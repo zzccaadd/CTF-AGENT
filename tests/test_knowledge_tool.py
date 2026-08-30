@@ -38,6 +38,7 @@ def _solver_with(service: KnowledgeService | None) -> CodexSolver:
     solver._knowledge_solver_budget = 8
     solver._knowledge_context_budget = 32_000
     solver._knowledge_challenge_budget = None
+    solver._step_count = 0
     solver.settings = SimpleNamespace(knowledge_top_k=5)
     solver.tracer = SimpleNamespace(event=lambda *_args, **_kwargs: None)
     solver.evidence_board = None
@@ -194,7 +195,7 @@ def test_tool_solver_budget_rejects_after_limit(tmp_path) -> None:
         assert solver._knowledge_queries == 2
         solver._turn_knowledge_queries = 0
         message = asyncio.run(solver._exec_tool("search_knowledge", {"query": "zz3"}))
-        assert "budget exhausted for this challenge" in message
+        assert "queries max per challenge" in message
         assert solver._knowledge_budget_rejections == 1
     finally:
         service.close()
@@ -254,3 +255,23 @@ def test_shared_challenge_budget_is_consumed_across_solvers() -> None:
     assert budget.remaining() == 0
     with pytest.raises(ValueError):
         KnowledgeBudget(0)
+
+
+def test_tool_budget_rejection_records_trace_outcome(tmp_path) -> None:
+    """Every refused call must leave a query_outcome=budget_exhausted trace
+    event so the eval can reconstruct rejected knowledge calls (S3.1)."""
+    events: list[dict] = []
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    service = KnowledgeService(knowledge)
+    solver = _solver_with(service)
+    solver.tracer = SimpleNamespace(event=lambda *_args, **kwargs: events.append(kwargs))
+    solver._knowledge_solver_budget = 0  # force immediate rejection
+    import asyncio
+
+    try:
+        message = asyncio.run(solver._exec_tool("search_knowledge", {"query": "z3"}))
+        assert "budget exhausted" in message
+        assert solver._knowledge_budget_rejections == 1
+        assert any(e.get("query_outcome") == "budget_exhausted" for e in events)
+    finally:
+        service.close()

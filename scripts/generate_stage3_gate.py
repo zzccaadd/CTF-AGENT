@@ -69,6 +69,10 @@ def main() -> int:
     compileall = _run([PY, "-m", "compileall", "-q", "backend", "scripts"], cwd=ROOT)
 
     status = _run(["git", "status", "--short"], cwd=ROOT).stdout.strip().splitlines()
+    try:
+        codex_version = _run(["codex", "--version"]).stdout.strip().splitlines()[:1]
+    except FileNotFoundError:
+        codex_version = ["not installed"]
     gate: dict = {
         "gate": "S3.0-stage2-acceptance",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -81,7 +85,7 @@ def main() -> int:
         "environment": {
             "python": sys.version.split()[0],
             "platform": platform.platform(),
-            "codex_cli": _run(["codex", "--version"]).stdout.strip().splitlines()[:1],
+            "codex_cli": codex_version,
         },
         "corpus": {
             "policy_manifest": _load_json(ROOT / "knowledge" / "manifest.json"),

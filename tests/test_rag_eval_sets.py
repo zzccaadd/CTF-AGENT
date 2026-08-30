@@ -183,9 +183,31 @@ def test_aggregate_replicates_means_and_incomplete() -> None:
     assert agg["off"]["solved"] == 3 and agg["on"]["solved"] == 3
     assert agg["delta_solved_mean"] == 0.0
     rows = {row["challenge_id"]: row for row in agg["per_challenge"]}
-    assert rows["b"]["delta_solved_total"] == 0
+    assert rows["b"]["on_solved_replicates"] == 1
+    assert rows["b"]["on_total_replicates"] == 2
     assert rows["b"]["knowledge_queries_total"] == 3
+    assert rows["b"]["incomplete"] is False
     assert agg["incomplete_pairs"] == []
+
+
+def test_aggregate_replicates_marks_missing_side_not_unsolved() -> None:
+    """A challenge that ran only on one side must be incomplete, and the
+    missing side must NOT count toward its solved/total replicate counts."""
+    pairs = [
+        (
+            {"results": [_run("a", True)]},
+            {"results": [_run("a", True), _run("b", True, "flag_found", kq=1)]},
+        ),
+    ]
+    agg = _aggregate_replicates(pairs)
+    rows = {row["challenge_id"]: row for row in agg["per_challenge"]}
+    assert rows["b"]["incomplete"] is True
+    assert rows["b"]["off_total_replicates"] == 0
+    assert rows["b"]["on_total_replicates"] == 1
+    assert rows["b"]["on_solved_replicates"] == 1
+    assert agg["incomplete_pairs"] == [{"challenge_id": "b", "missing_side": "off"}]
+    # Solve-rate aggregates only count rows that actually ran.
+    assert agg["on"]["total"] == 2 and agg["off"]["total"] == 1
 
 
 def test_build_comparison_marks_incomplete_pairs() -> None:

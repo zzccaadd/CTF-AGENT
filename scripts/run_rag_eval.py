@@ -76,7 +76,9 @@ def _aggregate_replicates(pairs: list[tuple[dict, dict]]) -> dict:
     """Cross-replicate aggregation: mean solve rates/costs/tokens and
     per-challenge solved counts, plus incomplete-pair accounting.
 
-    `pairs` is a list of (off_run, on_run) raw run outputs, one per replicate."""
+    `pairs` is a list of (off_run, on_run) raw run outputs, one per replicate.
+    A challenge missing on one side is marked incomplete and its missing side
+    is NOT counted as unsolved (Stage 3 §6.2)."""
     n = max(1, len(pairs))
     off_rows = [row for off, _ in pairs for row in off["results"]]
     on_rows = [row for _, on in pairs for row in on["results"]]
@@ -84,15 +86,25 @@ def _aggregate_replicates(pairs: list[tuple[dict, dict]]) -> dict:
     agg_on = _aggregate(on_rows)
     challenges: dict[str, dict] = {}
     for off, on in pairs:
+        off_by_id = {result.get("challenge_id"): result for result in off["results"]}
         on_by_id = {result.get("challenge_id"): result for result in on["results"]}
-        for off_result in off["results"]:
-            cid = off_result.get("challenge_id")
-            on_result = on_by_id.get(cid) or {}
-            entry = challenges.setdefault(cid, {"off_solved": 0, "on_solved": 0, "total": 0, "knowledge_queries": 0})
-            entry["total"] += 1
-            entry["off_solved"] += int(bool(off_result.get("solved")))
-            entry["on_solved"] += int(bool(on_result.get("solved")))
-            entry["knowledge_queries"] += int(on_result.get("knowledge_queries", 0))
+        for cid in set(off_by_id) | set(on_by_id):
+            entry = challenges.setdefault(
+                cid,
+                {"off_solved": 0, "off_total": 0, "on_solved": 0, "on_total": 0,
+                 "knowledge_queries": 0, "incomplete": False},
+            )
+            off_result = off_by_id.get(cid)
+            on_result = on_by_id.get(cid)
+            if off_result is not None:
+                entry["off_total"] += 1
+                entry["off_solved"] += int(bool(off_result.get("solved")))
+            if on_result is not None:
+                entry["on_total"] += 1
+                entry["on_solved"] += int(bool(on_result.get("solved")))
+                entry["knowledge_queries"] += int(on_result.get("knowledge_queries", 0))
+            if off_result is None or on_result is None:
+                entry["incomplete"] = True
     return {
         "replicates": len(pairs),
         "off": agg_off,
@@ -104,8 +116,10 @@ def _aggregate_replicates(pairs: list[tuple[dict, dict]]) -> dict:
             {
                 "challenge_id": cid,
                 "off_solved_replicates": entry["off_solved"],
+                "off_total_replicates": entry["off_total"],
                 "on_solved_replicates": entry["on_solved"],
-                "delta_solved_total": entry["on_solved"] - entry["off_solved"],
+                "on_total_replicates": entry["on_total"],
+                "incomplete": entry["incomplete"],
                 "knowledge_queries_total": entry["knowledge_queries"],
             }
             for cid, entry in sorted(challenges.items())
@@ -148,6 +162,7 @@ def build_comparison(manifest_path: Path, off: dict, on: dict) -> dict:
                     "knowledge_hits": on_result.get("knowledge_hits", 0),
                 },
                 "delta_solved": int(on_solved) - int(off_solved),
+                "incomplete": challenge_id not in on_by_id,
             }
         )
     return {

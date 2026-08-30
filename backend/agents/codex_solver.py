@@ -660,6 +660,21 @@ class CodexSolver:
             top_k,
         )
 
+    def _reject_knowledge(self, reason: str) -> str:
+        """Record a budget rejection in the trace and return a readable message.
+
+        The rejection is a first-class query_outcome (budget_exhausted) so the
+        eval can reconstruct every refused knowledge call, not just the ones
+        that reached the store (Stage 3 S3.1)."""
+        self._knowledge_budget_rejections += 1
+        self.tracer.event(
+            "knowledge_searched",
+            query_outcome="budget_exhausted",
+            reason=reason,
+            step=self._step_count,
+        )
+        return f"Knowledge budget exhausted ({reason}). Continue with sandbox analysis."
+
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
         if name == "search_knowledge":
             if not self.knowledge_service:
@@ -667,28 +682,20 @@ class CodexSolver:
             self._knowledge_tool_calls += 1
             # Stage 3 S3.1 budgets: turn -> solver -> cumulative context -> challenge.
             if self._turn_knowledge_queries >= self._knowledge_turn_budget:
-                self._knowledge_budget_rejections += 1
-                return (
-                    f"Knowledge budget exhausted for this turn "
-                    f"({self._knowledge_turn_budget} query max). Continue with sandbox analysis."
+                return self._reject_knowledge(
+                    f"1 query max per turn ({self._knowledge_turn_budget})"
                 )
             if self._knowledge_queries >= self._knowledge_solver_budget:
-                self._knowledge_budget_rejections += 1
-                return (
-                    f"Knowledge budget exhausted for this challenge "
-                    f"({self._knowledge_solver_budget} queries max). Continue with sandbox analysis."
+                return self._reject_knowledge(
+                    f"{self._knowledge_solver_budget} queries max per challenge"
                 )
             if self._knowledge_chars >= self._knowledge_context_budget:
-                self._knowledge_budget_rejections += 1
-                return (
-                    f"Knowledge context budget exhausted "
-                    f"({self._knowledge_context_budget} chars max). Continue with sandbox analysis."
+                return self._reject_knowledge(
+                    f"{self._knowledge_context_budget} context chars max"
                 )
             if self._knowledge_challenge_budget is not None and not self._knowledge_challenge_budget.consume():
-                self._knowledge_budget_rejections += 1
-                return (
-                    f"Challenge knowledge budget exhausted "
-                    f"({self._knowledge_challenge_budget.limit} queries max). Continue with sandbox analysis."
+                return self._reject_knowledge(
+                    f"{self._knowledge_challenge_budget.limit} queries max for the whole challenge"
                 )
             # Dedupe: an identical query+filters in the same run is a cache hit,
             # not a new backend query.
