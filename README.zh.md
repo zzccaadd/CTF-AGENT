@@ -20,7 +20,7 @@ CTF Agent 是一个自动化 CTF 解题系统，采用 coordinator + solver swar
 
 ## 默认模型
 
-当前 benchmark 默认模型是 `codex/gpt-5.6-luna`。
+当前 benchmark 默认模型是 `codex/gpt-5.5`。
 
 ## RAG 评估
 
@@ -45,7 +45,7 @@ uv run python scripts/run_rag_eval.py
 
 默认 runner 配置：
 
-- model: `codex/gpt-5.6-luna`
+- model: `codex/gpt-5.5`
 - timeout: `1800`
 - max tokens: `500000`
 - concurrency: `1`

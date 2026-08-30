@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from backend.evidence import EvidenceBoard
 
 
 @dataclass
@@ -24,6 +29,12 @@ class ChallengeMessageBus:
     findings: list[Finding] = field(default_factory=list)
     cursors: dict[str, int] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    evidence_board: EvidenceBoard | None = field(default=None, repr=False)
+    _board_cursors: dict[str, int] = field(default_factory=dict, repr=False)
+
+    def attach_board(self, board: EvidenceBoard) -> None:
+        """Attach the persistent board while keeping the legacy API callable."""
+        self.evidence_board = board
 
     async def post(self, model: str, content: str) -> None:
         """Post a finding from a solver."""
@@ -33,9 +44,29 @@ class ChallengeMessageBus:
                 trim = len(self.findings) - MAX_FINDINGS
                 self.findings = self.findings[trim:]
                 self.cursors = {k: max(0, v - trim) for k, v in self.cursors.items()}
+        if self.evidence_board:
+            self.evidence_board.record(
+                model,
+                "compat",
+                "compat_message",
+                {"message": content[:2000]},
+                provenance={"source_kind": "message_bus"},
+                dedupe_key=(
+                    "compat-message:"
+                    f"{self.evidence_board.run_id}:{model}:"
+                    f"{hashlib.sha256(content.encode()).hexdigest()}"
+                ),
+            )
 
     async def check(self, model: str) -> list[Finding]:
         """Get unread findings from other models. Advances the cursor."""
+        if self.evidence_board:
+            snapshot = self.evidence_board.snapshot()
+            last_seen = self._board_cursors.get(model, 0)
+            if snapshot.last_seq <= last_seen:
+                return []
+            self._board_cursors[model] = snapshot.last_seq
+            return [Finding(model="blackboard", content=self.evidence_board.summary())]
         async with self._lock:
             cursor = self.cursors.get(model, 0)
             unread = [f for f in self.findings[cursor:] if f.model != model]

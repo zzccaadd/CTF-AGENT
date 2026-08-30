@@ -9,16 +9,11 @@ from typing import Any
 
 import httpx
 
+from backend.submission import SubmitResult
+
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36"
-
-
-@dataclass
-class SubmitResult:
-    status: str  # "correct" | "already_solved" | "incorrect" | "unknown"
-    message: str
-    display: str
 
 
 @dataclass

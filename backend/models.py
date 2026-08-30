@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 # Default to a single Codex solver for reproducible agent evaluations.
 DEFAULT_MODELS: list[str] = [
-    "codex/gpt-5.6-luna",
+    "codex/gpt-5.5",
 ]
 
 # Context window sizes (tokens)
