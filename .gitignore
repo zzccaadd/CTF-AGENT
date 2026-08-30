@@ -3,7 +3,7 @@
 .env.*
 creds.json
 .codex/
-.codex-diffs/.last-full-worktree.diff
+.codex-diffs/
 .claude/scheduled_tasks.lock
 
 # Logs, traces, and benchmark outputs
