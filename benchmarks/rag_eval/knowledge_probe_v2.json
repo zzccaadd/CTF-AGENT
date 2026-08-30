@@ -1,0 +1,114 @@
+{
+  "name": "knowledge_probe_v2_11",
+  "description": "Stage 2/3 第二轮最小对照集（11 题）：8 道知识型 + 3 道非知识型。选题原则：1) 与扩充后的 72 篇语料直接相关（每题有对应语料文档）；2) 难度 Easy-Medium，避免吃满超时；3) 避开 shellcode/恶意软件/内核等易触发模型安全拦截或高风险主题；4) 复用已验证可运行的 benchmark 环境题目。v1（knowledge_probe.json）保留作为基线对照。",
+  "generated_at": "2026-08-31",
+  "default_model": "codex/gpt-5.5",
+  "labeling": {
+    "qrels_version": "v1",
+    "annotator": "CTF-Agent review (code-fix session)",
+    "knowledge_needed": "解出该题所需的关键技术是否在受控语料中有对应文档",
+    "expected_knowledge": "预估对该题有帮助的语料主题标签",
+    "relevant_corpus_docs": "该题相关的具体语料文档（doc 级 qrels，路径相对 knowledge/）"
+  },
+  "items": [
+    {
+      "provider": "cybench",
+      "challenge_id": "project-sekai-ctf/sekaictf-2023/misc/just-another-pickle-jail",
+      "name": "just-another-pickle-jail",
+      "family": "misc",
+      "knowledge_needed": true,
+      "expected_knowledge": ["pickle", "deserialization", "python-jail"],
+      "relevant_corpus_docs": ["reference/web/pickle-deserialization.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "project-sekai-ctf/sekaictf-2022/crypto/robust-cbc",
+      "name": "robust-cbc",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["cbc", "padding-oracle", "bit-flipping"],
+      "relevant_corpus_docs": ["reference/crypto/cbc-bit-flipping.md", "reference/crypto/padding-oracle.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "project-sekai-ctf/sekaictf-2023/crypto/randsubware",
+      "name": "randsubware",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["z3", "constraint-solving", "spn-cipher"],
+      "relevant_corpus_docs": ["official/tools/z3-usage-patterns.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "project-sekai-ctf/sekaictf-2023/crypto/noisier-crc",
+      "name": "noisier-crc",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["crc32", "bruteforce", "stream-cipher"],
+      "relevant_corpus_docs": ["reference/forensics/zip-archive-tricks.md"]
+    },
+    {
+      "provider": "nyu",
+      "challenge_id": "2020/CSAW-Quals/crypto/smallsurp",
+      "name": "smallsurp",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["rsa", "small-exponent", "known-plaintext"],
+      "relevant_corpus_docs": ["reference/crypto/rsa-attacks.md"]
+    },
+    {
+      "provider": "nyu",
+      "challenge_id": "2020/CSAW-Quals/crypto/perfect_secrecy",
+      "name": "perfect_secrecy",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["xor", "keystream-reuse", "otp"],
+      "relevant_corpus_docs": ["reference/crypto/xor-variants.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] PackedAway",
+      "name": "[Very Easy] PackedAway",
+      "family": "reverse",
+      "knowledge_needed": true,
+      "expected_knowledge": ["packing", "upx", "unpacking"],
+      "relevant_corpus_docs": ["reference/reverse/packers-unpacking.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/forensics/[Medium] Data Siege",
+      "name": "[Medium] Data Siege",
+      "family": "forensics",
+      "knowledge_needed": true,
+      "expected_knowledge": ["pcap", "network-forensics", "encoding"],
+      "relevant_corpus_docs": ["reference/forensics/pcap-analysis.md", "official/elf-pe/pcap-format.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/web/[Very Easy] Flag Command",
+      "name": "[Very Easy] Flag Command",
+      "family": "web",
+      "knowledge_needed": false,
+      "expected_knowledge": [],
+      "relevant_corpus_docs": []
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/web/[Easy] Labyrinth Linguist",
+      "name": "[Easy] Labyrinth Linguist",
+      "family": "web",
+      "knowledge_needed": false,
+      "expected_knowledge": [],
+      "relevant_corpus_docs": []
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/forensics/[Very Easy] It Has Begun",
+      "name": "[Very Easy] It Has Begun",
+      "family": "forensics",
+      "knowledge_needed": false,
+      "expected_knowledge": [],
+      "relevant_corpus_docs": []
+    }
+  ]
+}

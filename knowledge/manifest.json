@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "ctf-domain-knowledge",
+  "allowed_source_types": [
+    "official",
+    "reference",
+    "internal_notes"
+  ],
+  "required_front_matter": [
+    "source_url",
+    "source_title",
+    "source_version",
+    "publisher",
+    "license",
+    "retrieved_at"
+  ],
+  "excluded_content": [
+    "benchmark",
+    "flags",
+    "secrets",
+    "credentials",
+    "raw_challenge_attachments",
+    "unreviewed_challenge_specific_writeups"
+  ],
+  "documents": []
+}

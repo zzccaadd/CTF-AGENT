@@ -6,18 +6,23 @@
 
 > 结构对齐说明：帖子中的 `CWE`、`Writeup`、`Tool Docs` 是知识来源分类，不要求当前实现拆成三个数据库或三个工具。当前统一使用 `source_type + metadata` 管理来源；challenge-specific writeup 默认不进入通用 corpus，避免 flag 泄露和评测污染。
 
+> 阶段边界说明：本文中的 P3 仅覆盖 Stage 3 所需的评估字段、脚本和最小对照集前置准备；真实 Agent 检索策略、协作闭环、off/on 多次运行、引用正确率和 Stage 4 决策由 [`docs/rag_stage3_plan.md`](rag_stage3_plan.md) 负责。本文中的 P4 Advanced RAG 仅是后续阶段提示，不属于 Stage 2 或 Stage 3 的实现范围。
+
 ## 1. 结论先行
 
-当前 Stage 2 已完成了“知识库底座”，但尚未完成“RAG 对 solver 生效”的完整闭环。
+当前 Stage 2 已完成了“知识库底座”和受控语料目录框架，但尚未完成“真实语料驱动的 RAG 效果验收”闭环。
 
 已经具备：
 
 - `backend/knowledge/` 本地 SQLite FTS5 知识库；
+- `knowledge/` 三类受控语料目录和 corpus policy manifest；
+- 第一批 6 份带 front matter provenance 的官方/可信种子笔记；
 - Markdown/文本按标题、代码块和长度切分；
 - `KnowledgeDocument`、`KnowledgeChunk`、`SearchRequest`、`SearchResult` 数据模型；
 - source type、metadata、trust level、document/chunk provenance；
 - 文档幂等重建、同 URL 更新、删除和 benchmark corpus 隔离；
 - `scripts/index_knowledge.py` 离线建库；
+- `scripts/bootstrap_knowledge.py` 统一扫描三类目录、清理过期文档并生成建库报告；
 - `scripts/search_knowledge.py` 命令行查询；
 - `backend/knowledge/service.py` 统一查询边界、字符上限、诊断和失败隔离；
 - Codex solver 的 `search_knowledge` 动态工具、知识查询 trace/evidence provenance 和 RAG 指标字段；
@@ -26,10 +31,10 @@
 尚未具备：
 
 - Pydantic solver 的统一检索兼容工具（非 MVP 必选）；
-- 固定 RAG corpus、来源清单和版本管理；
+- 完整固定 RAG corpus、来源清单和版本管理；
 - 引用正确率和 Recall@K/MRR 等效果指标；
 
-因此当前完成度可定义为：**Stage 2 lexical MVP 和 Codex 最小接入已完成，受控语料治理和效果验收尚未完成。**
+因此当前完成度可定义为：**Stage 2 lexical MVP、Codex 最小接入、知识库目录框架和第一批 provenance 种子语料已完成，完整语料治理和效果验收尚未完成。**
 
 ## 2. 范围与原则
 
@@ -80,6 +85,8 @@ challenge started
 | `backend/knowledge/indexer.py` | 标题/空行/代码块感知切分，保存行号 | 已可用 |
 | `backend/knowledge/store.py` | SQLite WAL、FTS5、BM25、metadata 过滤、trust 加权、CRUD | 底座可用，需加固 |
 | `scripts/index_knowledge.py` | 本地 glob 文档导入、白名单、manifest/report、过期文档清理 | P0 基础项已完成 |
+| `scripts/bootstrap_knowledge.py` | 扫描 `knowledge/{official,reference,internal_notes}`、解析 front matter provenance、建库、删除过期文档、输出报告 | 目录框架与 provenance 已完成 |
+| `knowledge/` | 受控语料目录、来源策略、provenance front matter 和首批笔记 | 框架与首批语料已完成，待持续审核扩充 |
 | `scripts/search_knowledge.py` | JSON 查询输出、稳定参数错误码 | P1 基础项已完成 |
 | `backend/knowledge/service.py` | 查询清洗、top-k/字符上限、诊断和存储失败隔离 | P1 基础项已完成 |
 | `tests/test_knowledge.py` | 切分、检索、过滤、来源、更新、删除、隔离、trust 测试 | 基础覆盖已存在 |
@@ -216,18 +223,17 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
 
 验收：Codex solver 能在离线 DB 上调用统一接口；若启用 Pydantic 兼容适配，则其参数和结果与 Codex 一致；关闭 RAG 时原有 Stage 1 smoke 行为不变；开启 RAG 时可以在 trace/evidence 中定位检索和引用来源。
 
-### P3：RAG 效果与成本评估
+### P3：RAG 评估前置与 Stage 3 交接
 
-目标：证明检索是否产生业务收益，而不是只证明 API 能调用。
+目标：补齐 Stage 3 评估所需的指标字段、固定子集和比较脚本；本阶段不使用模型额度下最终收益结论。
 
 任务：
 
-1. 固定 `smoke_20.json` 中的最小对照子集，先跑 `rag_enabled=false` 基线。
-2. 相同 challenge、model、timeout、max_tokens、solver 数量跑 `rag_enabled=false/true`（`scripts/run_rag_eval.py --compare-rag`）。
-3. [已完成基础字段] 结果增加：`knowledge_queries`、`knowledge_hits`、`knowledge_chars`；检索耗时、额外 token、引用 provenance 数量仍需补充。
-4. 分别统计 solve rate、timeout/error、平均 tool calls、token/cost、elapsed。
-5. 对人工标注需要知识的题目统计 Recall@K/MRR；对不需要知识的题目统计无效调用率。
-6. smoke 只作为回归门槛，不把一次模型随机成功当成 RAG 效果结论。
+1. [已完成基础准备] 固定 `smoke_20.json` 中的最小对照子集 `knowledge_probe.json`，附知识型/非知识型标注。
+2. [已完成基础字段] 结果增加 `knowledge_queries`、`knowledge_hits`、`knowledge_chars`、检索耗时和估算额外 token。
+3. [已完成基础脚本] `scripts/run_rag_eval.py --compare-rag` 输出 off/on 聚合、delta 和按 challenge 配对明细。
+4. 将真实相同 challenge/model/timeout/max_tokens/solver 数量的 off/on 运行、Recall@K/MRR、引用正确率和无效检索率移交 Stage 3。
+5. smoke 只作为回归门槛，不把一次模型随机成功当成 RAG 效果结论。
 
 建议通过门槛：
 
@@ -238,9 +244,9 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
 - 在预先标注的知识型子集上 Recall@5 有可解释结果；
 - 若 solve rate 没有提升，也必须能明确判断是语料、召回还是 solver 使用问题。
 
-### P4：可选增强，不属于 Stage 2 MVP 门槛
+### P4：Advanced RAG 预留（移交 Stage 4）
 
-只有 P0-P3 稳定后再考虑：
+只有 Stage 3 评估稳定且满足数据门槛后，才由独立 Stage 4 计划考虑：
 
 - 向量 embedding 和本地向量索引；
 - BM25 + vector 的 RRF 融合；
@@ -248,7 +254,7 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
 - query rewrite 和多轮检索；
 - 自动知识摘要、知识审核和 UI。
 
-这些能力必须以独立 feature flag 接入，不能替换 lexical fallback。
+这些能力必须以独立 feature flag 接入，不能替换 lexical fallback，也不应在 Stage 3 提前实现。
 
 ## 6. 默认配置建议
 
@@ -283,11 +289,12 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
 
 ## 8. 下一步执行顺序
 
-1. 补齐 P0/P1 剩余的 migration step、特殊 query 测试和固定语料审核流程；
-2. 增加 Codex 工具的离线协议级回归测试；
-3. 仅在现有兼容运行需要时接入 Pydantic 薄适配，并确认其参数/结果与 Codex 一致；
-4. 增加 trace/evidence provenance；
-5. 固定 smoke 子集，跑 RAG off/on 两组结果；
-6. 根据实际召回、成本和 solve rate 决定是否进入 P4。
+1. 从官方/可信来源整理带 `source_url`、版本、许可证和抓取日期的 Markdown 种子语料，放入 `knowledge/official`、`knowledge/reference`、`knowledge/internal_notes`，再运行 `scripts/bootstrap_knowledge.py`；
+2. 补齐 P0/P1 剩余的 migration step、特殊 query 测试和固定语料审核流程；
+3. 增加 Codex 工具的离线协议级回归测试；
+4. 仅在现有兼容运行需要时接入 Pydantic 薄适配，并确认其参数/结果与 Codex 一致；
+5. 增加 trace/evidence provenance；
+6. 将固定 smoke 子集、评估字段和比较脚本交接给 Stage 3，按其计划跑多次 RAG off/on；
+7. 只有 Stage 3 评估报告满足数据门槛后，才另立 Stage 4 计划。
 
 Stage 2 的最小完成定义不是“有一个 SQLite FTS5 文件”，而是：**solver 能按需调用统一 lexical 检索接口，结果可追溯、可关闭、可评估，并且不破坏 Stage 1 主链路。** 向量检索、Merge/RRF 和 Reranker 不属于本阶段完成条件。

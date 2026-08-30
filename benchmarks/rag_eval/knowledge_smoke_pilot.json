@@ -1,0 +1,9 @@
+{
+  "name": "knowledge_smoke_pilot",
+  "description": "Step-1 smoke: single knowledge-needed challenge (pilot, RAG on) to verify the model calls search_knowledge and trace/evidence record it.",
+  "generated_at": "2026-08-31",
+  "default_model": "codex/gpt-5.5",
+  "items": [
+    {"provider": "nyu", "challenge_id": "2017/CSAW-Quals/pwn/pilot", "name": "pilot", "family": "pwn", "knowledge_needed": true}
+  ]
+}

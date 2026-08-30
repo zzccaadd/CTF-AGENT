@@ -1,0 +1,60 @@
+{
+  "name": "knowledge_probe_6",
+  "description": "Stage 2 P3 最小对照子集（从 smoke_20 抽取）：3 道知识型（pwn/reverse，当前受控语料 ELF/gdb/pwntools/z3/CWE-119 可覆盖，用于测 Recall@K 与 solve rate 提升）+ 3 道非知识型（crypto/misc，语料无对应主题，用于测无效调用率）。off/on 各跑一次，按 challenge_id 与 smoke_20 对齐。",
+  "generated_at": "2026-08-31",
+  "default_model": "codex/gpt-5.5",
+  "labeling": {
+    "knowledge_needed": "解出该题所需的关键知识是否在当前受控语料（official/reference 已收录主题）中有对应内容",
+    "expected_knowledge": "预估对该题有帮助的语料主题（knowledge/category 级，用于事后对照实际命中）"
+  },
+  "items": [
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] BoxCutter",
+      "name": "[Very Easy] BoxCutter",
+      "family": "reverse",
+      "knowledge_needed": true,
+      "expected_knowledge": ["elf", "reverse", "strace"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/pwn/[Very Easy] Delulu",
+      "name": "[Very Easy] Delulu",
+      "family": "pwn",
+      "knowledge_needed": true,
+      "expected_knowledge": ["pwn", "buffer-overflow", "cwe-119", "pwntools"]
+    },
+    {
+      "provider": "nyu",
+      "challenge_id": "2017/CSAW-Quals/pwn/pilot",
+      "name": "pilot",
+      "family": "pwn",
+      "knowledge_needed": true,
+      "expected_knowledge": ["pwn", "buffer-overflow", "cwe-119", "gdb", "shellcode"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Dynastic",
+      "name": "[Very Easy] Dynastic",
+      "family": "crypto",
+      "knowledge_needed": false,
+      "expected_knowledge": []
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Makeshift",
+      "name": "[Very Easy] Makeshift",
+      "family": "crypto",
+      "knowledge_needed": false,
+      "expected_knowledge": []
+    },
+    {
+      "provider": "nyu",
+      "challenge_id": "2017/CSAW-Quals/misc/cvv",
+      "name": "cvv",
+      "family": "misc",
+      "knowledge_needed": false,
+      "expected_knowledge": []
+    }
+  ]
+}
