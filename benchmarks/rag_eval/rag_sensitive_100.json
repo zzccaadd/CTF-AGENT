@@ -1,7 +1,7 @@
 {
   "name": "rag_sensitive_100",
   "generated_at": "2026-08-21T08:42:52.536909+00:00",
-  "default_model": "codex/gpt-5.6-luna",
+  "default_model": "codex/gpt-5.5",
   "note": "Knowledge-heavy and tool-sensitive tasks chosen to stress retrieval, protocol lookup, and exploit pattern recall.",
   "summary": {
     "total": 100,

@@ -1,0 +1,62 @@
+# Incremental diff snapshot reconstructed from historical worktree state.
+# This file contains only the net changes introduced at this timestamp.
+
+diff --git a/.gitignore b/.gitignore
+index 6b96bdc..b7342b9 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,7 +3,6 @@
+ .env.*
+ creds.json
+ .codex/
+-.codex-diffs/
+ .claude/scheduled_tasks.lock
+ 
+ # Logs, traces, and benchmark outputs
+diff --git a/scripts/save_worktree_diff.sh b/scripts/save_worktree_diff.sh
+index fc88d05..499db76 100755
+--- a/scripts/save_worktree_diff.sh
++++ b/scripts/save_worktree_diff.sh
+@@ -9,15 +9,40 @@ mkdir -p "$output_dir"
+ 
+ timestamp="$(date +%Y%m%d-%H%M%S-%N)"
+ output_file="$output_dir/worktree-$timestamp.diff"
++payload_file="$(mktemp "${TMPDIR:-/tmp}/codex-diff.XXXXXX")"
++trap 'rm -f "$payload_file"' EXIT
+ 
+ {
+-    printf '# Worktree diff snapshot generated at %s\n' "$(date --iso-8601=seconds)"
+-    printf '# Includes tracked changes and non-ignored untracked files.\n\n'
+     git diff --binary
+ 
+     while IFS= read -r -d '' file; do
++        # The snapshot directory may intentionally be unignored. Never include
++        # prior snapshots or the file currently being generated.
++        case "$file" in
++            .codex-diffs/*) continue ;;
++        esac
+         git diff --no-index --binary /dev/null "$file" || true
+     done < <(git ls-files --others --exclude-standard -z)
++} > "$payload_file"
++
++if [[ ! -s "$payload_file" ]]; then
++    printf 'No worktree changes; no diff snapshot created.\n'
++    exit 0
++fi
++
++# Repeated invocations before staging produce the same payload. Do not create
++# another timestamped copy when the latest snapshot is byte-for-byte equivalent.
++latest="$(find "$output_dir" -maxdepth 1 -type f -name '*.diff' -printf '%T@ %p\n' \
++    | sort -nr | sed -n '1s/^[^ ]* //p')"
++if [[ -n "$latest" ]] && tail -n +4 "$latest" | cmp -s - "$payload_file"; then
++    printf '%s\n' "$latest"
++    exit 0
++fi
++
++{
++    printf '# Worktree diff snapshot generated at %s\n' "$(date --iso-8601=seconds)"
++    printf '# Includes tracked changes and non-ignored untracked files.\n\n'
++    cat "$payload_file"
+ } > "$output_file"
+ 
+ printf '%s\n' "$output_file"

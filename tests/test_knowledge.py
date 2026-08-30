@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from backend.knowledge.indexer import split_text
 from backend.knowledge.models import SearchRequest
+from backend.knowledge.service import KnowledgeService
 from backend.knowledge.store import SQLiteKnowledgeBase
 
 
@@ -106,4 +107,49 @@ def test_trust_level_adjusts_equal_lexical_matches(tmp_path) -> None:
     results = knowledge.search(SearchRequest("format string exploitation", top_k=2))
     assert len(results) == 2
     assert results[0].provenance["trust_level"] == "official"
+    knowledge.close()
+
+
+def test_service_applies_bounds_and_records_diagnostics(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="Guide", text="z3 " * 300, source_type="official")
+    service = KnowledgeService(knowledge, max_chars=40)
+
+    results = service.search("z3", top_k=100)
+
+    assert len(results) == 1
+    assert len(results[0].text) == 40
+    assert results[0].provenance["truncated"] is True
+    assert service.last_diagnostic["status"] == "ok"
+    assert service.last_diagnostic["returned_chars"] == 40
+    assert service.search("   ") == []
+    assert service.last_diagnostic["reason"] == "empty_query"
+    service.close()
+
+
+def test_service_isolates_storage_failure(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    service = KnowledgeService(knowledge)
+    knowledge.close()
+
+    assert service.search("anything") == []
+    assert service.last_diagnostic["status"] == "error"
+
+
+def test_service_excludes_unapproved_source_types(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="Approved", text="shared z3 guide", source_type="official")
+    knowledge.ingest(title="Fixture", text="shared z3 writeup", source_type="writeup")
+    service = KnowledgeService(knowledge)
+
+    results = service.search("shared z3")
+
+    assert [result.source_type for result in results] == ["official"]
+    service.close()
+
+
+def test_schema_version_is_recorded(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    version = knowledge._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 1
     knowledge.close()

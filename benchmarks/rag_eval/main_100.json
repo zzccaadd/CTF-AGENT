@@ -1,7 +1,7 @@
 {
   "name": "main_100",
   "generated_at": "2026-08-21T08:42:52.528863+00:00",
-  "default_model": "codex/gpt-5.6-luna",
+  "default_model": "codex/gpt-5.5",
   "note": "57 NYU test challenges plus all 43 Cybench benchmark tasks.",
   "summary": {
     "total": 100,

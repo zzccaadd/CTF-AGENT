@@ -1,0 +1,65 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T03:23:14+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/docs/rag_stage2_plan.md b/docs/rag_stage2_plan.md
+index e286da7..f076eb2 100644
+--- a/docs/rag_stage2_plan.md
++++ b/docs/rag_stage2_plan.md
+@@ -15,6 +15,7 @@
+ - 文档幂等重建、同 URL 更新、删除和 benchmark corpus 隔离；
+ - `scripts/index_knowledge.py` 离线建库；
+ - `scripts/search_knowledge.py` 命令行查询；
++- `backend/knowledge/service.py` 统一查询边界、字符上限、诊断和失败隔离；
+ - `tests/test_knowledge.py` 基础回归测试。
+ 
+ 尚未具备：
+@@ -64,7 +65,8 @@ challenge started
+ | `backend/knowledge/indexer.py` | 标题/空行/代码块感知切分，保存行号 | 已可用 |
+ | `backend/knowledge/store.py` | SQLite WAL、FTS5、BM25、metadata 过滤、trust 加权、CRUD | 底座可用，需加固 |
+ | `scripts/index_knowledge.py` | 本地 glob 文档导入 | 可用，但缺少 manifest/report |
+-| `scripts/search_knowledge.py` | JSON 查询输出 | 可用，需统一 service 层 |
++| `scripts/search_knowledge.py` | JSON 查询输出 | 已接入统一 service，仍需稳定返回码 |
++| `backend/knowledge/service.py` | 查询清洗、top-k/字符上限、诊断和存储失败隔离 | P1 基础项已完成 |
+ | `tests/test_knowledge.py` | 切分、检索、过滤、来源、更新、删除、隔离、trust 测试 | 基础覆盖已存在 |
+ | `backend/config.py` | `knowledge_db_path` 配置 | 已有配置入口 |
+ | `backend/agents/codex_solver.py` | sandbox 动态工具和黑板工具 | 尚未注册知识检索工具 |
+@@ -79,7 +81,7 @@ challenge started
+ 4. `score` 是经过 trust weight 调整的相对分数，不应直接当作跨 query 的概率或质量百分比；评测必须使用排序指标和阈值前的原始结果。
+ 5. metadata 过滤是扁平字典精确匹配，暂不支持范围、列表、嵌套字段；应在 Stage 2 文档中明确该限制。
+ 6. 索引脚本没有记录输入文件清单、删除的过期文档、失败文件和最终 chunk 数，无法稳定复现一次建库结果。
+-7. 当前知识查询没有统一的 agent service 层；如果 Codex、Pydantic 各自直接操作 SQLite，后续参数和日志会分叉。
++7. 当前知识查询已有统一 `KnowledgeService` 基础层；但 corpus policy、agent tool trace 和评测指标仍未收口。
+ 8. 检索结果还没有自动写入 `tool_call/tool_result` 或专门的 `knowledge_searched` provenance；无法判断 solver 是否使用了知识以及引用了什么。
+ 9. 当前没有固定的 RAG corpus 目录和来源白名单；只要调用索引脚本指定 source type，任何本地文本都可能进入库。
+ 10. 当前没有 A/B 评测字段，无法证明 RAG 带来 solve rate 提升，还是只增加 token 和上下文噪声。
+@@ -167,15 +169,15 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
+ 
+ 验收：同一输入目录重复构建得到相同 document/chunk ID；非法 source 和 benchmark 文件被拒绝；构建报告可解释新增、更新、删除和失败文件。
+ 
+-### P1：收口 lexical 检索服务
++### P1：收口 lexical 检索服务（基础项已完成）
+ 
+ 目标：稳定提供受限、可观测的本地检索能力。
+ 
+ 任务：
+ 
+-1. 实现 `KnowledgeService`，封装 `SQLiteKnowledgeBase`。
+-2. 统一 `top_k`、字符上限、query 清洗和异常处理。
+-3. 保留 BM25 排序和 trust level 加权，但输出原始 rank 与最终 score，避免误解。
++1. [已完成] 实现 `KnowledgeService`，封装 `SQLiteKnowledgeBase`。
++2. [已完成] 统一 `top_k`、字符上限、query 清洗和异常处理。
++3. [已完成] 保留 BM25 排序和 trust level 加权，并输出原始 lexical score 与最终 score，避免误解。
+ 4. 明确 metadata 只支持扁平精确匹配；增加 source type、topic、tool_name、cwe_id 测试。
+ 5. 增加检索耗时、命中数和 query hash 统计；不记录完整敏感 query 到公开日志。
+ 6. 为删除、重建和 DB 不存在场景定义稳定 CLI 返回码。
+@@ -266,8 +268,8 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
+ 
+ ## 8. 下一步执行顺序
+ 
+-1. 先实现 P1 的 `KnowledgeService` 和边界测试；
+-2. 再接入 Codex `search_knowledge`，用离线 DB 做工具级测试；
++1. 补齐 P1 剩余的 schema/migration、manifest、白名单和构建报告；
++2. 接入 Codex `search_knowledge`，用离线 DB 做工具级测试；
+ 3. 仅在现有兼容运行需要时接入 Pydantic 薄适配，并确认其参数/结果与 Codex 一致；
+ 4. 增加 trace/evidence provenance；
+ 5. 固定 smoke 子集，跑 RAG off/on 两组结果；

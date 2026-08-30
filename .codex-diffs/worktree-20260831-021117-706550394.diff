@@ -1,0 +1,95 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T02:11:17+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/README.zh.md b/README.zh.md
+index 7a5af63..a8da659 100644
+--- a/README.zh.md
++++ b/README.zh.md
+@@ -20,7 +20,7 @@ CTF Agent 是一个自动化 CTF 解题系统，采用 coordinator + solver swar
+ 
+ ## 默认模型
+ 
+-当前 benchmark 默认模型是 `codex/gpt-5.6-luna`。
++当前 benchmark 默认模型是 `codex/gpt-5.5`。
+ 
+ ## RAG 评估
+ 
+diff --git a/docs/rag_stage1_review_v2.md b/docs/rag_stage1_review_v2.md
+index c5529f1..68a10c1 100644
+--- a/docs/rag_stage1_review_v2.md
++++ b/docs/rag_stage1_review_v2.md
+@@ -228,4 +228,4 @@ challenge_finished
+ - Pydantic API 兜底 solver 也会认领 intent、续租、记录 tool_call/tool_result 并完成任务；租约失效后旧 worker 会停止继续执行操作工具；
+ - board summary 有 item 数量和字符数双重上限，避免长结果挤爆模型上下文。
+ 
+-当前未执行的只有真实 Codex 进程、Docker sandbox 和 CTFd 的端到端联调；这不影响本地单元测试和静态校验结果。
++本地 benchmark/smoke 路径使用 `LocalFlagVerifier`，不会连接 CTFd；`backend/ctfd.py`、`poller.py` 和旧 coordinator 入口仍保留给在线 `ctf-solve` 兼容链路。当前未执行的只有真实 Codex 进程、Docker sandbox 和 CTFd 的在线端到端联调；这不影响本地单元测试和静态校验结果。
+diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
+index 377708b..8bf532a 100644
+--- a/tests/test_benchmark_policy.py
++++ b/tests/test_benchmark_policy.py
+@@ -3,6 +3,8 @@ from __future__ import annotations
+ from backend.agents.codex_solver import sandbox_tools
+ from backend.agents.swarm import build_solver_slots
+ from backend.benchmarks.models import BenchmarkLimits
++from backend.benchmarks.runner import _timeout_result
++from backend.cost_tracker import CostTracker
+ from backend.prompts import ChallengeMeta, build_prompt
+ 
+ 
+@@ -39,3 +41,29 @@ def test_offline_codex_tools_hide_host_network_helpers() -> None:
+ def test_offline_prompt_states_network_policy() -> None:
+     prompt = build_prompt(ChallengeMeta(name="demo"), [], allow_internet=False)
+     assert "General internet and external webhooks are disabled" in prompt
++
++
++def test_timeout_result_preserves_solver_diagnostics() -> None:
++    class Tracer:
++        path = "/tmp/demo-trace.jsonl"
++
++    class Solver:
++        _step_count = [7]
++        tracer = Tracer()
++
++    swarm = type(
++        "SwarmStub",
++        (),
++        {
++            "solvers": {"codex/gpt-5.5#1": Solver()},
++            "findings": {"codex/gpt-5.5#1": "inspected source.py"},
++            "confirmed_flag": None,
++        },
++    )()
++    tracker = CostTracker()
++    result = _timeout_result(swarm, tracker)
++
++    assert result.status == "timeout"
++    assert result.step_count == 7
++    assert result.findings_summary == "inspected source.py"
++    assert result.log_path == "/tmp/demo-trace.jsonl"
+diff --git a/tests/test_evidence.py b/tests/test_evidence.py
+index d0ac252..59752dd 100644
+--- a/tests/test_evidence.py
++++ b/tests/test_evidence.py
+@@ -222,3 +222,21 @@ def test_followup_index_restores_after_restart(tmp_path) -> None:
+     swarm._restore_followup_index()
+     assert swarm._next_intent_index == 10
+     board.close()
++
++
++def test_intent_status_aliases_are_normalized() -> None:
++    from backend.agents.codex_solver import CodexSolver
++
++    aliases = {
++        "done": "completed",
++        "complete": "completed",
++        "success": "completed",
++        "succeeded": "completed",
++        "error": "failed",
++        "gave_up": "blocked",
++        "give_up": "blocked",
++    }
++    for source, expected in aliases.items():
++        assert CodexSolver._normalize_intent_status(source) == expected
++    assert CodexSolver._normalize_intent_status("unexpected") == "failed"
++    assert CodexSolver._normalize_intent_status(None) == "completed"

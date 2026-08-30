@@ -17,9 +17,9 @@ def test_rag_eval_manifests_are_fixed_and_nested() -> None:
     assert len(main["items"]) == 100
     assert len(smoke["items"]) == 20
     assert len(sensitive["items"]) == 100
-    assert main["default_model"] == "codex/gpt-5.6-luna"
-    assert smoke["default_model"] == "codex/gpt-5.6-luna"
-    assert sensitive["default_model"] == "codex/gpt-5.6-luna"
+    assert main["default_model"] == "codex/gpt-5.5"
+    assert smoke["default_model"] == "codex/gpt-5.5"
+    assert sensitive["default_model"] == "codex/gpt-5.5"
 
     main_keys = {(item["provider"], item["challenge_id"]) for item in main["items"]}
     smoke_keys = {(item["provider"], item["challenge_id"]) for item in smoke["items"]}

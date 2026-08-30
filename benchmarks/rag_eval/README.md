@@ -15,7 +15,7 @@ Selection policy:
 - `rag_sensitive_100.json` = keyword-matched Cybench tasks plus 63 NYU keyword-matched tasks selected by category quota
 
 Model default:
-- `codex/gpt-5.6-luna`
+- `codex/gpt-5.5`
 
 Upstream corpora:
 - NYU CTF Bench: https://github.com/NYU-LLM-CTF/NYU_CTF_Bench

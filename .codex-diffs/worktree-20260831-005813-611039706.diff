@@ -1,0 +1,17 @@
+# Incremental diff snapshot reconstructed from historical worktree state.
+# This file contains only the net changes introduced at this timestamp.
+
+diff --git a/docs/rag_stage1_review_v2.md b/docs/rag_stage1_review_v2.md
+index ab3f68f..c5529f1 100644
+--- a/docs/rag_stage1_review_v2.md
++++ b/docs/rag_stage1_review_v2.md
+@@ -223,5 +223,9 @@ challenge_finished
+ - 基于事实、假设、死路和完成结果的动态 follow-up 规划；
+ - message bus 兼容适配、事件 provenance、verified gate、最大尝试次数和自动 blocked；
+ - state fold、query、replay 模块及回归测试。
++- 重启时继续使用未占用的 follow-up intent 编号，避免重复任务 ID；
++- 事件重放完全基于 append-only events，不依赖 intents 投影表；自定义 dedupe key 按 challenge/run 隔离，并兼容读取旧版未加作用域的事件；
++- Pydantic API 兜底 solver 也会认领 intent、续租、记录 tool_call/tool_result 并完成任务；租约失效后旧 worker 会停止继续执行操作工具；
++- board summary 有 item 数量和字符数双重上限，避免长结果挤爆模型上下文。
+ 
+ 当前未执行的只有真实 Codex 进程、Docker sandbox 和 CTFd 的端到端联调；这不影响本地单元测试和静态校验结果。

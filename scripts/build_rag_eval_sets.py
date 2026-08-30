@@ -4,9 +4,8 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 NYU_ROOT = ROOT / "benchmarks" / "NYU_CTF_Bench" / "test"
@@ -140,8 +139,8 @@ def write_manifest(name: str, items: list[dict], note: str) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "name": name,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "default_model": "codex/gpt-5.6-luna",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "default_model": "codex/gpt-5.5",
         "note": note,
         "summary": summarize(items),
         "items": items,

@@ -1,0 +1,19 @@
+# Incremental diff snapshot reconstructed from historical worktree state.
+# This file contains only the net changes introduced at this timestamp.
+
+diff --git a/tests/test_evidence.py b/tests/test_evidence.py
+index b29169e..d0ac252 100644
+--- a/tests/test_evidence.py
++++ b/tests/test_evidence.py
+@@ -34,6 +34,11 @@ def test_board_persists_and_replays(tmp_path) -> None:
+     assert snapshot.facts[0].schema_version == 1
+     assert snapshot.intents[0].status == "completed"
+     assert replayed == snapshot
++    # Replay must remain correct even if the fast intent projection is lost.
++    reopened.store._conn.execute("DELETE FROM intents WHERE intent_id=?", (intent.intent_id,))
++    reopened.store._conn.commit()
++    projection_free = reopened.replay()
++    assert projection_free.intents[0].status == "completed"
+     reopened.close()
+ 
+ 

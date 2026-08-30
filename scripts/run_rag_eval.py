@@ -10,7 +10,6 @@ from backend.benchmarks.models import BenchmarkLimits
 from backend.benchmarks.providers import CybenchProvider, NYUProvider
 from backend.benchmarks.runner import BenchmarkRunner
 
-
 ROOT = Path(__file__).resolve().parents[1]
 BENCH_ROOT = ROOT / "benchmarks"
 DEFAULT_MANIFESTS = [
@@ -41,6 +40,7 @@ async def run_manifest(
     concurrency: int,
     image: str,
     allow_internet: bool,
+    rag_enabled: bool,
     results_dir: Path,
 ) -> dict:
     manifest = load_manifest(manifest_path)
@@ -66,6 +66,7 @@ async def run_manifest(
             concurrency=concurrency,
             solvers_per_swarm=1,
             max_solvers_per_swarm=1,
+            rag_enabled=rag_enabled,
         )
         provider_results_path = results_dir / f"{manifest_path.stem}.{provider_name}.json"
         runner = BenchmarkRunner(impl, limits, image=image, results_path=provider_results_path)
@@ -79,6 +80,7 @@ async def run_manifest(
         "max_tokens": max_tokens,
         "concurrency": concurrency,
         "allow_internet": allow_internet,
+        "rag_enabled": rag_enabled,
         "total": len(manifest_results),
         "solved": sum(1 for result in manifest_results if result.get("solved")),
         "results": manifest_results,
@@ -99,12 +101,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Manifest JSON path. May be repeated. Defaults to all three curated manifests.",
     )
-    parser.add_argument("--model", default="codex/gpt-5.6-luna")
+    parser.add_argument("--model", default="codex/gpt-5.5")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--max-tokens", type=int, default=500_000)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--image", default="ctf-sandbox")
     parser.add_argument("--allow-internet", action="store_true")
+    parser.add_argument("--rag", dest="rag_enabled", default=True, action=argparse.BooleanOptionalAction)
+    parser.add_argument("--compare-rag", action="store_true", help="Run the same manifests with RAG off and on")
     parser.add_argument("--results-dir", type=Path, default=ROOT / "results" / "rag_eval")
     return parser.parse_args()
 
@@ -112,6 +116,37 @@ def parse_args() -> argparse.Namespace:
 async def main() -> None:
     args = parse_args()
     manifests = args.manifest or DEFAULT_MANIFESTS
+    if args.compare_rag:
+        comparisons = []
+        for manifest in manifests:
+            runs = {}
+            for enabled in (False, True):
+                run_dir = args.results_dir / ("rag_on" if enabled else "rag_off")
+                runs["on" if enabled else "off"] = await run_manifest(
+                    manifest,
+                    model=args.model,
+                    timeout=args.timeout,
+                    max_tokens=args.max_tokens,
+                    concurrency=args.concurrency,
+                    image=args.image,
+                    allow_internet=args.allow_internet,
+                    rag_enabled=enabled,
+                    results_dir=run_dir,
+                )
+            off, on = runs["off"], runs["on"]
+            comparisons.append({
+                "manifest": manifest.as_posix(),
+                "off": {"solved": off["solved"], "total": off["total"]},
+                "on": {"solved": on["solved"], "total": on["total"]},
+                "delta_solved": on["solved"] - off["solved"],
+                "knowledge_queries": sum(item.get("knowledge_queries", 0) for item in on["results"]),
+                "knowledge_hits": sum(item.get("knowledge_hits", 0) for item in on["results"]),
+            })
+        args.results_dir.mkdir(parents=True, exist_ok=True)
+        (args.results_dir / "rag_comparison.json").write_text(
+            json.dumps(comparisons, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return
     for manifest in manifests:
         await run_manifest(
             manifest,
@@ -121,6 +156,7 @@ async def main() -> None:
             concurrency=args.concurrency,
             image=args.image,
             allow_internet=args.allow_internet,
+            rag_enabled=args.rag_enabled,
             results_dir=args.results_dir,
         )
 

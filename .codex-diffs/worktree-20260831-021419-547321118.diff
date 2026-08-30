@@ -1,0 +1,58 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T02:14:19+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/backend/agents/codex_solver.py b/backend/agents/codex_solver.py
+index 74e5eb1..cf9f0a6 100755
+--- a/backend/agents/codex_solver.py
++++ b/backend/agents/codex_solver.py
+@@ -682,9 +682,10 @@ class CodexSolver:
+         elif name == "list_files":
+             return await do_list_files(self.sandbox, args.get("path", "/challenge/distfiles"))
+         elif name == "submit_flag":
+-            flag = args.get("flag", "")
++            flag = str(args.get("flag", "") or "")
++            candidate = flag.strip()
+             if self.no_submit:
+-                return f'DRY RUN — would submit "{flag}"'
++                return f'DRY RUN — would submit "{candidate}"'
+             if self.submit_fn:
+                 display, is_confirmed = await self.submit_fn(flag)
+             else:
+@@ -692,7 +693,7 @@ class CodexSolver:
+                 display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
+             if is_confirmed:
+                 self._confirmed = True
+-                self._flag = flag
++                self._flag = candidate
+             return display
+         elif name == "web_fetch":
+             if not self.allow_internet:
+diff --git a/tests/test_evidence.py b/tests/test_evidence.py
+index 59752dd..a6c1ce9 100644
+--- a/tests/test_evidence.py
++++ b/tests/test_evidence.py
+@@ -240,3 +240,24 @@ def test_intent_status_aliases_are_normalized() -> None:
+         assert CodexSolver._normalize_intent_status(source) == expected
+     assert CodexSolver._normalize_intent_status("unexpected") == "failed"
+     assert CodexSolver._normalize_intent_status(None) == "completed"
++
++
++def test_codex_submission_stores_normalized_flag() -> None:
++    from backend.agents.codex_solver import CodexSolver
++
++    async def submit(flag: str) -> tuple[str, bool]:
++        assert flag == " flag{ok} "
++        return "CORRECT", True
++
++    solver = object.__new__(CodexSolver)
++    solver.no_submit = False
++    solver.submit_fn = submit
++    solver.evidence_board = None
++    solver.intent_id = None
++    solver._confirmed = False
++    solver._flag = None
++    result = asyncio.run(solver._exec_tool("submit_flag", {"flag": " flag{ok} "}))
++
++    assert result == "CORRECT"
++    assert solver._confirmed is True
++    assert solver._flag == "flag{ok}"

@@ -1,0 +1,15 @@
+# Incremental diff snapshot reconstructed from historical worktree state.
+# This file contains only the net changes introduced at this timestamp.
+
+diff --git a/.gitignore b/.gitignore
+index b7342b9..6b96bdc 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,6 +3,7 @@
+ .env.*
+ creds.json
+ .codex/
++.codex-diffs/
+ .claude/scheduled_tasks.lock
+ 
+ # Logs, traces, and benchmark outputs

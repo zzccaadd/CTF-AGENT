@@ -1,7 +1,7 @@
 {
   "name": "smoke_20",
   "generated_at": "2026-08-21T08:42:52.530095+00:00",
-  "default_model": "codex/gpt-5.6-luna",
+  "default_model": "codex/gpt-5.5",
   "note": "10 NYU test challenges plus 10 Cybench benchmark tasks, all chosen from the lowest-score slice.",
   "summary": {
     "total": 20,

@@ -1,0 +1,158 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T03:13:29+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/docs/rag_stage2_plan.md b/docs/rag_stage2_plan.md
+index c7f46e4..e286da7 100644
+--- a/docs/rag_stage2_plan.md
++++ b/docs/rag_stage2_plan.md
+@@ -20,7 +20,7 @@
+ 尚未具备：
+ 
+ - Codex solver 的 `search_knowledge` 动态工具；
+-- Pydantic solver 的统一检索工具；
++- Pydantic solver 的统一检索兼容工具（非 MVP 必选）；
+ - 检索结果写入 trace/evidence 的可观测事件；
+ - 固定 RAG corpus、来源清单和版本管理；
+ - 无 RAG/RAG 对照评测；
+@@ -33,11 +33,11 @@
+ 
+ ### 2.1 本阶段目标
+ 
+-把知识检索接入 Stage 1 主链路，但不改变 solver 的任务领取、黑板、flag 提交和结束逻辑：
++把知识检索接入 Stage 1 主链路，但不改变 solver 的任务领取、黑板、flag 提交和结束逻辑。当前代码尚未完成该接入，下面的数据流是目标状态，不是现状声明：
+ 
+ ```text
+ challenge started
+-  -> Codex/Pydantic worker 按需调用 search_knowledge
++  -> Codex worker 按需调用 search_knowledge（Pydantic 仅保留兼容适配，不作为 MVP 门槛）
+   -> SQLite FTS5 返回带 provenance 的知识片段
+   -> worker 根据知识继续使用 sandbox/tools
+   -> 检索调用和引用写入 trace/evidence
+@@ -52,7 +52,7 @@ challenge started
+ - 不把 benchmark challenge 文件、flag、writeup 解答直接混入通用知识库；
+ - 不在 Stage 2 重写 `ChallengeSwarm` 或 Stage 1 evidence 状态机；
+ - 不要求 CTFd 在线服务参与 RAG 测试；
+-- 不同时支持多套不一致的 solver 检索接口。
++- 不同时维护多套不一致的 solver 检索接口；Codex 是 Stage 2 的必选接入方，Pydantic 仅在现有兼容场景需要时复用同一适配器。
+ 
+ ## 3. 当前代码审查
+ 
+@@ -101,7 +101,7 @@ challenge started
+   KnowledgeService.search(SearchRequest)
+         |
+         +--> Codex dynamic tool: search_knowledge
+-        +--> Pydantic tool: search_knowledge
++        +--> Pydantic compatibility tool: search_knowledge (optional)
+         |
+         v
+   SearchResult(text + metadata + provenance)
+@@ -113,7 +113,7 @@ challenge started
+ 
+ ### 4.2 统一服务接口
+ 
+-新增一个很薄的 service/adapter 层，禁止 solver 直接拼 SQL：
++新增一个很薄的 service/adapter 层，禁止 solver 直接拼 SQL。下面是目标契约；当前仓库还没有 `KnowledgeService` 实现：
+ 
+ ```python
+ search_knowledge(
+@@ -130,25 +130,25 @@ search_knowledge(
+ - `top_k` 默认 5，最大 10；
+ - 单次返回总字符数限制为 8,000；
+ - 每条结果必须带 document/chunk、section、行号、source URL/path、trust level；
+-- 没有结果返回空列表和可读提示，不抛出模型可见的 SQLite 异常；
++- service 层返回空列表并记录结构化诊断；agent tool 层再把“没有命中”或“暂时不可用”转换成模型可读文本，不向模型暴露 SQLite 异常；
+ - 检索失败只影响本次知识调用，不得终止 Stage 1 解题主链路。
+ 
+ ### 4.3 corpus 边界
+ 
+-Stage 2 默认只允许以下 source type：
++Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于索引脚本/service policy 层；底层 `SQLiteKnowledgeBase` 仍可保留通用 CRUD 能力，以免破坏现有单元测试和离线维护工具：
+ 
+ - `official`：官方工具、协议、文件格式和 CWE 文档；
+ - `reference`：经过审核的基础知识；
+ - `internal_notes`：项目内部运行说明。
+ 
+-以下内容默认禁止进入通用 RAG corpus：
++以下内容默认禁止进入通用 RAG corpus（测试用的 `writeup`/`notes` fixture 不代表批准的生产语料）：
+ 
+ - `benchmark`、`benchmark_corpus`；
+ - 题目原始附件和 flag；
+ - 未审核的 challenge-specific writeup；
+ - 带有外部秘密、凭据或个人数据的文件。
+ 
+-初始语料应优先覆盖：CWE、ELF/PE、常见协议和文件格式、gdb/radare2/pwntools/z3/Volatility 基础用法。每份文档必须有 source URL 或明确本地来源路径。
++初始语料应优先覆盖：CWE、ELF/PE、常见协议和文件格式、gdb/radare2/pwntools/z3/Volatility 基础用法。每份进入受控 corpus 的文档必须有 source URL 或明确本地来源路径；当前低层模型允许 `source_url=None`，这属于兼容能力，不等于 corpus policy 放宽。
+ 
+ ## 5. 分阶段实施计划
+ 
+@@ -180,24 +180,24 @@ Stage 2 默认只允许以下 source type：
+ 5. 增加检索耗时、命中数和 query hash 统计；不记录完整敏感 query 到公开日志。
+ 6. 为删除、重建和 DB 不存在场景定义稳定 CLI 返回码。
+ 
+-验收：本地离线环境可完成 ingest/search/delete；单次检索不超过 200 ms（目标库规模下）；所有结果可追溯到源文件和行号；异常不会让 solver 崩溃。
++验收：本地离线环境可完成 ingest/search/delete；在预先声明的目标库规模、硬件和冷/热缓存条件下，单次检索 P95 不超过 200 ms；该数值是性能目标，不是脱离语料规模的绝对保证；所有结果可追溯到源文件和行号；异常不会让 solver 崩溃。
+ 
+-### P2：接入 Codex 和 Pydantic solver
++### P2：接入 Codex solver（Pydantic 兼容适配可选）
+ 
+ 目标：在不改变 Stage 1 调度的前提下，让 solver 能按需查知识。
+ 
+ 任务：
+ 
+-1. Codex dynamic tool 增加 `search_knowledge` schema。
+-2. Pydantic `FunctionToolset` 增加同名工具。
+-3. 两条路径都调用同一个 service，使用相同参数和返回格式。
++1. Codex dynamic tool 增加 `search_knowledge` schema，这是 Stage 2 MVP 必须完成的 solver 接入。
++2. 如需维持现有 Pydantic 兼容运行，再在其 `FunctionToolset` 增加同名薄适配；它不是 Stage 2 MVP 的阻塞项。
++3. 所有已接入的路径都调用同一个 service，使用相同参数和返回格式。
+ 4. 每次调用写入现有 trace/tool_call/tool_result；结果 provenance 至少包含 query hash、document_id、chunk_id、source_type、trust_level。
+ 5. 将检索结果作为当前 turn 的上下文返回，不默认追加到全局 system prompt。
+ 6. 检索工具失败时返回可读错误并允许 solver 继续使用 sandbox。
+ 7. 增加 settings 开关：`knowledge_enabled`、`knowledge_db_path`、`knowledge_top_k`、`knowledge_max_chars`。
+-8. 默认启用工具但不主动调用；可通过配置关闭以进行 A/B 对照。
++8. 目标默认启用工具但不主动调用；可通过配置关闭以进行 A/B 对照。该默认值在代码落地前只是计划值，不能当作当前行为。
+ 
+-验收：Codex 和 Pydantic solver 都能在离线 DB 上调用同一接口；关闭 RAG 时原有 Stage 1 smoke 行为不变；开启 RAG 时可以在 trace/evidence 中定位检索和引用来源。
++验收：Codex solver 能在离线 DB 上调用统一接口；若启用 Pydantic 兼容适配，则其参数和结果与 Codex 一致；关闭 RAG 时原有 Stage 1 smoke 行为不变；开启 RAG 时可以在 trace/evidence 中定位检索和引用来源。
+ 
+ ### P3：RAG 效果与成本评估
+ 
+@@ -237,13 +237,13 @@ Stage 2 默认只允许以下 source type：
+ 
+ | 配置 | 默认值 | 说明 |
+ | --- | --- | --- |
+-| `knowledge_enabled` | `true` | 只控制工具是否可用，不代表自动检索 |
+-| `knowledge_db_path` | `logs/knowledge.sqlite3` | 与 evidence DB 分离 |
+-| `knowledge_top_k` | `5` | 单次最多返回 5 条 |
+-| `knowledge_max_chars` | `8000` | 限制返回上下文大小 |
+-| `knowledge_query_timeout_ms` | `200` | 超时返回空结果并记录 warning |
+-| `knowledge_allowed_sources` | `official,reference,internal_notes` | 防止任意文件入库 |
+-| `knowledge_trust_default` | `medium` | 未显式标记时使用 |
++| `knowledge_enabled` | `true`（目标值） | 只控制工具是否可用，不代表自动检索；当前代码尚未提供该开关 |
++| `knowledge_db_path` | `logs/knowledge.sqlite3`（目标值） | 与 evidence DB 分离；当前仅已有基础路径配置 |
++| `knowledge_top_k` | `5`（目标值） | 单次最多返回 5 条 |
++| `knowledge_max_chars` | `8000`（目标值） | 限制返回上下文大小 |
++| `knowledge_query_timeout_ms` | `200`（目标值） | 超时返回空结果并记录 warning；验收按 P95 目标执行 |
++| `knowledge_allowed_sources` | `official,reference,internal_notes`（目标值） | 由索引/service policy 层防止任意文件入库 |
++| `knowledge_trust_default` | `medium`（目标值） | 未显式标记时使用 |
+ | `knowledge_vector_enabled` | `false` | Stage 2 不启用向量检索 |
+ 
+ 参数由实现侧直接确定，优先保证本地可运行和可关闭，不增加不必要的业务对接。
+@@ -259,7 +259,7 @@ Stage 2 默认只允许以下 source type：
+ - `scripts/search_knowledge.py`：统一 service、返回码和 JSON 格式；
+ - `backend/config.py`：知识检索 feature flags 和上限配置；
+ - `backend/agents/codex_solver.py`：动态 `search_knowledge` 工具；
+-- `backend/agents/solver.py`：Pydantic 同名工具；
++- `backend/agents/solver.py`：Pydantic 同名兼容工具（如保留该运行路径）；
+ - `backend/benchmarks/models.py`、`backend/benchmarks/runner.py`：RAG 指标字段和 A/B 配置；
+ - `tests/test_knowledge.py`、新增 `tests/test_knowledge_tool.py`：单测、工具契约和失败隔离测试；
+ - `docs/rag_plan.md`：把阶段 2 状态更新为本文定义，避免旧计划继续把 Stage 2 写成未开始。
+@@ -268,7 +268,7 @@ Stage 2 默认只允许以下 source type：
+ 
+ 1. 先实现 P1 的 `KnowledgeService` 和边界测试；
+ 2. 再接入 Codex `search_knowledge`，用离线 DB 做工具级测试；
+-3. 接入 Pydantic solver，确认两条路径返回完全一致；
++3. 仅在现有兼容运行需要时接入 Pydantic 薄适配，并确认其参数/结果与 Codex 一致；
+ 4. 增加 trace/evidence provenance；
+ 5. 固定 smoke 子集，跑 RAG off/on 两组结果；
+ 6. 根据实际召回、成本和 solve rate 决定是否进入 P4。

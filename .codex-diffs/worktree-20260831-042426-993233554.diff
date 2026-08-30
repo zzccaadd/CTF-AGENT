@@ -1,0 +1,12 @@
+diff --git a/docs/STAGE1_PRESURE_plan.md b/docs/STAGE1_PRESURE_plan.md
+index 8a549fb..84348a6 100644
+--- a/docs/STAGE1_PRESURE_plan.md
++++ b/docs/STAGE1_PRESURE_plan.md
+@@ -28,6 +28,7 @@ benchmark runner -> ChallengeSwarm -> Codex worker pool
+ - CTFd 服务端吞吐和在线 API 压测；
+ - Codex 模型质量排名或跨模型公平比较；
+ - 向量 RAG、reranker、routes/branches 等 Stage 2 以后功能；
++- Stage 2 knowledge corpus/index/search 的吞吐和召回；这些内容单独在 Stage 2 评测，不计入本压测门槛；
+ - 生产环境多机 SQLite、分布式锁或跨主机容灾。
+ 
+ 在线 coordinator/poller 保留兼容性检查，但不放入本地 Stage 1 压测的通过门槛。

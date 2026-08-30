@@ -6,12 +6,14 @@ from backend.knowledge.models import (
     SearchRequest,
     SearchResult,
 )
+from backend.knowledge.service import KnowledgeService
 from backend.knowledge.store import SQLiteKnowledgeBase
 
 __all__ = [
     "KnowledgeChunk",
     "KnowledgeDocument",
     "SQLiteKnowledgeBase",
+    "KnowledgeService",
     "SearchRequest",
     "SearchResult",
 ]

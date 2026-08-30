@@ -1,0 +1,128 @@
+diff --git a/docs/rag_plan.md b/docs/rag_plan.md
+index e1966cb..c618df7 100644
+--- a/docs/rag_plan.md
++++ b/docs/rag_plan.md
+@@ -6,6 +6,28 @@
+ 
+ 默认 solver 模型：`codex/gpt-5.5`
+ 
++## RAG 架构分层
++
++当前项目采用“先 lexical、后 hybrid”的渐进路线。你提供的 Vector Search + BM25 + Merge + Reranker 是完整 Advanced RAG 形态，其中向量库、融合和 reranker 不属于当前 Stage 2 的已实现范围。
++
++```text
++当前 Stage 2 MVP
++文档 -> 清洗/切分 -> metadata -> SQLite FTS5(BM25) -> KnowledgeService -> Codex search_knowledge
++
++后续 Stage 4
++Query -> BM25 + Vector Search -> Merge/RRF -> Reranker -> Top-K Context -> Agent
++```
++
++知识库的统一概念不是只存 CWE，而是 `CTF Domain Knowledge Base`，至少包含三类受控来源：
++
++- `official`：CWE、ELF/PE、协议、文件格式和官方工具文档；
++- `reference`：经过审核的 pwn、reverse、crypto、web、forensics、misc 通用技术资料；
++- `internal_notes`：sandbox、黑板和 solver 协作规则。
++
++每个 chunk 都需要保留 `source_type`、`category`、`topic`、`tool_name`、`cwe_id`、`version`、`document_id`、`section`、`trust_level` 和来源路径/URL。当前实现中部分字段由通用 metadata 字典承载，`document_id`、`section`、行号和来源由索引流程补齐。
++
++benchmark 题目、flag、原始附件和未审核的 challenge-specific writeup 只属于评测或临时资料，不能进入通用 RAG corpus。
++
+ ## 总体原则
+ 
+ - 不重写主 solver 调度
+@@ -97,6 +119,8 @@
+   - 建索引
+ - 先用本地 SQLite FTS5 做 BM25/关键词检索
+ 
++本阶段明确不做 Vector Search、Embedding、Merge/RRF 和 Reranker；这些能力只有在 lexical 召回数据证明不足后，作为独立 Stage 4 增强接入，不能替换当前 lexical fallback。
++
+ ### metadata 建议
+ 
+ - `source_type`
+@@ -133,8 +157,7 @@ search_knowledge(query, source_type, metadata, top_k)
+ 
+ - Pydantic Solver：`backend/agents/solver.py`
+ - Codex Solver：`backend/agents/codex_solver.py`
+-- Claude Coordinator：`backend/agents/claude_coordinator.py`
+-- Claude Solver：补 MCP 工具或受控命令桥接
++- Claude Coordinator/Solver：暂不作为当前 MVP 门槛，后续按统一 service 适配
+ 
+ ### 原则
+ 
+@@ -242,7 +265,11 @@ search_knowledge(query, source_type, metadata, top_k)
+ 
+ ## 建议下一步
+ 
+-先把阶段 0 和阶段 1 做完，再进入阶段 2。
++当前 Stage 1 evidence graph 和 Stage 2 knowledge base 是两条不同链路：前者记录本次解题产生的事实/假设/工具证据，后者提供可复用的外部技术资料。两者通过 trace/evidence provenance 关联，但不能把题目运行结果反向当作通用知识直接入库。
++
++当前不拆分成 `search_cwe`、`search_writeup`、`search_docs` 三套 solver 工具，而是统一为 `search_knowledge`，通过 `source_type` 和 metadata filter 区分语料。这样可以避免不同工具的参数、错误处理和审计格式分叉；未来有必要时再增加面向用户的语义别名。
++
++先用受控语料完成 Stage 2 lexical MVP 和 Codex 工具闭环，再根据真实召回和 solve rate 数据决定是否进入向量/混合检索阶段。
+ 
+ 这样做的好处是：
+ - baseline 清楚
+diff --git a/docs/rag_stage1_review_v2.md b/docs/rag_stage1_review_v2.md
+index 68a10c1..de00ee0 100644
+--- a/docs/rag_stage1_review_v2.md
++++ b/docs/rag_stage1_review_v2.md
+@@ -229,3 +229,7 @@ challenge_finished
+ - board summary 有 item 数量和字符数双重上限，避免长结果挤爆模型上下文。
+ 
+ 本地 benchmark/smoke 路径使用 `LocalFlagVerifier`，不会连接 CTFd；`backend/ctfd.py`、`poller.py` 和旧 coordinator 入口仍保留给在线 `ctf-solve` 兼容链路。当前未执行的只有真实 Codex 进程、Docker sandbox 和 CTFd 的在线端到端联调；这不影响本地单元测试和静态校验结果。
++
++## 12. 与 Stage 2 Knowledge Base 的边界
++
++Stage 1 只负责解题运行时的 evidence graph、黑板协作、Intent 领取和 flag 生命周期；Stage 2 knowledge base 负责提供可复用的领域资料。Stage 1 产生的题目附件、flag、临时假设和未审核 writeup 不得自动写入通用 knowledge corpus。两者只通过 trace/evidence provenance 关联，避免把一次题目的运行结果当成通用事实。
+diff --git a/docs/rag_stage2_plan.md b/docs/rag_stage2_plan.md
+index 86fc190..45d5947 100644
+--- a/docs/rag_stage2_plan.md
++++ b/docs/rag_stage2_plan.md
+@@ -2,6 +2,10 @@
+ 
+ > 本文用于说明当前 Stage 2 的真实实现状态、缺口和后续落地路径。Stage 2 以本地、离线、可回滚的 lexical RAG 为目标，不在本阶段引入向量数据库、reranker 或复杂知识图谱。
+ 
++> 架构对齐说明：你提供的 Vector Search + BM25 + Merge + Reranker 属于后续 Advanced RAG 目标形态；本文只落地其中的 BM25/metadata/Agent Tool 最小闭环，向量检索和 reranker 保留到独立后续阶段。
++
++> 结构对齐说明：帖子中的 `CWE`、`Writeup`、`Tool Docs` 是知识来源分类，不要求当前实现拆成三个数据库或三个工具。当前统一使用 `source_type + metadata` 管理来源；challenge-specific writeup 默认不进入通用 corpus，避免 flag 泄露和评测污染。
++
+ ## 1. 结论先行
+ 
+ 当前 Stage 2 已完成了“知识库底座”，但尚未完成“RAG 对 solver 生效”的完整闭环。
+@@ -42,6 +46,20 @@ challenge started
+   -> 原有黑板、提交和 SolverResult 链路继续工作
+ ```
+ 
++### 2.1.1 与 Advanced RAG 的对应关系
++
++| Advanced RAG 组件 | 当前 Stage 2 | 后续阶段 |
++| --- | --- | --- |
++| 结构化清洗/切分 | 已实现 | 持续优化 |
++| Metadata Filter | 已实现扁平精确匹配 | 可扩展范围/列表过滤 |
++| BM25 Search | SQLite FTS5 已实现 | 保留 lexical fallback |
++| Vector Search | 暂不实现 | 独立 embedding/vector index |
++| Merge/RRF | 暂不实现 | Vector + BM25 融合阶段 |
++| Reranker | 暂不实现 | Hybrid 稳定后再加 |
++| Agent Tool | Codex `search_knowledge` 已实现 | 统一其他 solver 适配 |
++
++因此当前 knowledge 库不是“向量数据库缺失的半成品”，而是有明确边界的 lexical MVP；未来增加向量检索时，应复用同一个 `KnowledgeService`，由 service 内部完成候选合并，不能让 solver 各自实现检索逻辑。
++
+ ### 2.2 明确不做
+ 
+ - 不引入向量数据库或外部 embedding 服务；
+@@ -147,7 +165,7 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
+ - 未审核的 challenge-specific writeup；
+ - 带有外部秘密、凭据或个人数据的文件。
+ 
+-初始语料应优先覆盖：CWE、ELF/PE、常见协议和文件格式、gdb/radare2/pwntools/z3/Volatility 基础用法。每份进入受控 corpus 的文档必须有 source URL 或明确本地来源路径；当前低层模型允许 `source_url=None`，这属于兼容能力，不等于 corpus policy 放宽。
++初始语料应优先覆盖：CWE、ELF/PE、常见协议和文件格式、gdb/radare2/pwntools/z3/Volatility 基础用法，并按 `category/topic/tool_name/cwe_id/version` 补齐 metadata。每份进入受控 corpus 的文档必须有 source URL 或明确本地来源路径；当前低层模型允许 `source_url=None`，这属于兼容能力，不等于 corpus policy 放宽。
+ 
+ ## 5. 分阶段实施计划
+ 
+@@ -272,4 +290,4 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
+ 5. 固定 smoke 子集，跑 RAG off/on 两组结果；
+ 6. 根据实际召回、成本和 solve rate 决定是否进入 P4。
+ 
+-Stage 2 的最小完成定义不是“有一个 SQLite FTS5 文件”，而是：**solver 能按需调用统一检索接口，结果可追溯、可关闭、可评估，并且不破坏 Stage 1 主链路。**
++Stage 2 的最小完成定义不是“有一个 SQLite FTS5 文件”，而是：**solver 能按需调用统一 lexical 检索接口，结果可追溯、可关闭、可评估，并且不破坏 Stage 1 主链路。** 向量检索、Merge/RRF 和 Reranker 不属于本阶段完成条件。

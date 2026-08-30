@@ -1,0 +1,853 @@
+# Incremental diff snapshot reconstructed from historical worktree state.
+# This file contains only the net changes introduced at this timestamp.
+
+diff --git a/.gitignore b/.gitignore
+index 6b96bdc..b7342b9 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,7 +3,6 @@
+ .env.*
+ creds.json
+ .codex/
+-.codex-diffs/
+ .claude/scheduled_tasks.lock
+ 
+ # Logs, traces, and benchmark outputs
+diff --git a/backend/agents/codex_solver.py b/backend/agents/codex_solver.py
+index 199fb36..3e1c1bf 100755
+--- a/backend/agents/codex_solver.py
++++ b/backend/agents/codex_solver.py
+@@ -739,11 +739,23 @@ class CodexSolver:
+             except asyncio.CancelledError:
+                 return
+             if self.intent_id:
+-                self.evidence_board.store.heartbeat(
++                renewed = self.evidence_board.heartbeat(
+                     intent_id=self.intent_id,
+                     worker_id=self.solver_label,
+                     lease_seconds=self._intent_lease_seconds,
+                 )
++                if not renewed:
++                    self.evidence_board.record(
++                        self.solver_label,
++                        "worker",
++                        "intent_lease_lost",
++                        {"intent_id": self.intent_id},
++                        provenance={"source_kind": "trace", "source_excerpt": "intent lease heartbeat rejected"},
++                    )
++                    self.intent_id = None
++                    self._intent_goal = ""
++                    self._intent_acceptance = ""
++                    return
+ 
+     def _complete_current_intent(self, result: str, status: str = "completed") -> None:
+         if self.evidence_board and self.intent_id:
+diff --git a/backend/agents/solver.py b/backend/agents/solver.py
+index 08a29dc..c525fb6 100755
+--- a/backend/agents/solver.py
++++ b/backend/agents/solver.py
+@@ -45,6 +45,7 @@ from backend.tracing import SolverTracer
+ 
+ if TYPE_CHECKING:
+     from backend.config import Settings
++    from backend.evidence import EvidenceBoard
+     from backend.submission import FlagSubmitter
+ 
+ logger = logging.getLogger(__name__)
+@@ -65,6 +66,33 @@ class TracingToolset(WrapperToolset[SolverDeps]):
+         step = self.step_counter[0]
+ 
+         self.tracer.tool_call(name, tool_args, step)
++        board = ctx.deps.evidence_board
++        intent_id = ctx.deps.intent_id
++        if board:
++            board.record(
++                ctx.deps.model_spec or "solver",
++                "worker",
++                "tool_call",
++                {"tool": name, "args": tool_args, "step": step, "intent_id": intent_id or ""},
++                provenance={"source_kind": "trace", "source_excerpt": f"{name} called at step {step}"},
++                dedupe_key=f"tool-call:{ctx.deps.model_spec}:{step}:{name}",
++            )
++
++        # Operational work must be tied to a blackboard intent. This keeps the
++        # API-backed fallback under the same coordination contract as Codex.
++        if board and not intent_id and name in {
++            "bash", "read_file", "write_file", "list_files", "submit_flag",
++            "web_fetch", "webhook_create", "webhook_get_requests", "view_image",
++        }:
++            message = "No active blackboard intent; claim a task before using operational tools."
++            self.tracer.tool_result(name, message, step)
++            board.record(
++                ctx.deps.model_spec or "solver", "worker", "tool_result",
++                {"tool": name, "result": message, "step": step, "intent_id": ""},
++                provenance={"source_kind": "trace", "source_excerpt": message},
++                dedupe_key=f"tool-result:{ctx.deps.model_spec}:{step}:{name}",
++            )
++            return message
+ 
+         # Loop detection
+         loop_status = self.loop_detector.check(name, tool_args)
+@@ -72,12 +100,29 @@ class TracingToolset(WrapperToolset[SolverDeps]):
+             logger.warning(f"Loop break on {name} at step {step}")
+             self.tracer.event("loop_break", tool=name, step=step)
+             # Inject loop warning by returning it as the tool result
++            if board:
++                board.record(
++                    ctx.deps.model_spec or "solver", "worker", "tool_result",
++                    {"tool": name, "result": LOOP_WARNING_MESSAGE, "step": step,
++                     "intent_id": intent_id or ""},
++                    provenance={"source_kind": "trace", "source_excerpt": LOOP_WARNING_MESSAGE},
++                    dedupe_key=f"tool-result:{ctx.deps.model_spec}:{step}:{name}",
++                )
+             return LOOP_WARNING_MESSAGE
+ 
+         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
+ 
+         result_str = str(result) if result is not None else ""
+         self.tracer.tool_result(name, result_str, step)
++        if board:
++            board.record(
++                ctx.deps.model_spec or "solver",
++                "worker",
++                "tool_result",
++                {"tool": name, "result": result_str[:2000], "step": step, "intent_id": intent_id or ""},
++                provenance={"source_kind": "tool_result", "source_excerpt": result_str[:500]},
++                dedupe_key=f"tool-result:{ctx.deps.model_spec}:{step}:{name}",
++            )
+ 
+         # Inject loop warning alongside result on "warn" level
+         if loop_status == "warn":
+@@ -130,6 +175,7 @@ class Solver:
+         sandbox: DockerSandbox | None = None,
+         owns_sandbox: bool | None = None,
+         solver_label: str | None = None,
++        evidence_board: EvidenceBoard | None = None,
+     ) -> None:
+         self.model_spec = model_spec
+         self.model_id = model_id_from_spec(model_spec)
+@@ -141,6 +187,10 @@ class Solver:
+         self.settings = settings
+         self.cancel_event = cancel_event or asyncio.Event()
+         self._owns_sandbox = owns_sandbox if owns_sandbox is not None else (sandbox is None)
++        self.evidence_board = evidence_board
++        self.intent_id: str | None = None
++        self._intent_lease_seconds = int(getattr(settings, "blackboard_default_worker_lease_seconds", 300))
++        self._intent_heartbeat_task: asyncio.Task | None = None
+ 
+         self.sandbox = sandbox or DockerSandbox(
+             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
+@@ -158,6 +208,7 @@ class Solver:
+             use_vision=self.use_vision,
+             cost_tracker=cost_tracker,
+             allow_internet=bool(getattr(settings, "allow_internet", True)),
++            evidence_board=evidence_board,
+         )
+         self.loop_detector = LoopDetector()
+         self.tracer = SolverTracer(meta.name, self.solver_label)
+@@ -214,11 +265,22 @@ class Solver:
+             await self.start()
+         assert self._agent is not None
+ 
++        await self._claim_next_intent()
++        board_context = self.evidence_board.summary() if self.evidence_board else ""
++        intent_context = ""
++        if self.intent_id and self.evidence_board:
++            intent = next((i for i in self.evidence_board.open_intents() if i.intent_id == self.intent_id), None)
++            if intent:
++                intent_context = f"\nAssigned blackboard intent: {intent.goal}\nAcceptance: {intent.acceptance}\n"
++        prompt = ("Solve this CTF challenge." if not self._messages else "Continue solving.")
++        if board_context:
++            prompt += f"\n{intent_context}\nShared blackboard:\n{board_context}"
++
+         t0 = time.monotonic()
+         try:
+             from pydantic_ai.usage import UsageLimits
+             result = await self._agent.run(
+-                "Solve this CTF challenge." if not self._messages else "Continue solving.",
++                prompt,
+                 deps=self.deps,
+                 message_history=self._messages if self._messages else None,
+                 usage_limits=UsageLimits(request_limit=None),
+@@ -268,17 +330,77 @@ class Solver:
+                 self._flag = self._flag or self.deps.confirmed_flag
+ 
+             if self._confirmed and self._flag:
++                await self._finalize_intent(FLAG_FOUND)
+                 return self._result(FLAG_FOUND)
++            await self._finalize_intent(GAVE_UP)
+             return self._result(GAVE_UP)
+ 
+         except asyncio.CancelledError:
++            await self._finalize_intent(CANCELLED)
+             return self._result(CANCELLED)
+         except Exception as e:
+             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
+             self._findings = f"Error: {e}"
+             self.tracer.event("error", error=str(e))
++            await self._finalize_intent(ERROR)
+             return self._result(ERROR)
+ 
++    async def _claim_next_intent(self) -> None:
++        if not self.evidence_board or self.intent_id:
++            return
++        max_attempts = int(getattr(self.settings, "blackboard_intent_max_attempts", 3))
++        for intent in self.evidence_board.open_intents():
++            claimed = self.evidence_board.claim(
++                self.solver_label,
++                intent.intent_id,
++                lease_seconds=self._intent_lease_seconds,
++                max_attempts=max_attempts,
++            )
++            if claimed:
++                self.intent_id = claimed.intent_id
++                self.deps.intent_id = claimed.intent_id
++                self._intent_heartbeat_task = asyncio.create_task(self._heartbeat_intent())
++                return
++
++    async def _heartbeat_intent(self) -> None:
++        try:
++            while self.intent_id and not self.cancel_event.is_set():
++                await asyncio.sleep(max(1, min(60, self._intent_lease_seconds // 3)))
++                if self.intent_id and not self.evidence_board:
++                    return
++                if self.intent_id and not self.evidence_board.heartbeat(
++                    self.intent_id, self.solver_label, self._intent_lease_seconds
++                ):
++                    self.evidence_board.record(
++                        self.solver_label,
++                        "worker",
++                        "intent_lease_lost",
++                        {"intent_id": self.intent_id},
++                        provenance={"source_kind": "trace", "source_excerpt": "intent lease heartbeat rejected"},
++                    )
++                    self.intent_id = None
++                    self.deps.intent_id = None
++                    return
++        except asyncio.CancelledError:
++            return
++
++    async def _finalize_intent(self, solver_status: str) -> None:
++        if not self.evidence_board or not self.intent_id:
++            return
++        intent_id, self.intent_id = self.intent_id, None
++        self.deps.intent_id = None
++        if self._intent_heartbeat_task:
++            self._intent_heartbeat_task.cancel()
++            await asyncio.gather(self._intent_heartbeat_task, return_exceptions=True)
++            self._intent_heartbeat_task = None
++        terminal = "blocked" if solver_status == CANCELLED else ("failed" if solver_status == ERROR else "completed")
++        self.evidence_board.complete(
++            self.solver_label,
++            intent_id,
++            self._findings or solver_status,
++            status=terminal,
++        )
++
+     def bump(self, insights: str) -> None:
+         """Inject insights from siblings and prepare to resume."""
+         bump_msg = ModelRequest(
+@@ -313,6 +435,10 @@ class Solver:
+         )
+ 
+     async def stop(self) -> None:
++        if self._intent_heartbeat_task:
++            self._intent_heartbeat_task.cancel()
++            await asyncio.gather(self._intent_heartbeat_task, return_exceptions=True)
++            self._intent_heartbeat_task = None
+         self.tracer.event("stop", step_count=self._step_count[0])
+         self.tracer.close()
+         if self._owns_sandbox and self.sandbox:
+diff --git a/backend/agents/swarm.py b/backend/agents/swarm.py
+index 6e0bfbb..a64dcc4 100755
+--- a/backend/agents/swarm.py
++++ b/backend/agents/swarm.py
+@@ -112,6 +112,7 @@ class ChallengeSwarm:
+         self.run_id = self.evidence_board.run_id
+         self.message_bus.attach_board(self.evidence_board)
+         self.evidence_board.start("swarm")
++        self._restore_followup_index()
+         # Three focused bootstrap tasks give the initial Codex workers distinct work.
+         goals = (
+             "Recon the challenge files, target, and exposed services",
+@@ -126,6 +127,22 @@ class ChallengeSwarm:
+                 intent_id=f"bootstrap:{self.meta.name}:{self.run_id}:{idx}",
+             )
+ 
++    def _restore_followup_index(self) -> None:
++        """Continue dynamic intent numbering when a run is reopened."""
++        if not self.evidence_board:
++            return
++        prefix = f"followup:{self.meta.name}:{self.run_id}:"
++        indexes: list[int] = []
++        for intent in self.evidence_board.store.list_intents(
++            self.meta.name, self.run_id, active_only=False
++        ):
++            if not intent.intent_id.startswith(prefix):
++                continue
++            suffix = intent.intent_id[len(prefix):]
++            if suffix.isdigit():
++                indexes.append(int(suffix))
++        self._next_intent_index = max(4, max(indexes, default=3) + 1)
++
+     def _solver_slots(self) -> list[SolverSlot]:
+         max_solvers = min(self.max_solvers, getattr(self.settings, "max_solvers_per_swarm", self.max_solvers))
+         return build_solver_slots(
+@@ -212,6 +229,7 @@ class ChallengeSwarm:
+             sandbox=sandbox,
+             owns_sandbox=owns_sandbox,
+             solver_label=solver_label,
++            evidence_board=self.evidence_board,
+         )
+         solver.deps.message_bus = self.message_bus
+         solver.deps.model_spec = solver_label
+diff --git a/backend/evidence/board.py b/backend/evidence/board.py
+index 1c4cc41..330401f 100644
+--- a/backend/evidence/board.py
++++ b/backend/evidence/board.py
+@@ -70,6 +70,13 @@ class EvidenceBoard:
+             max_attempts=max_attempts,
+         )
+ 
++    def heartbeat(self, intent_id: str, worker_id: str, lease_seconds: int = 300) -> bool:
++        return self.store.heartbeat(
++            intent_id=intent_id,
++            worker_id=worker_id,
++            lease_seconds=lease_seconds,
++        )
++
+     def open_intents(self) -> list[Intent]:
+         return self.store.list_intents(self.challenge_name, self.run_id)
+ 
+@@ -77,8 +84,8 @@ class EvidenceBoard:
+     def list_open_intents(self) -> list[Intent]:
+         return self.open_intents()
+ 
+-    def read_board_summary(self, max_items: int = 16) -> str:
+-        return self.summary(max_items=max_items)
++    def read_board_summary(self, max_items: int = 16, max_chars: int = 12000) -> str:
++        return self.summary(max_items=max_items, max_chars=max_chars)
+ 
+     def complete(self, worker_id: str, intent_id: str, result: str, status: str = "completed", produced_event_ids: list[str] | None = None) -> Intent | None:
+         return self.store.complete_intent(
+@@ -119,11 +126,15 @@ class EvidenceBoard:
+     def verify_flag(self, actor_id: str, flag: str, *, provenance: dict[str, Any], intent_id: str | None = None) -> EvidenceEvent:
+         return self.record(actor_id, "worker", "flag_verified", {"flag": flag.strip(), "intent_id": intent_id or ""}, provenance=provenance, verified=True, dedupe_key=f"flag:{self.challenge_name}:{self.run_id}:{flag.strip()}")
+ 
+-    def summary(self, max_items: int = 16) -> str:
++    def summary(self, max_items: int = 16, max_chars: int = 12000) -> str:
+         events = self.store.events(self.challenge_name, self.run_id)
+-        facts = [e for e in events if e.kind == "fact_added" and e.verified][-max_items:]
+-        hypotheses = [e for e in events if e.kind == "hypothesis_added"][-max_items:]
+-        dead_ends = [e for e in events if e.kind == "dead_end_added"][-max_items:]
++        item_limit = max(0, int(max_items))
++        facts = ([e for e in events if e.kind == "fact_added" and e.verified][-item_limit:]
++                 if item_limit else [])
++        hypotheses = ([e for e in events if e.kind == "hypothesis_added"][-item_limit:]
++                      if item_limit else [])
++        dead_ends = ([e for e in events if e.kind == "dead_end_added"][-item_limit:]
++                     if item_limit else [])
+         intents = self.open_intents()
+         lines = [f"## Blackboard: {self.challenge_name}"]
+         if facts:
+@@ -137,7 +148,15 @@ class EvidenceBoard:
+             lines.extend(f"- {e.payload.get('reason', '')}" for e in dead_ends)
+         lines.append("\n### Active intents")
+         lines.extend(f"- {i.intent_id}: {i.goal} ({i.status})" for i in intents)
+-        return "\n".join(lines)
++        summary = "\n".join(lines)
++        if max_chars < 1:
++            return ""
++        if len(summary) <= max_chars:
++            return summary
++        marker = "\n... [blackboard summary truncated]"
++        if max_chars <= len(marker):
++            return marker[:max_chars]
++        return summary[: max_chars - len(marker)] + marker
+ 
+     def snapshot(self) -> BoardSnapshot:
+         events = self.store.events(self.challenge_name, self.run_id)
+@@ -145,7 +164,6 @@ class EvidenceBoard:
+             self.challenge_name,
+             self.run_id,
+             events,
+-            self.store.list_intents(self.challenge_name, self.run_id, active_only=False),
+         )
+ 
+     def replay(self) -> BoardSnapshot:
+diff --git a/backend/evidence/replay.py b/backend/evidence/replay.py
+index 4782c45..c6aa1ba 100644
+--- a/backend/evidence/replay.py
++++ b/backend/evidence/replay.py
+@@ -12,6 +12,4 @@ def replay(query: EvidenceQuery) -> BoardSnapshot:
+         query.challenge_name,
+         query.run_id,
+         query.events(),
+-        query.intents(active_only=False),
+     )
+-
+diff --git a/backend/evidence/state.py b/backend/evidence/state.py
+index 2d6f21a..f294487 100644
+--- a/backend/evidence/state.py
++++ b/backend/evidence/state.py
+@@ -7,13 +7,49 @@ from collections.abc import Iterable
+ from backend.evidence.models import BoardSnapshot, EvidenceEvent, Intent
+ 
+ 
++def _fold_intents(events: list[EvidenceEvent]) -> list[Intent]:
++    intents: dict[str, Intent] = {}
++    for event in events:
++        if event.kind == "intent_proposed":
++            intent_id = str(event.payload.get("intent_id", ""))
++            if intent_id and intent_id not in intents:
++                intents[intent_id] = Intent(
++                    intent_id=intent_id,
++                    challenge_name=event.challenge_name,
++                    run_id=event.run_id,
++                    goal=str(event.payload.get("goal", "")),
++                    acceptance=str(event.payload.get("acceptance", "")),
++                    created_event_id=event.event_id,
++                )
++        elif event.kind == "intent_claimed":
++            intent_id = str(event.payload.get("intent_id", ""))
++            current = intents.get(intent_id)
++            if current:
++                intents[intent_id] = Intent(
++                    **{**current.__dict__, "status": "claimed", "worker_id": event.actor_id,
++                       "lease_until": event.payload.get("lease_until"), "attempt": current.attempt + 1}
++                )
++        elif event.kind == "intent_completed":
++            intent_id = str(event.payload.get("intent_id", ""))
++            current = intents.get(intent_id)
++            if current:
++                intents[intent_id] = Intent(
++                    **{**current.__dict__, "status": str(event.payload.get("status", "completed")),
++                       "worker_id": None, "lease_until": None,
++                       "result": str(event.payload.get("result", ""))[:2000],
++                       "result_event_id": event.event_id}
++                )
++    return sorted(intents.values(), key=lambda intent: intent.intent_id)
++
++
+ def fold_events(
+     challenge_name: str,
+     run_id: str,
+     events: Iterable[EvidenceEvent],
+-    intents: Iterable[Intent],
++    intents: Iterable[Intent] | None = None,
+ ) -> BoardSnapshot:
+     ordered = sorted(events, key=lambda event: event.seq)
++    folded_intents = _fold_intents(ordered) if intents is None else list(intents)
+     flags = [
+         event.payload.get("flag")
+         for event in ordered
+@@ -25,8 +61,7 @@ def fold_events(
+         facts=[event for event in ordered if event.kind == "fact_added"],
+         hypotheses=[event for event in ordered if event.kind == "hypothesis_added"],
+         dead_ends=[event for event in ordered if event.kind == "dead_end_added"],
+-        intents=list(intents),
++        intents=folded_intents,
+         flag=flags[0] if flags else None,
+         last_seq=ordered[-1].seq if ordered else 0,
+     )
+-
+diff --git a/backend/evidence/store.py b/backend/evidence/store.py
+index 1c1b63a..1959c88 100644
+--- a/backend/evidence/store.py
++++ b/backend/evidence/store.py
+@@ -155,6 +155,18 @@ class SQLiteEvidenceStore:
+         dedupe_key = dedupe_key or self._fingerprint(
+             challenge_name, run_id, actor_id, kind, payload
+         )
++        legacy_dedupe_key = dedupe_key
++        # Dedupe is scoped to one challenge run. This prevents a caller-supplied
++        # short key from colliding with an unrelated challenge in the global DB.
++        dedupe_key = f"{challenge_name}:{run_id}:{dedupe_key}"
++        # Read old unscoped rows during an in-place upgrade. Restrict the lookup
++        # by challenge/run so a legacy collision cannot leak another run's event.
++        legacy = self._conn.execute(
++            "SELECT * FROM events WHERE dedupe_key=? AND challenge_name=? AND run_id=?",
++            (legacy_dedupe_key, challenge_name, run_id),
++        ).fetchone()
++        if legacy is not None:
++            return self._event(legacy)
+         event_id = str(uuid.uuid4())
+         self._conn.execute(
+             """INSERT OR IGNORE INTO events
+@@ -437,6 +449,7 @@ class SQLiteEvidenceStore:
+         if status not in {"completed", "failed", "blocked"}:
+             raise ValueError(f"invalid intent terminal status: {status}")
+         with self._lock:
++            now = time.time()
+             existing = self._conn.execute(
+                 """SELECT * FROM intents
+                 WHERE intent_id=? AND challenge_name=? AND run_id=?""",
+@@ -451,8 +464,8 @@ class SQLiteEvidenceStore:
+                 current = self._conn.execute(
+                     """SELECT * FROM intents
+                     WHERE intent_id=? AND challenge_name=? AND run_id=?
+-                      AND status='claimed' AND worker_id=?""",
+-                    (intent_id, challenge_name, run_id, worker_id),
++                      AND status='claimed' AND worker_id=? AND lease_until >= ?""",
++                    (intent_id, challenge_name, run_id, worker_id, now),
+                 ).fetchone()
+                 if current is None:
+                     self._conn.rollback()
+diff --git a/docs/rag_plan.md b/docs/rag_plan.md
+index 861dc67..e1966cb 100644
+--- a/docs/rag_plan.md
++++ b/docs/rag_plan.md
+@@ -4,7 +4,7 @@
+ 
+ 在不改变主链路的前提下，把 RAG 作为一个可插拔模块接入当前 CTF Agent，并先完成一个低成本、可复现、可评估的最小版本。
+ 
+-默认 solver 模型：`codex/gpt-5.6-luna`
++默认 solver 模型：`codex/gpt-5.5`
+ 
+ ## 总体原则
+ 
+@@ -13,64 +13,6 @@
+ - 先做 lexical MVP，再考虑向量检索
+ - RAG 按需调用，不默认塞进系统提示词
+ - 每一步都要能独立评估和回滚
+-- 评估时同时看 solve rate、token、耗时、步数、失败类型和错误引用率，不只看单一指标
+-
+-## 术语说明
+-
+-### Evidence Graph
+-
+-Evidence Graph 不是直接为 RAG 检索服务的，它的作用是把题目推进过程结构化保存下来，方便：
+-
+-- 推理过程回放
+-- 事实、猜测、死路的区分
+-- trace / tool result 的追溯
+-- 后续分析模型到底用了哪些证据
+-
+-它更像是解题记忆和审计层，不是知识库本身。
+-
+-### Corpus
+-
+-corpus 就是语料库 / 数据集。
+-
+-这里至少分两类：
+-
+-- benchmark corpus：只用于评估，不参与检索索引
+-- RAG corpus：知识库内容，只用于检索
+-
+-### Lexical MVP
+-
+-lexical MVP 指最小可用的关键词检索版本。
+-
+-先不用向量检索，先用：
+-
+-- BM25
+-- SQLite FTS5
+-- 关键词匹配
+-- metadata 过滤
+-
+-把 RAG 的第一版跑通。
+-
+-### Writeup
+-
+-writeup 指题目的解题说明、解法总结、分析笔记、官方或社区提供的题解材料。
+-
+-在这份计划里，writeup 也要进入知识库，但要打 `trust_level`，因为它高价值，也可能过拟合某道题。
+-
+-### Trust Level
+-
+-trust_level 用来标记知识可信度，例如：
+-
+-- `official`
+-- `high`
+-- `medium`
+-- `low`
+-
+-这样检索时可以优先选更可信的来源，也方便后续分析错误引用。
+-后续可以进一步约定：
+-
+-- `official` 优先进入默认检索
+-- `high` / `medium` 可参与默认检索
+-- `low` 仅在显式放开时参与，避免把噪声当经验
+ 
+ ## 阶段 0：建立基线和契约
+ 
+@@ -93,58 +35,36 @@ trust_level 用来标记知识可信度，例如：
+ - `score`
+ - `provenance`
+ 
+-### SearchResult 的 provenance
+-
+-provenance 建议至少包括：
+-
+-- `source_url`
+-- `document_id`
+-- `section`
+-- `paragraph`
+-- `chunk_id`
+-- `line_start`
+-- `line_end`
+-
+-这样结果可以溯源，也能减少幻觉式引用。
+-
+-### 默认检索参数
+-
+-- `top_k = 10`
+-- metadata 过滤默认开启
+-
+ ### 验收标准
+ 
+ - 有 baseline 指标
+ - 数据模型可落地
+ - benchmark corpus 和 RAG corpus 不混用
+ 
+-## 阶段 1：补 Shared Graph / 共享黑板
++## 阶段 1：补 Evidence Graph
+ 
+ ### 目标
+ 
+-把现有字符串 findings 和低级 trace，升级成对齐 `muteki-main` 的 shared graph 共享黑板。
+-详细实现见 `docs/rag_stage1_plan.md`。
++把现有 MessageBus 里的字符串 findings，逐步升级成结构化证据事件。
+ 
+ ### 建议事件类型
+ 
+ - `fact_added`
+ - `hypothesis_added`
+ - `dead_end_added`
++- `poc_added`
+ - `intent_proposed`
+ - `intent_claimed`
+ - `intent_completed`
++- `review_submitted`
+ - `flag_verified`
+ 
+ ### 实现思路
+ 
+ - 新增独立的 `backend/evidence/` 模块
+-- 黑板功能默认启用，且作为唯一主状态
+-- coordinator / reason 负责生成 intent
+-- solver 从单兵闭环模式迁移为 worker，按 intent 认领、执行、回写
++- 现有 `ChallengeSwarm` 竞争模式先保留
++- 结构化事件先作为旁路记录，不强制改调度逻辑
+ - 事件需要能关联原始 trace 和 tool result
+-- 落盘优先用 SQLite
+-- 支持增量恢复
+-- 支持按 challenge 回放
+ 
+ ### 验收标准
+ 
+@@ -157,7 +77,7 @@ provenance 建议至少包括：
+ 
+ ### 目标
+ 
+-先做一个不依赖外部向量服务的关键词检索版本，验证 RAG 是否能带来收益。
++先做一个不依赖外部向量服务的检索版本，验证 RAG 是否能带来收益。
+ 
+ ### 范围
+ 
+@@ -176,7 +96,6 @@ provenance 建议至少包括：
+   - 去重
+   - 建索引
+ - 先用本地 SQLite FTS5 做 BM25/关键词检索
+-- `SearchRequest` 先支持 `query`、`source_type`、`metadata`、`top_k=10`
+ 
+ ### metadata 建议
+ 
+@@ -191,29 +110,12 @@ provenance 建议至少包括：
+ - `trust_level`
+ - `split`
+ 
+-### 建议收录内容
+-
+-- 官方文档
+-- 基础漏洞知识
+-- 协议 / 文件格式 / 二进制基础
+-- 工具文档
+-- writeup / 解题笔记 / 题目分析
+-- 特定题目的解法方法论和可复用套路
+-
+-### 不建议混入的内容
+-
+-- benchmark corpus 原始题目本体
+-- 运行时临时日志
+-- 没有来源标记的碎片化猜测
+-
+ ### 验收标准
+ 
+ - 能按 query 检索知识
+ - 能按 metadata 过滤
+ - 检索结果可追溯
+ - 不需要向量库也能跑通
+-- 新文档进入知识库前必须经过人工审核
+-- 过期内容保留但降权
+ 
+ ## 阶段 3：接入 Agent 工具层
+ 
+@@ -231,15 +133,14 @@ search_knowledge(query, source_type, metadata, top_k)
+ 
+ - Pydantic Solver：`backend/agents/solver.py`
+ - Codex Solver：`backend/agents/codex_solver.py`
+-- Claude Coordinator：后续再接，不作为当前主链路范围
+-- Claude Solver：先不补 MCP，等主链路稳定后再决定是否补齐
++- Claude Coordinator：`backend/agents/claude_coordinator.py`
++- Claude Solver：补 MCP 工具或受控命令桥接
+ 
+ ### 原则
+ 
+ - 按需调用
+ - 不自动灌进 system prompt
+ - 各 solver 的 RAG 能力尽量一致
+-- 先把主链路打通，再考虑补齐其他 solver 形态
+ 
+ ### 验收标准
+ 
+@@ -274,7 +175,6 @@ search_knowledge(query, source_type, metadata, top_k)
+ - 额外 token 成本
+ - Solver solve rate 变化
+ - 错误知识引用率
+-- smoke 集是否跑，作为可选检查项而不是强制项
+ 
+ ## 当前评估集
+ 
+@@ -297,22 +197,48 @@ search_knowledge(query, source_type, metadata, top_k)
+ 
+ ## 目前我认为还需要确认的点
+ 
+-### 1. 知识更新节奏
++### 1. 数据边界
+ 
+-我建议先采用批量更新：
+-- 每累计约 5 个已验证题目，或 5 次 solver 完成，触发一次知识库整理
+-- 由人工审核后再入库
+-- 如果增长太慢，再把阈值调低
++要明确哪些内容属于 RAG corpus，哪些只是 benchmark corpus。
+ 
+-还需要确认：
+-- 这个批次策略是否符合你的节奏
+-- 是否要额外加入按周补充的兜底批次
++建议先定成：
++- benchmark corpus：只用于评估，不参与检索索引
++- RAG corpus：知识库内容，只在检索阶段使用
++
++### 2. 证据图存储方式
++
++还需要确定：
++- 事件落地是 SQLite、Postgres，还是文件
++- 是否要支持增量恢复
++- 是否要支持按 challenge 回放
++
++### 3. 检索接口的返回策略
++
++还需要确定：
++- `top_k` 默认是多少
++- metadata 过滤是否必须
++- provenance 要不要包括段落位置和来源 URL
+ 
+-### 2. smoke 集使用方式
++### 4. 文档来源范围
+ 
+-smoke 集已确定为手动触发，这里只剩执行细节：
+-- 是否只在检索层改动后跑
+-- 是否允许临时指定子集
++还需要确定：
++- 只收官方文档和基础知识，还是也纳入 writeup
++- 是否允许把 challenge-specific 解法写入知识库
++- 是否需要给每条知识打 trust level
++
++### 5. 评估口径
++
++还需要确定：
++- RAG 是否只看 solve rate
++- 还是要同时看 token、耗时、错误引用率
++- smoke 集是否作为 CI 必跑
++
++### 6. solver 侧一致性
++
++还需要确认：
++- Claude Solver 现在要不要先补 MCP
++- 还是先做受控命令桥接
++- 是否要求所有 solver 先达到同一套 RAG 能力
+ 
+ ## 建议下一步
+ 
+diff --git a/tests/test_evidence.py b/tests/test_evidence.py
+index 7eb84bd..b29169e 100644
+--- a/tests/test_evidence.py
++++ b/tests/test_evidence.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import asyncio
+ import threading
+ import time
++from types import SimpleNamespace
+ 
+ from backend.evidence import EvidenceBoard
+ from backend.evidence.store import SQLiteEvidenceStore
+@@ -129,6 +130,22 @@ def test_stale_worker_cannot_complete_reclaimed_intent(tmp_path) -> None:
+     board.close()
+ 
+ 
++def test_expired_worker_cannot_complete_without_reclaim(tmp_path) -> None:
++    board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
++    intent = board.propose("coordinator", "lease fenced task")
++    assert board.claim("codex-1", intent.intent_id, lease_seconds=30)
++    board.store._conn.execute(
++        "UPDATE intents SET lease_until=0 WHERE intent_id=?", (intent.intent_id,)
++    )
++    board.store._conn.commit()
++    assert board.complete("codex-1", intent.intent_id, "late result") is None
++    assert not any(
++        event.kind == "intent_completed"
++        for event in board.store.events("demo", "run-1")
++    )
++    board.close()
++
++
+ def test_intent_is_blocked_after_max_attempts(tmp_path) -> None:
+     board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
+     intent = board.propose("coordinator", "bounded task")
+@@ -158,3 +175,45 @@ def test_deduped_events_do_not_duplicate(tmp_path) -> None:
+     assert first.event_id == second.event_id
+     assert len(store.events("demo", "run-1")) == 1
+     store.close()
++
++
++def test_custom_dedupe_keys_are_scoped_to_run(tmp_path) -> None:
++    store = SQLiteEvidenceStore(tmp_path / "evidence.sqlite3")
++    first = store.append_event(
++        challenge_name="demo", run_id="run-1", actor_id="worker", actor_type="worker",
++        kind="fact_added", payload={"fact": "one"}, dedupe_key="shared-key",
++    )
++    second = store.append_event(
++        challenge_name="demo", run_id="run-2", actor_id="worker", actor_type="worker",
++        kind="fact_added", payload={"fact": "two"}, dedupe_key="shared-key",
++    )
++    assert first.event_id != second.event_id
++    assert len(store.events("demo", "run-1")) == 1
++    assert len(store.events("demo", "run-2")) == 1
++    store.close()
++
++
++def test_summary_respects_character_limit(tmp_path) -> None:
++    board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
++    board.add_hypothesis("worker", "x" * 5000)
++    summary = board.summary(max_chars=180)
++    assert len(summary) <= 180
++    assert "truncated" in summary
++    assert len(board.summary(max_items=0)) < 200
++    assert len(board.summary(max_chars=10)) == 10
++    board.close()
++
++
++def test_followup_index_restores_after_restart(tmp_path) -> None:
++    from backend.agents.swarm import ChallengeSwarm
++
++    board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
++    board.propose("coordinator", "followup", intent_id="followup:demo:run-1:9")
++    swarm = object.__new__(ChallengeSwarm)
++    swarm.evidence_board = board
++    swarm.meta = SimpleNamespace(name="demo")
++    swarm.run_id = "run-1"
++    swarm._next_intent_index = 4
++    swarm._restore_followup_index()
++    assert swarm._next_intent_index == 10
++    board.close()

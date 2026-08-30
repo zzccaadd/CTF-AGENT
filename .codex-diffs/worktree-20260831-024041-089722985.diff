@@ -1,0 +1,24 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T02:40:41+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/scripts/save_worktree_diff.sh b/scripts/save_worktree_diff.sh
+index e9f4ddc..8c777ca 100755
+--- a/scripts/save_worktree_diff.sh
++++ b/scripts/save_worktree_diff.sh
+@@ -46,7 +46,15 @@ if [[ -s "$previous_payload" ]]; then
+     git -C "$old_tree" add -A
+     git -C "$old_tree" commit -qm "previous worktree state"
+     rsync -a --delete --exclude .git "$new_tree"/ "$old_tree"/
+-    git -C "$old_tree" diff --binary > "$payload_file"
++    # Include both tracked changes and files newly added since the previous
++    # baseline. `git diff` alone omits untracked files in the reconstructed tree.
++    (
++        cd "$old_tree"
++        git diff --binary
++        while IFS= read -r -d '' file; do
++            git diff --no-index --binary /dev/null "$file" || true
++        done < <(git ls-files --others --exclude-standard -z)
++    ) > "$payload_file"
+ else
+     cp "$full_payload_file" "$payload_file"
+ fi

@@ -6,8 +6,10 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 from collections.abc import Iterable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,28 @@ from backend.knowledge.models import KnowledgeDocument, SearchRequest, SearchRes
 
 TRUST_WEIGHT = {"official": 1.20, "high": 1.10, "medium": 1.00, "low": 0.80}
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]+")
+SCHEMA_VERSION = 1
+_INIT_LOCK = threading.Lock()
+
+
+@contextmanager
+def _schema_lock(path: str):
+    """Serialize first-time schema work across processes on local files."""
+    if path == ":memory:":
+        yield
+        return
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    lock_path = f"{path}.init.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class SQLiteKnowledgeBase:
@@ -26,8 +50,9 @@ class SQLiteKnowledgeBase:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, timeout=5.0)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(
-            """
+        with _INIT_LOCK, _schema_lock(self.path):
+            self._conn.executescript(
+                """
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA foreign_keys=ON;
@@ -65,12 +90,23 @@ class SQLiteKnowledgeBase:
                 ON knowledge_documents(source_type, trust_level);
             CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
                 ON knowledge_chunks(document_id, ordinal);
-            """
-        )
-        self._conn.commit()
+                """
+            )
+            version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(f"unsupported knowledge schema version: {version}")
+            if version < SCHEMA_VERSION:
+                self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
+
+    def chunk_count(self, document_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM knowledge_chunks WHERE document_id=?", (document_id,)
+        ).fetchone()
+        return int(row[0])
 
     @staticmethod
     def document_id_for(text: str, *, source_type: str, source_url: str | None = None) -> str:
@@ -168,6 +204,19 @@ class SQLiteKnowledgeBase:
             cur = self._conn.execute("DELETE FROM knowledge_documents WHERE document_id=?", (document_id,))
         return cur.rowcount == 1
 
+    def delete_source_except(self, source_type: str, source_urls: set[str], *, source_prefix: str | None = None) -> int:
+        rows = self._conn.execute(
+            "SELECT document_id, source_url FROM knowledge_documents WHERE source_type=?",
+            (source_type.strip().lower(),),
+        ).fetchall()
+        removed = 0
+        for row in rows:
+            if row[1] not in source_urls and (
+                source_prefix is None or str(row[1] or "").startswith(source_prefix)
+            ):
+                removed += int(self.delete(row[0]))
+        return removed
+
     @staticmethod
     def _fts_query(query: str) -> str:
         tokens = TOKEN_RE.findall(query)
@@ -177,24 +226,31 @@ class SQLiteKnowledgeBase:
     def _matches_metadata(metadata: dict[str, Any], expected: dict[str, Any]) -> bool:
         return all(metadata.get(key) == value for key, value in expected.items())
 
-    def search(self, request: SearchRequest) -> list[SearchResult]:
+    def search(self, request: SearchRequest, *, timeout_ms: int | None = None) -> list[SearchResult]:
         query = self._fts_query(request.query)
         if not query:
             return []
         top_k = max(1, min(int(request.top_k), 100))
         candidate_limit = max(100, top_k * 10)
-        rows = self._conn.execute(
-            """SELECT f.chunk_id, f.text, f.section, bm25(knowledge_fts, 1.0, 0.7, 1.2) AS rank,
-                      d.document_id, d.title, d.source_type, d.source_url, d.metadata AS doc_metadata,
-                      d.trust_level, c.line_start, c.line_end, c.metadata AS chunk_metadata
-               FROM knowledge_fts AS f
-               JOIN knowledge_chunks AS c ON c.chunk_id=f.chunk_id
-               JOIN knowledge_documents AS d ON d.document_id=c.document_id
-               WHERE knowledge_fts MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (query, candidate_limit),
-        ).fetchall()
+        deadline = time.monotonic() + timeout_ms / 1000 if timeout_ms else None
+        if deadline:
+            self._conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        try:
+            rows = self._conn.execute(
+                """SELECT f.chunk_id, f.text, f.section, bm25(knowledge_fts, 1.0, 0.7, 1.2) AS rank,
+                          d.document_id, d.title, d.source_type, d.source_url, d.metadata AS doc_metadata,
+                          d.trust_level, c.line_start, c.line_end, c.metadata AS chunk_metadata
+                   FROM knowledge_fts AS f
+                   JOIN knowledge_chunks AS c ON c.chunk_id=f.chunk_id
+                   JOIN knowledge_documents AS d ON d.document_id=c.document_id
+                   WHERE knowledge_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (query, candidate_limit),
+            ).fetchall()
+        finally:
+            if deadline:
+                self._conn.set_progress_handler(None, 0)
         results: list[SearchResult] = []
         for row in rows:
             if request.source_type and row["source_type"] != request.source_type:
@@ -211,6 +267,7 @@ class SQLiteKnowledgeBase:
                     text=row["text"],
                     source_type=row["source_type"],
                     metadata=merged_metadata,
+                    raw_score=lexical_score,
                     score=score,
                     provenance={
                         "document_id": row["document_id"],

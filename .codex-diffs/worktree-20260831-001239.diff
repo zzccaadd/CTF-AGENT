@@ -1,5 +1,5 @@
-# Worktree diff snapshot generated at 2026-08-31T00:12:39+08:00
-# Includes tracked changes and non-ignored untracked files.
+# Incremental diff snapshot reconstructed from historical worktree state.
+# This file contains only the net changes introduced at this timestamp.
 
 diff --git a/.gitignore b/.gitignore
 index b7342b9..6b96bdc 100755
@@ -531,35 +531,6 @@ index cc77eb1..960f5e6 100755
  
  
  @dataclass
-diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
-index ad899ec..beaab68 100644
---- a/tests/test_benchmark_policy.py
-+++ b/tests/test_benchmark_policy.py
-@@ -14,19 +14,17 @@ def test_default_benchmark_limits_are_fixed_and_offline() -> None:
-     assert limits.allow_internet is False
-     assert limits.attempts == 1
-     assert limits.concurrency == 1
--    assert limits.solvers_per_swarm == 1
--    assert limits.max_solvers_per_swarm == 5
-+    assert limits.solvers_per_swarm == 3
-+    assert limits.max_solvers_per_swarm == 3
- 
- 
--def test_single_model_solver_replicas_get_unique_labels_and_cap_at_five() -> None:
--    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=5)
--    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 5
-+def test_single_model_solver_replicas_get_unique_labels_and_cap_at_three() -> None:
-+    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=3)
-+    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 3
-     assert [slot.label for slot in slots] == [
-         "codex/gpt-5.5#1",
-         "codex/gpt-5.5#2",
-         "codex/gpt-5.5#3",
--        "codex/gpt-5.5#4",
--        "codex/gpt-5.5#5",
-     ]
- 
- 
 diff --git a/backend/evidence/__init__.py b/backend/evidence/__init__.py
 new file mode 100644
 index 0000000..cab576e
@@ -2594,6 +2565,35 @@ index 0000000..00e7075
 +} > "$output_file"
 +
 +printf '%s\n' "$output_file"
+diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
+index ad899ec..beaab68 100644
+--- a/tests/test_benchmark_policy.py
++++ b/tests/test_benchmark_policy.py
+@@ -14,19 +14,17 @@ def test_default_benchmark_limits_are_fixed_and_offline() -> None:
+     assert limits.allow_internet is False
+     assert limits.attempts == 1
+     assert limits.concurrency == 1
+-    assert limits.solvers_per_swarm == 1
+-    assert limits.max_solvers_per_swarm == 5
++    assert limits.solvers_per_swarm == 3
++    assert limits.max_solvers_per_swarm == 3
+ 
+ 
+-def test_single_model_solver_replicas_get_unique_labels_and_cap_at_five() -> None:
+-    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=5)
+-    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 5
++def test_single_model_solver_replicas_get_unique_labels_and_cap_at_three() -> None:
++    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=3)
++    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 3
+     assert [slot.label for slot in slots] == [
+         "codex/gpt-5.5#1",
+         "codex/gpt-5.5#2",
+         "codex/gpt-5.5#3",
+-        "codex/gpt-5.5#4",
+-        "codex/gpt-5.5#5",
+     ]
+ 
+ 
 diff --git a/tests/test_evidence.py b/tests/test_evidence.py
 new file mode 100644
 index 0000000..9fab5a3

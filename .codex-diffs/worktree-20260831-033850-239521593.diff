@@ -1,0 +1,75 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T03:38:50+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/docs/rag_stage2_plan.md b/docs/rag_stage2_plan.md
+index 22e4353..86fc190 100644
+--- a/docs/rag_stage2_plan.md
++++ b/docs/rag_stage2_plan.md
+@@ -205,7 +205,7 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
+ 任务：
+ 
+ 1. 固定 `smoke_20.json` 中的最小对照子集，先跑 `rag_enabled=false` 基线。
+-2. 相同 challenge、model、timeout、max_tokens、solver 数量跑 `rag_enabled=true`。
++2. 相同 challenge、model、timeout、max_tokens、solver 数量跑 `rag_enabled=false/true`（`scripts/run_rag_eval.py --compare-rag`）。
+ 3. [已完成基础字段] 结果增加：`knowledge_queries`、`knowledge_hits`、`knowledge_chars`；检索耗时、额外 token、引用 provenance 数量仍需补充。
+ 4. 分别统计 solve rate、timeout/error、平均 tool calls、token/cost、elapsed。
+ 5. 对人工标注需要知识的题目统计 Recall@K/MRR；对不需要知识的题目统计无效调用率。
+@@ -216,7 +216,7 @@ Stage 2 的 corpus policy 默认只允许以下 source type。该白名单属于
+ - RAG 开关关闭时，Stage 1 既有测试和 smoke 结果不回退；
+ - 检索调用不会产生 CTFd 或公共网络请求；
+ - 所有命中结果有 provenance；
+-- RAG-enabled 运行的额外成本和耗时可量化；
++- RAG-enabled 运行的额外成本和耗时可量化；脚本至少输出 solve 数、知识查询数和命中数差异。
+ - 在预先标注的知识型子集上 Recall@5 有可解释结果；
+ - 若 solve rate 没有提升，也必须能明确判断是语料、召回还是 solver 使用问题。
+ 
+diff --git a/scripts/run_rag_eval.py b/scripts/run_rag_eval.py
+index 029b654..5fe4285 100644
+--- a/scripts/run_rag_eval.py
++++ b/scripts/run_rag_eval.py
+@@ -108,6 +108,7 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--image", default="ctf-sandbox")
+     parser.add_argument("--allow-internet", action="store_true")
+     parser.add_argument("--rag", dest="rag_enabled", default=True, action=argparse.BooleanOptionalAction)
++    parser.add_argument("--compare-rag", action="store_true", help="Run the same manifests with RAG off and on")
+     parser.add_argument("--results-dir", type=Path, default=ROOT / "results" / "rag_eval")
+     return parser.parse_args()
+ 
+@@ -115,6 +116,37 @@ def parse_args() -> argparse.Namespace:
+ async def main() -> None:
+     args = parse_args()
+     manifests = args.manifest or DEFAULT_MANIFESTS
++    if args.compare_rag:
++        comparisons = []
++        for manifest in manifests:
++            runs = {}
++            for enabled in (False, True):
++                run_dir = args.results_dir / ("rag_on" if enabled else "rag_off")
++                runs["on" if enabled else "off"] = await run_manifest(
++                    manifest,
++                    model=args.model,
++                    timeout=args.timeout,
++                    max_tokens=args.max_tokens,
++                    concurrency=args.concurrency,
++                    image=args.image,
++                    allow_internet=args.allow_internet,
++                    rag_enabled=enabled,
++                    results_dir=run_dir,
++                )
++            off, on = runs["off"], runs["on"]
++            comparisons.append({
++                "manifest": manifest.as_posix(),
++                "off": {"solved": off["solved"], "total": off["total"]},
++                "on": {"solved": on["solved"], "total": on["total"]},
++                "delta_solved": on["solved"] - off["solved"],
++                "knowledge_queries": sum(item.get("knowledge_queries", 0) for item in on["results"]),
++                "knowledge_hits": sum(item.get("knowledge_hits", 0) for item in on["results"]),
++            })
++        args.results_dir.mkdir(parents=True, exist_ok=True)
++        (args.results_dir / "rag_comparison.json").write_text(
++            json.dumps(comparisons, indent=2, ensure_ascii=False), encoding="utf-8"
++        )
++        return
+     for manifest in manifests:
+         await run_manifest(
+             manifest,

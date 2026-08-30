@@ -6,6 +6,28 @@
 
 默认 solver 模型：`codex/gpt-5.5`
 
+## RAG 架构分层
+
+当前项目采用“先 lexical、后 hybrid”的渐进路线。你提供的 Vector Search + BM25 + Merge + Reranker 是完整 Advanced RAG 形态，其中向量库、融合和 reranker 不属于当前 Stage 2 的已实现范围。
+
+```text
+当前 Stage 2 MVP
+文档 -> 清洗/切分 -> metadata -> SQLite FTS5(BM25) -> KnowledgeService -> Codex search_knowledge
+
+后续 Stage 4
+Query -> BM25 + Vector Search -> Merge/RRF -> Reranker -> Top-K Context -> Agent
+```
+
+知识库的统一概念不是只存 CWE，而是 `CTF Domain Knowledge Base`，至少包含三类受控来源：
+
+- `official`：CWE、ELF/PE、协议、文件格式和官方工具文档；
+- `reference`：经过审核的 pwn、reverse、crypto、web、forensics、misc 通用技术资料；
+- `internal_notes`：sandbox、黑板和 solver 协作规则。
+
+每个 chunk 都需要保留 `source_type`、`category`、`topic`、`tool_name`、`cwe_id`、`version`、`document_id`、`section`、`trust_level` 和来源路径/URL。当前实现中部分字段由通用 metadata 字典承载，`document_id`、`section`、行号和来源由索引流程补齐。
+
+benchmark 题目、flag、原始附件和未审核的 challenge-specific writeup 只属于评测或临时资料，不能进入通用 RAG corpus。
+
 ## 总体原则
 
 - 不重写主 solver 调度
@@ -97,6 +119,8 @@
   - 建索引
 - 先用本地 SQLite FTS5 做 BM25/关键词检索
 
+本阶段明确不做 Vector Search、Embedding、Merge/RRF 和 Reranker；这些能力只有在 lexical 召回数据证明不足后，作为独立 Stage 4 增强接入，不能替换当前 lexical fallback。
+
 ### metadata 建议
 
 - `source_type`
@@ -133,8 +157,7 @@ search_knowledge(query, source_type, metadata, top_k)
 
 - Pydantic Solver：`backend/agents/solver.py`
 - Codex Solver：`backend/agents/codex_solver.py`
-- Claude Coordinator：`backend/agents/claude_coordinator.py`
-- Claude Solver：补 MCP 工具或受控命令桥接
+- Claude Coordinator/Solver：暂不作为当前 MVP 门槛，后续按统一 service 适配
 
 ### 原则
 
@@ -242,7 +265,11 @@ search_knowledge(query, source_type, metadata, top_k)
 
 ## 建议下一步
 
-先把阶段 0 和阶段 1 做完，再进入阶段 2。
+当前 Stage 1 evidence graph 和 Stage 2 knowledge base 是两条不同链路：前者记录本次解题产生的事实/假设/工具证据，后者提供可复用的外部技术资料。两者通过 trace/evidence provenance 关联，但不能把题目运行结果反向当作通用知识直接入库。
+
+当前不拆分成 `search_cwe`、`search_writeup`、`search_docs` 三套 solver 工具，而是统一为 `search_knowledge`，通过 `source_type` 和 metadata filter 区分语料。这样可以避免不同工具的参数、错误处理和审计格式分叉；未来有必要时再增加面向用户的语义别名。
+
+先用受控语料完成 Stage 2 lexical MVP 和 Codex 工具闭环，再根据真实召回和 solve rate 数据决定是否进入向量/混合检索阶段。
 
 这样做的好处是：
 - baseline 清楚

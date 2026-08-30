@@ -1,0 +1,17 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T03:20:46+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/backend/knowledge/models.py b/backend/knowledge/models.py
+index 62ebfeb..1415c91 100644
+--- a/backend/knowledge/models.py
++++ b/backend/knowledge/models.py
+@@ -43,8 +43,8 @@ class SearchResult:
+     text: str
+     source_type: str
+     metadata: dict[str, Any]
+-    raw_score: float
+     score: float
+     provenance: dict[str, Any]
+     document_id: str
+     chunk_id: str
++    raw_score: float | None = None

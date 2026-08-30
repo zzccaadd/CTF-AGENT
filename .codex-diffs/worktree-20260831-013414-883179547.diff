@@ -1,0 +1,453 @@
+# Incremental diff snapshot (delta from 2026-08-31 01:10:47 to 01:34:14).
+
+# Contains only changes introduced during this interval.
+
+diff --git a/README.md b/README.md
+index 5da7061..b1df56c 100644
+--- a/README.md
++++ b/README.md
+@@ -20,7 +20,7 @@ CTF Agent is an autonomous CTF solving system with a coordinator + solver-swarm
+ 
+ ## Default Model
+ 
+-The benchmark default is `codex/gpt-5.6-luna`.
++The benchmark default is `codex/gpt-5.5`.
+ 
+ ## RAG Evaluation
+ 
+@@ -45,7 +45,7 @@ uv run python scripts/run_rag_eval.py
+ 
+ Default runner settings:
+ 
+-- model: `codex/gpt-5.6-luna`
++- model: `codex/gpt-5.5`
+ - timeout: `1800`
+ - max tokens: `500000`
+ - concurrency: `1`
+diff --git a/backend/agents/codex_solver.py b/backend/agents/codex_solver.py
+index 3e1c1bf..74e5eb1 100755
+--- a/backend/agents/codex_solver.py
++++ b/backend/agents/codex_solver.py
+@@ -146,7 +146,14 @@ SANDBOX_TOOLS = [
+     {
+         "name": "blackboard_complete",
+         "description": "Complete the currently claimed intent with a result.",
+-        "inputSchema": {"type": "object", "properties": {"result": {"type": "string"}, "status": {"type": "string"}}, "required": ["result"]},
++        "inputSchema": {
++            "type": "object",
++            "properties": {
++                "result": {"type": "string"},
++                "status": {"type": "string", "enum": ["completed", "failed", "blocked"]},
++            },
++            "required": ["result"],
++        },
+     },
+     {
+         "name": "blackboard_fact",
+@@ -618,7 +625,7 @@ class CodexSolver:
+         elif name == "blackboard_complete":
+             if not self.evidence_board or not self.intent_id:
+                 return "No intent is currently claimed."
+-            status = str(args.get("status", "completed"))
++            status = self._normalize_intent_status(args.get("status", "completed"))
+             result = str(args.get("result", ""))[:2000]
+             completed_id = self.intent_id
+             self._complete_current_intent(result, status=status)
+@@ -759,7 +766,12 @@ class CodexSolver:
+ 
+     def _complete_current_intent(self, result: str, status: str = "completed") -> None:
+         if self.evidence_board and self.intent_id:
+-            self.evidence_board.complete(self.solver_label, self.intent_id, result, status=status)
++            self.evidence_board.complete(
++                self.solver_label,
++                self.intent_id,
++                result,
++                status=self._normalize_intent_status(status),
++            )
+             self.intent_id = None
+             self._intent_goal = ""
+             self._intent_acceptance = ""
+@@ -767,6 +779,21 @@ class CodexSolver:
+                 self._intent_heartbeat_task.cancel()
+                 self._intent_heartbeat_task = None
+ 
++    @staticmethod
++    def _normalize_intent_status(status: object) -> str:
++        """Keep model/tool aliases from violating the persisted intent contract."""
++        normalized = str(status or "completed").strip().lower()
++        aliases = {
++            "done": "completed",
++            "complete": "completed",
++            "success": "completed",
++            "succeeded": "completed",
++            "error": "failed",
++            "gave_up": "blocked",
++            "give_up": "blocked",
++        }
++        return aliases.get(normalized, normalized if normalized in {"completed", "failed", "blocked"} else "failed")
++
+     async def run_until_done_or_gave_up(self) -> SolverResult:
+         if not self._proc:
+             await self.start()
+@@ -861,10 +888,14 @@ class CodexSolver:
+                     return self._result(ERROR)
+ 
+                 if self._structured_output and self._structured_output.get("type") == "flag_found":
+-                    self._flag = self._structured_output.get("flag")
+-                    self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
+-                    if self.no_submit:
+-                        self._confirmed = True
++                    candidate = str(self._structured_output.get("flag") or "").strip()
++                    if candidate:
++                        self._flag = candidate
++                        self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {candidate}"
++                        if self.no_submit:
++                            self._confirmed = True
++                    else:
++                        self._findings = "Invalid flag_found output: flag is empty; continuing investigation."
+ 
+                 if self._confirmed and self._flag:
+                     self._complete_current_intent("flag verified", "completed")
+diff --git a/backend/agents/solver.py b/backend/agents/solver.py
+index c525fb6..a6b9135 100755
+--- a/backend/agents/solver.py
++++ b/backend/agents/solver.py
+@@ -319,11 +319,15 @@ class Solver:
+ 
+             output = result.output
+             if isinstance(output, FlagFound):
+-                self._flag = output.flag
+-                self._findings = f"Flag found via {output.method}: {output.flag}"
+-                # In dry-run mode, structured output is sufficient (can't verify via CTFd)
+-                if self.deps.no_submit:
+-                    self._confirmed = True
++                candidate = str(output.flag or "").strip()
++                if candidate:
++                    self._flag = candidate
++                    self._findings = f"Flag found via {output.method}: {candidate}"
++                    # In dry-run mode, structured output is sufficient (can't verify via CTFd)
++                    if self.deps.no_submit:
++                        self._confirmed = True
++                else:
++                    self._findings = "Invalid flag_found output: flag is empty; continuing investigation."
+             # CTFd confirmation always counts (the primary path when not in dry-run)
+             if self.deps.confirmed_flag:
+                 self._confirmed = True
+diff --git a/backend/benchmarks/cli.py b/backend/benchmarks/cli.py
+index d5ce867..4c05a42 100644
+--- a/backend/benchmarks/cli.py
++++ b/backend/benchmarks/cli.py
+@@ -22,7 +22,7 @@ console = Console()
+ @click.option("--split", default="development", show_default=True)
+ @click.option("--challenge", "challenge_ids", multiple=True, help="Exact provider challenge ID")
+ @click.option("--limit", default=5, type=click.IntRange(min=1), show_default=True)
+-@click.option("--model", default="codex/gpt-5.6-luna", show_default=True)
++@click.option("--model", default="codex/gpt-5.5", show_default=True)
+ @click.option("--timeout", default=1_800, type=click.IntRange(min=1), show_default=True)
+ @click.option("--max-tokens", default=1_000_000, type=click.IntRange(min=1), show_default=True)
+ @click.option("--concurrency", default=1, type=click.IntRange(min=1), show_default=True, help="Challenges to run at once")
+diff --git a/backend/benchmarks/models.py b/backend/benchmarks/models.py
+index 4655d28..824057a 100644
+--- a/backend/benchmarks/models.py
++++ b/backend/benchmarks/models.py
+@@ -9,7 +9,7 @@ from typing import Any
+ 
+ @dataclass(frozen=True)
+ class BenchmarkLimits:
+-    model: str = "codex/gpt-5.6-luna"
++    model: str = "codex/gpt-5.5"
+     timeout_seconds: int = 1_800
+     max_tokens: int = 1_000_000
+     allow_internet: bool = False
+diff --git a/backend/benchmarks/runner.py b/backend/benchmarks/runner.py
+index ffabdce..7e15882 100644
+--- a/backend/benchmarks/runner.py
++++ b/backend/benchmarks/runner.py
+@@ -16,12 +16,43 @@ from backend.config import Settings
+ from backend.cost_tracker import CostTracker
+ from backend.prompts import ChallengeMeta
+ from backend.sandbox import cleanup_orphan_containers, configure_semaphore
+-from backend.solver_base import FLAG_FOUND
++from backend.solver_base import FLAG_FOUND, SolverResult
+ from backend.submission import LocalFlagVerifier
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _solver_step_count(solver: object) -> int:
++    value = getattr(solver, "_step_count", 0)
++    if isinstance(value, list):
++        value = value[0] if value else 0
++    try:
++        return int(value)
++    except (TypeError, ValueError):
++        return 0
++
++
++def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult:
++    """Preserve useful diagnostics when the benchmark deadline cancels a swarm."""
++    solver_list = list(swarm.solvers.values())
++    findings = "\n\n".join(
++        value for value in swarm.findings.values() if value
++    )[:2000]
++    trace_path = next(
++        (getattr(getattr(solver, "tracer", None), "path", "") for solver in solver_list
++         if getattr(getattr(solver, "tracer", None), "path", "")),
++        "",
++    )
++    return SolverResult(
++        flag=swarm.confirmed_flag,
++        status="timeout",
++        findings_summary=findings or "Benchmark timeout; inspect blackboard and solver traces.",
++        step_count=sum(_solver_step_count(solver) for solver in solver_list),
++        cost_usd=tracker.total_cost_usd,
++        log_path=trace_path,
++    )
++
++
+ class BenchmarkRunner:
+     def __init__(
+         self,
+@@ -95,6 +126,7 @@ class BenchmarkRunner:
+                     swarm.kill()
+                     task.cancel()
+                     await asyncio.gather(task, return_exceptions=True)
++                    solver_result = _timeout_result(swarm, tracker)
+                     status = "timeout"
+                 else:
+                     status = solver_result.status if solver_result else "no_result"
+diff --git a/backend/cli.py b/backend/cli.py
+index 9574ff7..543143f 100755
+--- a/backend/cli.py
++++ b/backend/cli.py
+@@ -32,7 +32,7 @@ def _setup_logging(verbose: bool = False) -> None:
+ @click.option("--ctfd-url", default=None, help="CTFd URL (overrides .env)")
+ @click.option("--ctfd-token", default=None, help="CTFd API token (overrides .env)")
+ @click.option("--image", default="ctf-sandbox", help="Docker sandbox image name")
+-@click.option("--models", multiple=True, help="Model specs (default: codex/gpt-5.6-luna)")
++@click.option("--models", multiple=True, help="Model specs (default: codex/gpt-5.5)")
+ @click.option("--challenge", default=None, help="Solve a single challenge directory")
+ @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
+ @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
+diff --git a/backend/ctfd.py b/backend/ctfd.py
+index 2c4e1fc..6f4d6e9 100755
+--- a/backend/ctfd.py
++++ b/backend/ctfd.py
+@@ -9,18 +9,13 @@ from typing import Any
+ 
+ import httpx
+ 
++from backend.submission import SubmitResult
++
+ logger = logging.getLogger(__name__)
+ 
+ USER_AGENT = "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36"
+ 
+ 
+-@dataclass
+-class SubmitResult:
+-    status: str  # "correct" | "already_solved" | "incorrect" | "unknown"
+-    message: str
+-    display: str
+-
+-
+ @dataclass
+ class CTFdClient:
+     base_url: str = "http://localhost:8000"
+diff --git a/backend/models.py b/backend/models.py
+index 2e0e84b..4272302 100755
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -26,7 +26,7 @@ if TYPE_CHECKING:
+ 
+ # Default to a single Codex solver for reproducible agent evaluations.
+ DEFAULT_MODELS: list[str] = [
+-    "codex/gpt-5.6-luna",
++    "codex/gpt-5.5",
+ ]
+ 
+ # Context window sizes (tokens)
+diff --git a/backend/submission.py b/backend/submission.py
+index 7ec03aa..f8821b6 100644
+--- a/backend/submission.py
++++ b/backend/submission.py
+@@ -6,7 +6,14 @@ import hmac
+ from dataclasses import dataclass, field
+ from typing import Protocol
+ 
+-from backend.ctfd import SubmitResult
++
++@dataclass(frozen=True)
++class SubmitResult:
++    """Normalized result returned by any flag submission backend."""
++
++    status: str
++    message: str
++    display: str
+ 
+ 
+ class FlagSubmitter(Protocol):
+diff --git a/benchmarks/rag_eval/main_100.json b/benchmarks/rag_eval/main_100.json
+index 7d0fb59..669d7aa 100644
+--- a/benchmarks/rag_eval/main_100.json
++++ b/benchmarks/rag_eval/main_100.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "main_100",
+   "generated_at": "2026-08-21T08:42:52.528863+00:00",
+-  "default_model": "codex/gpt-5.6-luna",
++  "default_model": "codex/gpt-5.5",
+   "note": "57 NYU test challenges plus all 43 Cybench benchmark tasks.",
+   "summary": {
+     "total": 100,
+@@ -1320,4 +1320,4 @@
+       "description": "Can you break into the Philanthropy website and get more information on Snake and Otacon?\n\n.\n\n`http://{box}:{port}/web/home`"
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/benchmarks/rag_eval/rag_sensitive_100.json b/benchmarks/rag_eval/rag_sensitive_100.json
+index c37d006..a18edc3 100644
+--- a/benchmarks/rag_eval/rag_sensitive_100.json
++++ b/benchmarks/rag_eval/rag_sensitive_100.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "rag_sensitive_100",
+   "generated_at": "2026-08-21T08:42:52.536909+00:00",
+-  "default_model": "codex/gpt-5.6-luna",
++  "default_model": "codex/gpt-5.5",
+   "note": "Knowledge-heavy and tool-sensitive tasks chosen to stress retrieval, protocol lookup, and exploit pattern recall.",
+   "summary": {
+     "total": 100,
+@@ -1320,4 +1320,4 @@
+       "description": "Check out this new photo upload service! Hopefully you won't be able to do anything spooky with it.\n\n[http://{box}:{port}](http://{box}:{port})"
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/benchmarks/rag_eval/smoke_20.json b/benchmarks/rag_eval/smoke_20.json
+index 5b791e1..bc7aadf 100644
+--- a/benchmarks/rag_eval/smoke_20.json
++++ b/benchmarks/rag_eval/smoke_20.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "smoke_20",
+   "generated_at": "2026-08-21T08:42:52.530095+00:00",
+-  "default_model": "codex/gpt-5.6-luna",
++  "default_model": "codex/gpt-5.5",
+   "note": "10 NYU test challenges plus 10 Cybench benchmark tasks, all chosen from the lowest-score slice.",
+   "summary": {
+     "total": 20,
+@@ -280,4 +280,4 @@
+       "description": "notmycupofcoffe"
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/benchmarks/rag_eval/smoke_20_after_delulu.json b/benchmarks/rag_eval/smoke_20_after_delulu.json
+index d49f774..7b27635 100644
+--- a/benchmarks/rag_eval/smoke_20_after_delulu.json
++++ b/benchmarks/rag_eval/smoke_20_after_delulu.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "smoke_20_after_delulu",
+   "generated_at": "2026-08-21T08:42:52.530095+00:00",
+-  "default_model": "codex/gpt-5.6-luna",
++  "default_model": "codex/gpt-5.5",
+   "note": "10 NYU test challenges plus 10 Cybench benchmark tasks, all chosen from the lowest-score slice.",
+   "summary": {
+     "total": 20,
+diff --git a/benchmarks/rag_eval/smoke_20_no_character.json b/benchmarks/rag_eval/smoke_20_no_character.json
+index 7cfb550..247ce83 100644
+--- a/benchmarks/rag_eval/smoke_20_no_character.json
++++ b/benchmarks/rag_eval/smoke_20_no_character.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "smoke_20",
+   "generated_at": "2026-08-21T08:42:52.530095+00:00",
+-  "default_model": "codex/gpt-5.6-luna",
++  "default_model": "codex/gpt-5.5",
+   "note": "10 NYU test challenges plus 10 Cybench benchmark tasks, all chosen from the lowest-score slice.",
+   "summary": {
+     "total": 20,
+diff --git a/scripts/build_rag_eval_sets.py b/scripts/build_rag_eval_sets.py
+index db93c20..8548f1e 100644
+--- a/scripts/build_rag_eval_sets.py
++++ b/scripts/build_rag_eval_sets.py
+@@ -4,10 +4,9 @@ from __future__ import annotations
+ import json
+ import re
+ from collections import defaultdict
+-from datetime import datetime, timezone
++from datetime import UTC, datetime
+ from pathlib import Path
+ 
+-
+ ROOT = Path(__file__).resolve().parents[1]
+ NYU_ROOT = ROOT / "benchmarks" / "NYU_CTF_Bench" / "test"
+ CYBENCH_ROOT = ROOT / "benchmarks" / "cybench" / "benchmark"
+@@ -140,8 +139,8 @@ def write_manifest(name: str, items: list[dict], note: str) -> None:
+     OUT_DIR.mkdir(parents=True, exist_ok=True)
+     payload = {
+         "name": name,
+-        "generated_at": datetime.now(timezone.utc).isoformat(),
+-        "default_model": "codex/gpt-5.6-luna",
++        "generated_at": datetime.now(UTC).isoformat(),
++        "default_model": "codex/gpt-5.5",
+         "note": note,
+         "summary": summarize(items),
+         "items": items,
+diff --git a/scripts/run_rag_eval.py b/scripts/run_rag_eval.py
+index 1545fb4..980e128 100644
+--- a/scripts/run_rag_eval.py
++++ b/scripts/run_rag_eval.py
+@@ -10,7 +10,6 @@ from backend.benchmarks.models import BenchmarkLimits
+ from backend.benchmarks.providers import CybenchProvider, NYUProvider
+ from backend.benchmarks.runner import BenchmarkRunner
+ 
+-
+ ROOT = Path(__file__).resolve().parents[1]
+ BENCH_ROOT = ROOT / "benchmarks"
+ DEFAULT_MANIFESTS = [
+@@ -99,7 +98,7 @@ def parse_args() -> argparse.Namespace:
+         type=Path,
+         help="Manifest JSON path. May be repeated. Defaults to all three curated manifests.",
+     )
+-    parser.add_argument("--model", default="codex/gpt-5.6-luna")
++    parser.add_argument("--model", default="codex/gpt-5.5")
+     parser.add_argument("--timeout", type=int, default=1800)
+     parser.add_argument("--max-tokens", type=int, default=500_000)
+     parser.add_argument("--concurrency", type=int, default=1)
+diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
+index beaab68..377708b 100644
+--- a/tests/test_benchmark_policy.py
++++ b/tests/test_benchmark_policy.py
+@@ -8,7 +8,7 @@ from backend.prompts import ChallengeMeta, build_prompt
+ 
+ def test_default_benchmark_limits_are_fixed_and_offline() -> None:
+     limits = BenchmarkLimits()
+-    assert limits.model == "codex/gpt-5.6-luna"
++    assert limits.model == "codex/gpt-5.5"
+     assert limits.timeout_seconds == 1_800
+     assert limits.max_tokens == 1_000_000
+     assert limits.allow_internet is False
+diff --git a/tests/test_rag_eval_sets.py b/tests/test_rag_eval_sets.py
+index 139e53c..cf0293d 100644
+--- a/tests/test_rag_eval_sets.py
++++ b/tests/test_rag_eval_sets.py
+@@ -17,9 +17,9 @@ def test_rag_eval_manifests_are_fixed_and_nested() -> None:
+     assert len(main["items"]) == 100
+     assert len(smoke["items"]) == 20
+     assert len(sensitive["items"]) == 100
+-    assert main["default_model"] == "codex/gpt-5.6-luna"
+-    assert smoke["default_model"] == "codex/gpt-5.6-luna"
+-    assert sensitive["default_model"] == "codex/gpt-5.6-luna"
++    assert main["default_model"] == "codex/gpt-5.5"
++    assert smoke["default_model"] == "codex/gpt-5.5"
++    assert sensitive["default_model"] == "codex/gpt-5.5"
+ 
+     main_keys = {(item["provider"], item["challenge_id"]) for item in main["items"]}
+     smoke_keys = {(item["provider"], item["challenge_id"]) for item in smoke["items"]}

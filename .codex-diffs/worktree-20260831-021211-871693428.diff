@@ -1,0 +1,16 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T02:12:12+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/README.zh.md b/README.zh.md
+index a8da659..2b20ff8 100644
+--- a/README.zh.md
++++ b/README.zh.md
+@@ -45,7 +45,7 @@ uv run python scripts/run_rag_eval.py
+ 
+ 默认 runner 配置：
+ 
+-- model: `codex/gpt-5.6-luna`
++- model: `codex/gpt-5.5`
+ - timeout: `1800`
+ - max tokens: `500000`
+ - concurrency: `1`

@@ -6,8 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from backend.knowledge.models import SearchRequest
-from backend.knowledge.store import SQLiteKnowledgeBase
+from backend.knowledge.service import KnowledgeService
 
 
 def main() -> int:
@@ -16,7 +15,7 @@ def main() -> int:
     parser.add_argument("--db", default="logs/knowledge.sqlite3")
     parser.add_argument("--source-type")
     parser.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--top-k", type=int, default=5)
     args = parser.parse_args()
 
     metadata: dict[str, str] = {}
@@ -28,16 +27,20 @@ def main() -> int:
             parser.error("metadata key cannot be empty")
         metadata[key] = value
 
-    knowledge = SQLiteKnowledgeBase(args.db)
     try:
-        results = knowledge.search(
-            SearchRequest(
-                query=args.query,
+        knowledge = KnowledgeService.from_path(args.db)
+    except OSError as exc:
+        parser.exit(2, f"knowledge database unavailable: {exc}\n")
+    try:
+        try:
+            results = knowledge.search(
+                args.query,
                 source_type=args.source_type,
                 metadata=metadata,
                 top_k=args.top_k,
             )
-        )
+        except ValueError as exc:
+            parser.exit(2, f"invalid search request: {exc}\n")
         print(json.dumps([result.__dict__ for result in results], ensure_ascii=False, indent=2))
     finally:
         knowledge.close()

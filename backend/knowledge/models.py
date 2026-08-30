@@ -47,4 +47,4 @@ class SearchResult:
     provenance: dict[str, Any]
     document_id: str
     chunk_id: str
-
+    raw_score: float | None = None

@@ -1,0 +1,266 @@
+# Incremental worktree diff snapshot generated at 2026-08-31T03:19:44+08:00
+# Contains only changes since the previous snapshot baseline.
+
+diff --git a/backend/knowledge/__init__.py b/backend/knowledge/__init__.py
+index 84c4577..08abf5e 100644
+--- a/backend/knowledge/__init__.py
++++ b/backend/knowledge/__init__.py
+@@ -6,12 +6,14 @@ from backend.knowledge.models import (
+     SearchRequest,
+     SearchResult,
+ )
++from backend.knowledge.service import KnowledgeService
+ from backend.knowledge.store import SQLiteKnowledgeBase
+ 
+ __all__ = [
+     "KnowledgeChunk",
+     "KnowledgeDocument",
+     "SQLiteKnowledgeBase",
++    "KnowledgeService",
+     "SearchRequest",
+     "SearchResult",
+ ]
+diff --git a/backend/knowledge/models.py b/backend/knowledge/models.py
+index 329f869..62ebfeb 100644
+--- a/backend/knowledge/models.py
++++ b/backend/knowledge/models.py
+@@ -43,8 +43,8 @@ class SearchResult:
+     text: str
+     source_type: str
+     metadata: dict[str, Any]
++    raw_score: float
+     score: float
+     provenance: dict[str, Any]
+     document_id: str
+     chunk_id: str
+-
+diff --git a/backend/knowledge/store.py b/backend/knowledge/store.py
+index 29257dd..0e4635f 100644
+--- a/backend/knowledge/store.py
++++ b/backend/knowledge/store.py
+@@ -211,6 +211,7 @@ class SQLiteKnowledgeBase:
+                     text=row["text"],
+                     source_type=row["source_type"],
+                     metadata=merged_metadata,
++                    raw_score=lexical_score,
+                     score=score,
+                     provenance={
+                         "document_id": row["document_id"],
+diff --git a/scripts/search_knowledge.py b/scripts/search_knowledge.py
+index 15a518f..6f07039 100644
+--- a/scripts/search_knowledge.py
++++ b/scripts/search_knowledge.py
+@@ -6,8 +6,7 @@ from __future__ import annotations
+ import argparse
+ import json
+ 
+-from backend.knowledge.models import SearchRequest
+-from backend.knowledge.store import SQLiteKnowledgeBase
++from backend.knowledge.service import KnowledgeService
+ 
+ 
+ def main() -> int:
+@@ -16,7 +15,7 @@ def main() -> int:
+     parser.add_argument("--db", default="logs/knowledge.sqlite3")
+     parser.add_argument("--source-type")
+     parser.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
+-    parser.add_argument("--top-k", type=int, default=10)
++    parser.add_argument("--top-k", type=int, default=5)
+     args = parser.parse_args()
+ 
+     metadata: dict[str, str] = {}
+@@ -28,15 +27,13 @@ def main() -> int:
+             parser.error("metadata key cannot be empty")
+         metadata[key] = value
+ 
+-    knowledge = SQLiteKnowledgeBase(args.db)
++    knowledge = KnowledgeService.from_path(args.db)
+     try:
+         results = knowledge.search(
+-            SearchRequest(
+-                query=args.query,
+-                source_type=args.source_type,
+-                metadata=metadata,
+-                top_k=args.top_k,
+-            )
++            args.query,
++            source_type=args.source_type,
++            metadata=metadata,
++            top_k=args.top_k,
+         )
+         print(json.dumps([result.__dict__ for result in results], ensure_ascii=False, indent=2))
+     finally:
+diff --git a/tests/test_knowledge.py b/tests/test_knowledge.py
+index fcd4415..8611535 100644
+--- a/tests/test_knowledge.py
++++ b/tests/test_knowledge.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ from backend.knowledge.indexer import split_text
+ from backend.knowledge.models import SearchRequest
++from backend.knowledge.service import KnowledgeService
+ from backend.knowledge.store import SQLiteKnowledgeBase
+ 
+ 
+@@ -107,3 +108,29 @@ def test_trust_level_adjusts_equal_lexical_matches(tmp_path) -> None:
+     assert len(results) == 2
+     assert results[0].provenance["trust_level"] == "official"
+     knowledge.close()
++
++
++def test_service_applies_bounds_and_records_diagnostics(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="Guide", text="z3 " * 300, source_type="official")
++    service = KnowledgeService(knowledge, max_chars=40)
++
++    results = service.search("z3", top_k=100)
++
++    assert len(results) == 1
++    assert len(results[0].text) == 40
++    assert results[0].provenance["truncated"] is True
++    assert service.last_diagnostic["status"] == "ok"
++    assert service.last_diagnostic["returned_chars"] == 40
++    assert service.search("   ") == []
++    assert service.last_diagnostic["reason"] == "empty_query"
++    service.close()
++
++
++def test_service_isolates_storage_failure(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++    knowledge.close()
++
++    assert service.search("anything") == []
++    assert service.last_diagnostic["status"] == "error"
+diff --git a/backend/knowledge/service.py b/backend/knowledge/service.py
+new file mode 100644
+index 0000000..858f0bf
+--- /dev/null
++++ b/backend/knowledge/service.py
+@@ -0,0 +1,126 @@
++"""Stable, bounded service facade for agent-facing knowledge search."""
++
++from __future__ import annotations
++
++import time
++from dataclasses import replace
++from typing import Any
++
++from backend.knowledge.models import SearchRequest, SearchResult
++from backend.knowledge.store import SQLiteKnowledgeBase
++
++
++class KnowledgeService:
++    """Apply agent-safe limits and isolate storage failures from solver runs."""
++
++    DEFAULT_TOP_K = 5
++    MAX_TOP_K = 10
++    DEFAULT_MAX_CHARS = 8_000
++    DEFAULT_TIMEOUT_MS = 200
++
++    def __init__(
++        self,
++        knowledge: SQLiteKnowledgeBase,
++        *,
++        max_chars: int = DEFAULT_MAX_CHARS,
++        timeout_ms: int = DEFAULT_TIMEOUT_MS,
++    ) -> None:
++        if max_chars < 1:
++            raise ValueError("max_chars must be positive")
++        if timeout_ms < 1:
++            raise ValueError("timeout_ms must be positive")
++        self.knowledge = knowledge
++        self.max_chars = max_chars
++        self.timeout_ms = timeout_ms
++        self.last_diagnostic: dict[str, Any] = {"status": "idle"}
++
++    @classmethod
++    def from_path(cls, path: str, **kwargs: Any) -> KnowledgeService:
++        return cls(SQLiteKnowledgeBase(path), **kwargs)
++
++    def close(self) -> None:
++        self.knowledge.close()
++
++    @staticmethod
++    def _bounded_top_k(top_k: int | None) -> int:
++        if top_k is None:
++            return KnowledgeService.DEFAULT_TOP_K
++        try:
++            value = int(top_k)
++        except (TypeError, ValueError) as exc:
++            raise ValueError("top_k must be an integer") from exc
++        if value < 1:
++            raise ValueError("top_k must be at least 1")
++        return min(value, KnowledgeService.MAX_TOP_K)
++
++    def search(
++        self,
++        query: str,
++        *,
++        source_type: str | None = None,
++        metadata: dict[str, Any] | None = None,
++        top_k: int | None = None,
++    ) -> list[SearchResult]:
++        normalized_query = str(query or "").strip()
++        if not normalized_query:
++            self.last_diagnostic = {"status": "invalid", "reason": "empty_query"}
++            return []
++        bounded_top_k = self._bounded_top_k(top_k)
++        request = SearchRequest(
++            query=normalized_query,
++            source_type=source_type.strip().lower() if source_type else None,
++            metadata=dict(metadata or {}),
++            top_k=bounded_top_k,
++        )
++        started = time.perf_counter()
++        try:
++            results = self.knowledge.search(request)
++        except Exception as exc:  # storage errors must not kill the solver
++            self.last_diagnostic = {
++                "status": "error",
++                "reason": "knowledge_store_unavailable",
++                "error_type": type(exc).__name__,
++            }
++            return []
++        elapsed_ms = (time.perf_counter() - started) * 1000
++        if elapsed_ms > self.timeout_ms:
++            self.last_diagnostic = {
++                "status": "timeout",
++                "elapsed_ms": round(elapsed_ms, 3),
++                "timeout_ms": self.timeout_ms,
++                "query_hash": self._query_hash(normalized_query),
++            }
++            return []
++
++        bounded: list[SearchResult] = []
++        chars = 0
++        for result in results:
++            remaining = self.max_chars - chars
++            if remaining <= 0:
++                break
++            if len(result.text) > remaining:
++                bounded.append(
++                    replace(
++                        result,
++                        text=result.text[:remaining],
++                        provenance={**result.provenance, "truncated": True},
++                    )
++                )
++                chars = self.max_chars
++                break
++            bounded.append(result)
++            chars += len(result.text)
++        self.last_diagnostic = {
++            "status": "ok",
++            "elapsed_ms": round(elapsed_ms, 3),
++            "query_hash": self._query_hash(normalized_query),
++            "hit_count": len(bounded),
++            "returned_chars": chars,
++        }
++        return bounded
++
++    @staticmethod
++    def _query_hash(query: str) -> str:
++        import hashlib
++
++        return hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
