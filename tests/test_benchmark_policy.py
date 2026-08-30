@@ -84,3 +84,36 @@ def test_timeout_result_preserves_solver_diagnostics() -> None:
     assert result.step_count == 7
     assert result.findings_summary == "inspected source.py"
     assert result.log_path == "/tmp/demo-trace.jsonl"
+
+
+def test_swarm_knowledge_metrics_sums_all_solvers_not_just_winner() -> None:
+    from backend.benchmarks.runner import _swarm_knowledge_metrics
+
+    class SolverA:
+        _knowledge_queries = 3
+        _knowledge_hits = 4
+        _knowledge_chars = 500
+        _knowledge_elapsed_ms = 1.2
+        _knowledge_tool_calls = 3
+        _knowledge_cache_hits = 1
+        _knowledge_budget_rejections = 1
+
+    class SolverB:
+        _knowledge_queries = 2
+        _knowledge_hits = 2
+        _knowledge_chars = 300
+        _knowledge_elapsed_ms = 0.8
+        _knowledge_tool_calls = 2
+        _knowledge_cache_hits = 0
+        _knowledge_budget_rejections = 0
+
+    swarm = type("SwarmStub", (), {"solvers": {"#1": SolverA(), "#2": SolverB()}})()
+    metrics = _swarm_knowledge_metrics(swarm)
+
+    assert metrics["knowledge_queries"] == 5
+    assert metrics["knowledge_hits"] == 6
+    assert metrics["knowledge_chars"] == 800
+    assert metrics["knowledge_elapsed_ms"] == 2.0
+    assert metrics["knowledge_tool_calls"] == 5
+    assert metrics["knowledge_cache_hits"] == 1
+    assert metrics["knowledge_budget_rejections"] == 1

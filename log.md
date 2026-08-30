@@ -16290,3 +16290,31 @@ index cf0293d..35d85ec 100644
 +    assert comparison["incomplete"] == [{"challenge_id": "b", "missing_side": "off"}]
 > ```
 ---
+
+# 开发记录【49】
+> 时间：2026-08-31
+> 会话ID：【代码自查修复：预算 trace 事件 / 配对聚合语义 / swarm 知识指标】
+> 涉及文件：backend/agents/codex_solver.py / scripts/run_rag_eval.py / scripts/generate_stage3_gate.py / backend/benchmarks/runner.py / backend/benchmarks/models.py / tests/test_knowledge_tool.py / tests/test_rag_eval_sets.py / tests/test_benchmark_policy.py / log.md
+> 需求/遇到的问题：
+> 用户要求自查最近实现的问题并修复。复查 S3.1 预算/缓存/outcome、S3.4 评估聚合、S3.0 gate 脚本后发现 4 个问题 + 2 个遗留限制：1) 预算拒绝只计数不写 trace（query_outcome 缺 budget_exhausted 事件，评估无法重建被拒调用）；2) _aggregate_replicates 把缺侧当 unsolved 计入 solved/total；3) build_comparison per_challenge 行缺 per-row incomplete 标记；4) gate 脚本 codex --version 无 FileNotFoundError 保护；遗留：多 solver 时 BenchmarkResult 只记 winner 的知识计数；turn 预算不含缓存命中（有 32k 上下文兜底，判定符合 plan 语义不修）。
+
+> 我的原始提问Prompt：
+> > 你先自查一下代码，看看实现有什么问题没有 / 现在把这些问题修复，更新log.md，然后再开三个子模型，跑on的那几个
+
+> 分析与根因：
+> 问题 1 违反 plan §3.3"查询终态统一使用 query_outcome 区分（含 budget_exhausted）"——拒绝必须留痕；问题 2 违反 plan §6.2"缺任一侧标记 incomplete 而不是当作 unsolved"——solve rate 均值用 _aggregate 只统计实际行是对的，但 per_challenge 的 solved/total 把缺失侧计为 unsolved；问题 4 是环境健壮性。遗留限制（多 solver winner-only 计数）在 _timeout_result 早已按全 solver 求和、而正常路径只取 winner——抽取 _swarm_knowledge_metrics 统一两者，为"3 solver/题跑 on"实验铺路。
+
+> 可选解决方案对比：
+> 问题 1：在 4 个拒绝分支各加 tracer.event（重复）vs 抽 _reject_knowledge 辅助方法统一记录+返回——采用后者；问题 2：在 per_challenge 行补 incomplete 标志并在 _aggregate_replicates 分侧统计 off/on_total（缺侧不计入）——采用；遗留限制：runner 正常路径用 dataclasses.replace 把 winner 结果补丁为 swarm 总量，_timeout_result 复用同一 helper——采用。
+
+> 代码改动说明：
+> backend/agents/codex_solver.py：新增 _reject_knowledge(reason)——预算拒绝时记录 query_outcome=budget_exhausted trace 事件（含 reason/step）并返回统一可读消息；4 个预算分支改为调用它。scripts/run_rag_eval.py：_aggregate_replicates 重写 per_challenge 统计（off/on 分侧 total、缺侧不计、行内 incomplete 标志）；build_comparison per_challenge 行加 incomplete；新增 --solvers-per-swarm 参数（run_manifest 透传，默认 1 保持兼容）。scripts/generate_stage3_gate.py：codex --version 缺失时记录 "not installed"。backend/benchmarks/runner.py：新增 _swarm_knowledge_metrics（全 solver 求和 7 个知识字段）；_timeout_result 复用；run_one 正常路径对 winner 结果 replace 补丁为 swarm 总量。tests：新增预算拒绝 trace 事件测试、缺侧聚合语义测试、_swarm_knowledge_metrics 多 solver 求和测试；更新旧断言到新消息文案。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：78 passed（75→78）；ruff 通过；compileall 通过。已提交推送：fix 提交（预算 trace 事件/配对语义/gate 健壮性）与 swarm 聚合提交。遗留：v2 对照（knowledge_probe_v2，--concurrency 4）仍在后台；修复完成后按用户要求以 --solvers-per-swarm 3 跑 on 阶段（验证多 solver 知识指标聚合与解题效率）。
+
+> 本次完整代码Diff：
+> ```diff
+> 【本轮改动已随 fix/swarm-aggregation 提交推送（bfd1681 之后的两个提交）；完整 diff 见 git log。】
+> ```
+---

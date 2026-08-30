@@ -7,6 +7,7 @@ import json
 import logging
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from backend.agents.swarm import ChallengeSwarm
@@ -32,6 +33,28 @@ def _solver_step_count(solver: object) -> int:
         return 0
 
 
+def _swarm_knowledge_metrics(swarm: ChallengeSwarm) -> dict:
+    """Sum knowledge counters across ALL solvers of a swarm.
+
+    The winner's SolverResult only carries the winner's counters; with
+    solvers_per_swarm > 1 that under-counts the challenge's real knowledge
+    usage, so results are patched with swarm totals."""
+    solver_list = list(swarm.solvers.values())
+    return {
+        "knowledge_queries": sum(int(getattr(solver, "_knowledge_queries", 0)) for solver in solver_list),
+        "knowledge_hits": sum(int(getattr(solver, "_knowledge_hits", 0)) for solver in solver_list),
+        "knowledge_chars": sum(int(getattr(solver, "_knowledge_chars", 0)) for solver in solver_list),
+        "knowledge_elapsed_ms": round(
+            sum(float(getattr(solver, "_knowledge_elapsed_ms", 0.0)) for solver in solver_list), 3
+        ),
+        "knowledge_tool_calls": sum(int(getattr(solver, "_knowledge_tool_calls", 0)) for solver in solver_list),
+        "knowledge_cache_hits": sum(int(getattr(solver, "_knowledge_cache_hits", 0)) for solver in solver_list),
+        "knowledge_budget_rejections": sum(
+            int(getattr(solver, "_knowledge_budget_rejections", 0)) for solver in solver_list
+        ),
+    }
+
+
 def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult:
     """Preserve useful diagnostics when the benchmark deadline cancels a swarm."""
     solver_list = list(swarm.solvers.values())
@@ -50,17 +73,7 @@ def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult
         step_count=sum(_solver_step_count(solver) for solver in solver_list),
         cost_usd=tracker.total_cost_usd,
         log_path=trace_path,
-        knowledge_queries=sum(int(getattr(solver, "_knowledge_queries", 0)) for solver in solver_list),
-        knowledge_hits=sum(int(getattr(solver, "_knowledge_hits", 0)) for solver in solver_list),
-        knowledge_chars=sum(int(getattr(solver, "_knowledge_chars", 0)) for solver in solver_list),
-        knowledge_elapsed_ms=round(
-            sum(float(getattr(solver, "_knowledge_elapsed_ms", 0.0)) for solver in solver_list), 3
-        ),
-        knowledge_tool_calls=sum(int(getattr(solver, "_knowledge_tool_calls", 0)) for solver in solver_list),
-        knowledge_cache_hits=sum(int(getattr(solver, "_knowledge_cache_hits", 0)) for solver in solver_list),
-        knowledge_budget_rejections=sum(
-            int(getattr(solver, "_knowledge_budget_rejections", 0)) for solver in solver_list
-        ),
+        **_swarm_knowledge_metrics(swarm),
     )
 
 
@@ -145,6 +158,10 @@ class BenchmarkRunner:
                     status = "timeout"
                 else:
                     status = solver_result.status if solver_result else "no_result"
+                    if solver_result:
+                        # Patch winner-only knowledge counters with swarm totals
+                        # so multi-solver runs report the challenge's real usage.
+                        solver_result = replace(solver_result, **_swarm_knowledge_metrics(swarm))
             except Exception as exc:
                 error = str(exc)
                 logger.exception("Benchmark challenge failed: %s", challenge.challenge_id)

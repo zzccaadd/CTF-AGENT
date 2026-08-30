@@ -184,6 +184,7 @@ async def run_manifest(
     timeout: int,
     max_tokens: int,
     concurrency: int,
+    solvers_per_swarm: int = 1,
     image: str,
     allow_internet: bool,
     rag_enabled: bool,
@@ -210,8 +211,8 @@ async def run_manifest(
             allow_internet=allow_internet,
             attempts=1,
             concurrency=concurrency,
-            solvers_per_swarm=1,
-            max_solvers_per_swarm=1,
+            solvers_per_swarm=solvers_per_swarm,
+            max_solvers_per_swarm=solvers_per_swarm,
             rag_enabled=rag_enabled,
         )
         provider_results_path = results_dir / f"{manifest_path.stem}.{provider_name}.json"
@@ -251,6 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--max-tokens", type=int, default=500_000)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--solvers-per-swarm", type=int, default=1, help="Codex workers per challenge (default 1)")
     parser.add_argument("--image", default="ctf-sandbox")
     parser.add_argument("--allow-internet", action="store_true")
     parser.add_argument("--rag", dest="rag_enabled", default=True, action=argparse.BooleanOptionalAction)
@@ -296,6 +298,7 @@ async def main() -> None:
                         timeout=args.timeout,
                         max_tokens=args.max_tokens,
                         concurrency=args.concurrency,
+                        solvers_per_swarm=args.solvers_per_swarm,
                         image=args.image,
                         allow_internet=args.allow_internet,
                         rag_enabled=enabled,
@@ -325,6 +328,7 @@ async def main() -> None:
             timeout=args.timeout,
             max_tokens=args.max_tokens,
             concurrency=args.concurrency,
+            solvers_per_swarm=args.solvers_per_swarm,
             image=args.image,
             allow_internet=args.allow_internet,
             rag_enabled=args.rag_enabled,
