@@ -16470,3 +16470,28 @@ index cf0293d..35d85ec 100644
 > 【assistant_message 记录已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【56】
+> 时间：2026-08-31
+> 会话ID：【v3 快题集结论 + v4 medium 题启动】
+> 涉及文件：benchmarks/rag_eval/knowledge_probe_v4.json（新增）/ log.md
+> 需求/遇到的问题：
+> v3 快题集（bash-15，source_type 修复后代码）跑完：off 4/4、on 4/4 全解出，但 on 阶段 knowledge_queries 仍为 0；成本 off $1.16 vs on $2.25（RAG on 反而更贵）。用户此前要求 v3 完成后加入 medium 题（并发已调 4）。
+
+> 我的原始提问Prompt：
+> > 这个完了可以加一些medium题来，并发调整到4
+
+> 分析与根因：
+> v3 结论：4 道快题（Very Easy）模型凭自身知识即可解出（off 无知识也 4/4），不存在"缺知识时刻"，因此即使 source_type 修复后模型仍不调用知识工具——RAG on 的成本差异（+$1.10）来自提示词加长与 3-solver 竞争随机波动，不属于 RAG 收益。这证实"调用 RAG 效率更高"无法在 easy 题上验证，必须在模型真正需要知识的 medium 题上测。v4 加入 3 道 medium：whataxor（rev/XOR，静态）、matrix-lab-2（rev/Python 可执行文件）、frog-waf（web/WAF 绕过，有源码），均锚定语料文档（xor-variants/pyc-reversing/sql-injection/command-injection）。
+
+> 代码改动说明：
+> benchmarks/rag_eval/knowledge_probe_v4.json（新增）：v3 快题 4 道 + medium 3 道，共 7 题（知识型 5 + 非知识型 2），含 knowledge_needed/expected_knowledge/relevant_corpus_docs 标注。启动：--compare-rag --timeout 300 --max-tokens 1000000 --solvers-per-swarm 3 --concurrency 4 --results-dir results/rag_eval_v4（bash-16 后台运行）。
+
+> 测试验证方式 & 结果：
+> 运行中。预期与观察项：medium 题上模型是否产生知识调用（source_type 修复后应真实命中）；off/on 在 medium 题上的 solve rate 与耗时/成本对比；若 medium 题又出现 token 耗尽，则继续从测试集剔除并记录。
+
+> 本次完整代码Diff：
+> ```diff
+> 【新增 knowledge_probe_v4.json 清单文件。】
+> ```
+---
