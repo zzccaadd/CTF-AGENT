@@ -33,6 +33,15 @@ def _solver_step_count(solver: object) -> int:
         return 0
 
 
+def _swarm_tool_calls(swarm: ChallengeSwarm) -> int:
+    """Total tool-call count across ALL solvers.
+
+    The winner's step_count undercounts in multi-solver swarms and diverges
+    from the swarm-wide knowledge metrics, so the normal path patches it with
+    the swarm total (matching the timeout/no-result fallbacks)."""
+    return sum(_solver_step_count(solver) for solver in swarm.solvers.values())
+
+
 def _swarm_knowledge_metrics(swarm: ChallengeSwarm) -> dict:
     """Sum knowledge counters across ALL solvers of a swarm.
 
@@ -189,7 +198,11 @@ class BenchmarkRunner:
                     status = solver_result.status
                     # Patch winner-only knowledge counters with swarm totals
                     # so multi-solver runs report the challenge's real usage.
-                    solver_result = replace(solver_result, **_swarm_knowledge_metrics(swarm))
+                    solver_result = replace(
+                        solver_result,
+                        **_swarm_knowledge_metrics(swarm),
+                        step_count=_swarm_tool_calls(swarm),
+                    )
             except Exception as exc:
                 error = str(exc)
                 logger.exception("Benchmark challenge failed: %s", challenge.challenge_id)

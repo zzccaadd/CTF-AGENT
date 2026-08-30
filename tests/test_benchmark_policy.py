@@ -87,9 +87,10 @@ def test_timeout_result_preserves_solver_diagnostics() -> None:
 
 
 def test_swarm_knowledge_metrics_sums_all_solvers_not_just_winner() -> None:
-    from backend.benchmarks.runner import _swarm_knowledge_metrics
+    from backend.benchmarks.runner import _swarm_knowledge_metrics, _swarm_tool_calls
 
     class SolverA:
+        _step_count = 7
         _knowledge_queries = 3
         _knowledge_hits = 4
         _knowledge_chars = 500
@@ -99,6 +100,7 @@ def test_swarm_knowledge_metrics_sums_all_solvers_not_just_winner() -> None:
         _knowledge_budget_rejections = 1
 
     class SolverB:
+        _step_count = 5
         _knowledge_queries = 2
         _knowledge_hits = 2
         _knowledge_chars = 300
@@ -117,3 +119,5 @@ def test_swarm_knowledge_metrics_sums_all_solvers_not_just_winner() -> None:
     assert metrics["knowledge_tool_calls"] == 5
     assert metrics["knowledge_cache_hits"] == 1
     assert metrics["knowledge_budget_rejections"] == 1
+    # tool_calls must be swarm-wide too (winner-only would undercount).
+    assert _swarm_tool_calls(swarm) == 12

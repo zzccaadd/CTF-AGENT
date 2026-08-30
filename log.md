@@ -16520,3 +16520,25 @@ index cf0293d..35d85ec 100644
 > 【coordinator 模块与 swarm/solver 改造已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【58】
+> 时间：2026-08-31
+> 会话ID：【工具调用统计口径核查与修复】
+> 涉及文件：backend/benchmarks/runner.py / tests/test_benchmark_policy.py / log.md
+> 需求/遇到的问题：
+> 用户要求核查工具调用统计是否正确、log 是否更新、是否全部 commit push。核查发现：knowledge 指标（queries/hits/chars/tool_calls/cache/rejections/elapsed）已在上轮改为全 swarm 聚合，但**正常解出路径的 tool_calls（step_count）仍是 winner-only**——3-solver 下与 timeout/no_result 兜底路径（全 swarm 求和）口径不一致，低估实际工具调用量（如 v3 中 Dynastic 3-solver 只记录 winner 的 11 次，实际三 worker 合计更多）。
+
+> 分析与根因：
+> run_one 正常分支 `tool_calls=solver_result.step_count`（winner 结果），而 `_timeout_result`/`_no_result_result` 已是 `sum(_solver_step_count)`；知识指标在正常分支也已被 `_swarm_knowledge_metrics` 补丁为全 swarm 总量——tool_calls 是唯一遗留的 winner-only 字段，多 solver 下口径不一致。
+
+> 代码改动说明：
+> backend/benchmarks/runner.py：新增 _swarm_tool_calls(swarm)（全 solver _step_count 求和）；正常路径 replace 时同时覆盖 step_count（与 _swarm_knowledge_metrics 一并补丁）。tests/test_benchmark_policy.py：swarm 指标测试扩展 SolverA/B 的 _step_count 并断言 _swarm_tool_calls==12。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：87 passed；ruff 通过。git：全部提交已推送 origin/rag_branch（本地=远端，工作树仅子模块内部差异）；log.md 记录 1-58 完整。v4 运行中（bash-16，off 阶段），不受本轮改动影响。
+
+> 本次完整代码Diff：
+> ```diff
+> 【runner 统计口径修复已随本轮提交推送；详见 git log。】
+> ```
+---
