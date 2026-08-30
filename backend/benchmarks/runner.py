@@ -55,6 +55,28 @@ def _swarm_knowledge_metrics(swarm: ChallengeSwarm) -> dict:
     }
 
 
+def _no_result_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult:
+    """Diagnostic result when the swarm ran but produced no winner/flag.
+
+    Preserves the real trace path, tool-call count and cost instead of the
+    empty `no_result` row that previously hid what actually happened."""
+    solver_list = list(swarm.solvers.values())
+    trace_path = next(
+        (getattr(getattr(solver, "tracer", None), "path", "") for solver in solver_list
+         if getattr(getattr(solver, "tracer", None), "path", "")),
+        "",
+    )
+    return SolverResult(
+        flag=None,
+        status="no_result",
+        findings_summary="Swarm finished without a winner or confirmed flag; see solver traces.",
+        step_count=sum(_solver_step_count(solver) for solver in solver_list),
+        cost_usd=tracker.total_cost_usd,
+        log_path=trace_path,
+        **_swarm_knowledge_metrics(swarm),
+    )
+
+
 def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult:
     """Preserve useful diagnostics when the benchmark deadline cancels a swarm."""
     solver_list = list(swarm.solvers.values())
@@ -157,11 +179,17 @@ class BenchmarkRunner:
                     solver_result = _timeout_result(swarm, tracker)
                     status = "timeout"
                 else:
-                    status = solver_result.status if solver_result else "no_result"
-                    if solver_result:
-                        # Patch winner-only knowledge counters with swarm totals
-                        # so multi-solver runs report the challenge's real usage.
-                        solver_result = replace(solver_result, **_swarm_knowledge_metrics(swarm))
+                    if solver_result is None:
+                        # Swarm finished without a winner and without a
+                        # confirmed flag (e.g. all solvers cancelled on token
+                        # budget). Never discard what actually ran: build a
+                        # diagnostic result from the swarm instead of losing
+                        # the trace/cost/step info.
+                        solver_result = _no_result_result(swarm, tracker)
+                    status = solver_result.status
+                    # Patch winner-only knowledge counters with swarm totals
+                    # so multi-solver runs report the challenge's real usage.
+                    solver_result = replace(solver_result, **_swarm_knowledge_metrics(swarm))
             except Exception as exc:
                 error = str(exc)
                 logger.exception("Benchmark challenge failed: %s", challenge.challenge_id)

@@ -18,7 +18,9 @@
       "family": "misc",
       "knowledge_needed": true,
       "expected_knowledge": ["pickle", "deserialization", "python-jail"],
-      "relevant_corpus_docs": ["reference/web/pickle-deserialization.md"]
+      "relevant_corpus_docs": ["reference/web/pickle-deserialization.md"],
+      "environment_unavailable": true,
+      "reason": "docker image build fails: apt-get exit 100 (Debian buster sources unavailable)"
     },
     {
       "provider": "cybench",
@@ -45,7 +47,9 @@
       "family": "crypto",
       "knowledge_needed": true,
       "expected_knowledge": ["crc32", "bruteforce", "stream-cipher"],
-      "relevant_corpus_docs": ["reference/forensics/zip-archive-tricks.md"]
+      "relevant_corpus_docs": ["reference/forensics/zip-archive-tricks.md"],
+      "environment_unavailable": true,
+      "reason": "docker image build fails: apt-get exit 100 (Debian buster sources unavailable)"
     },
     {
       "provider": "nyu",

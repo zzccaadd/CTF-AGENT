@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from scripts.run_rag_eval import (
+    _active_items,
     _aggregate,
     _aggregate_replicates,
     _incomplete_pairs,
@@ -217,3 +218,27 @@ def test_build_comparison_marks_incomplete_pairs() -> None:
         {"results": [_run("a", True), _run("b", True)]},
     )
     assert comparison["incomplete"] == [{"challenge_id": "b", "missing_side": "off"}]
+
+
+def test_active_items_skips_environment_unavailable() -> None:
+    manifest = {
+        "items": [
+            {"challenge_id": "a"},
+            {"challenge_id": "b", "environment_unavailable": True, "reason": "build fails"},
+            {"challenge_id": "c"},
+        ]
+    }
+    active, skipped = _active_items(manifest)
+    assert [item["challenge_id"] for item in active] == ["a", "c"]
+    assert skipped == ["b"]
+
+
+def test_v2_probe_unavailable_challenges_are_flagged() -> None:
+    probe = _load("knowledge_probe_v2")
+    flagged = [item for item in probe["items"] if item.get("environment_unavailable")]
+    assert [item["challenge_id"].split("/")[-1] for item in flagged] == [
+        "just-another-pickle-jail",
+        "noisier-crc",
+    ]
+    for item in flagged:
+        assert item["reason"]

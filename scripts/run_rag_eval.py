@@ -177,6 +177,18 @@ def build_comparison(manifest_path: Path, off: dict, on: dict) -> dict:
     }
 
 
+def _active_items(manifest: dict) -> tuple[list[dict], list[str]]:
+    """Split manifest items into runnable ones and environment-unavailable
+    ones (docker image build failures etc.), so those never waste a run."""
+    skipped = [
+        item["challenge_id"]
+        for item in manifest["items"]
+        if item.get("environment_unavailable")
+    ]
+    active = [item for item in manifest["items"] if not item.get("environment_unavailable")]
+    return active, skipped
+
+
 async def run_manifest(
     manifest_path: Path,
     *,
@@ -191,8 +203,9 @@ async def run_manifest(
     results_dir: Path,
 ) -> dict:
     manifest = load_manifest(manifest_path)
+    items, skipped = _active_items(manifest)
     grouped: dict[str, list[str]] = {}
-    for item in manifest["items"]:
+    for item in items:
         grouped.setdefault(item["provider"], []).append(item["challenge_id"])
 
     manifest_results = []
@@ -230,6 +243,7 @@ async def run_manifest(
         "rag_enabled": rag_enabled,
         "total": len(manifest_results),
         "solved": sum(1 for result in manifest_results if result.get("solved")),
+        "skipped_environment_unavailable": skipped,
         "results": manifest_results,
     }
     results_dir.mkdir(parents=True, exist_ok=True)
