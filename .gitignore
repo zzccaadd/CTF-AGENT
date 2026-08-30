@@ -1,0 +1,39 @@
+# Credentials and local secrets
+.env
+.env.*
+creds.json
+.codex/
+.claude/scheduled_tasks.lock
+
+# Logs, traces, and benchmark outputs
+logs/
+results/
+*.log
+*.jsonl
+benchmark-results.json
+
+# Runtime and downloaded challenge data
+workspace/
+challenges*/
+codex-schema-*/
+benchmarks/NYU_CTF_Bench/
+benchmarks/cybench/.git/
+benchmarks/cybench/
+
+# Python cache and build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
