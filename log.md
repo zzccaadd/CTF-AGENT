@@ -13782,3 +13782,2511 @@ diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
 > 【本轮改动已随提交 bfd1681/fbf12d9 固化；.codex-diffs 增量快照由后续 save_worktree_diff.sh 生成。】
 > ```
 ---
+
+# 开发记录【48】
+> 时间：2026-08-31
+> 会话ID：【本轮新增代码实现增量 diff 存档】
+> 涉及文件：backend/knowledge/budget.py / backend/agents/codex_solver.py / backend/agents/swarm.py / backend/config.py / backend/solver_base.py / backend/benchmarks/models.py / backend/benchmarks/runner.py / backend/prompts.py / backend/knowledge/service.py / backend/knowledge/store.py / scripts/run_rag_eval.py / scripts/analyze_rag_compare.py / scripts/generate_stage3_gate.py / scripts/index_knowledge.py / scripts/search_knowledge.py / scripts/bootstrap_knowledge.py / scripts/rag_tool_probe.py / tests/* / log.md
+> 需求/遇到的问题：
+> 用户要求把本轮新增的代码实现部分以增量 diff 形式上传到 log.md 存档，并完成 .codex-diffs 忽略处理（该目录为会话级快照存档，不进 git；已加入 .gitignore 并提交推送）。
+
+> 我的原始提问Prompt：
+> > 可以，然后把你刚刚新增加的代码实现部分，增量式上传到log.md里把，然后汇报当前进度
+
+> 分析与根因：
+> log 记录 46/47 对代码改动只有文字描述或占位引用，缺少可供复查的完整 diff。本记录以提交基线 222c2e6（本会话开始前最后一个代码提交）到 bfd1681（本轮代码提交）的完整代码增量作为存档：23 个文件、+1930/-56，覆盖：Stage 2 修复轮（service/store/CLI/index，记录 38-40 已描述）、并行会话的 frontmatter/line_offset（记录 41）、提示词 Knowledge 段（记录 46）、S3.1 预算与 query_outcome、S3.0 gate、S3.4 评估基建与全部新增测试（记录 47）。语料与评测资产增量（bfd1681..fbf12d9，84 文件）已在记录 44/45 描述，不重复内嵌。
+
+> 代码改动说明：
+> 【本轮完整增量 diff 见下方；与记录 46/47 的说明一一对应。】
+
+> 测试验证方式 & 结果：
+> 存档基线校验：.venv/bin/pytest -q 75 passed；ruff 通过；compileall 通过（与 gate 档案 logs/stage3_gate_20260831-063444.json 一致）。git：.gitignore 新增 .codex-diffs/（替换原基线文件忽略规则），已提交推送 origin/rag_branch；工作树仅剩 benchmarks/cybench 子模块内部差异（有意不提交）。v2 对照（knowledge_probe_v2，--concurrency 4）仍在后台运行，完成后用 analyze_rag_compare.py 汇总。
+
+> 本次完整代码Diff：
+> ```diff
+diff --git a/backend/agents/codex_solver.py b/backend/agents/codex_solver.py
+index 856b2da..111e428 100755
+--- a/backend/agents/codex_solver.py
++++ b/backend/agents/codex_solver.py
+@@ -173,7 +173,7 @@ SANDBOX_TOOLS = [
+     },
+     {
+         "name": "search_knowledge",
+-        "description": "Search the local reviewed knowledge base. Returns source and line provenance.",
++        "description": "Search the local reviewed knowledge base (CWE/memory-safety, ELF/PE and file formats, protocols, gdb/radare2/pwntools/z3/Volatility, CTF technique patterns). Use it when the challenge involves an ABI, format, protocol or technique you are unsure about, or when you need exact tool syntax. Returns source URL, version, license and line provenance. Local and fast.",
+         "inputSchema": {
+             "type": "object",
+             "properties": {
+@@ -218,6 +218,7 @@ class CodexSolver:
+         notify_coordinator=None,
+         solver_label: str | None = None,
+         evidence_board: EvidenceBoard | None = None,
++        knowledge_challenge_budget=None,
+     ) -> None:
+         self.model_spec = model_spec
+         self.model_id = model_id_from_spec(model_spec)
+@@ -248,6 +249,17 @@ class CodexSolver:
+         self._knowledge_queries = 0
+         self._knowledge_hits = 0
+         self._knowledge_chars = 0
++        self._knowledge_elapsed_ms = 0.0
++        # Stage 3 S3.1: unified knowledge accounting + budgets + dedupe cache.
++        self._knowledge_tool_calls = 0
++        self._knowledge_cache_hits = 0
++        self._knowledge_budget_rejections = 0
++        self._turn_knowledge_queries = 0
++        self._knowledge_cache: dict[tuple, tuple[list, dict]] = {}
++        self._knowledge_turn_budget = int(getattr(settings, "knowledge_turn_budget", 1))
++        self._knowledge_solver_budget = int(getattr(settings, "knowledge_solver_budget", 8))
++        self._knowledge_context_budget = int(getattr(settings, "knowledge_context_chars_budget", 32_000))
++        self._knowledge_challenge_budget = knowledge_challenge_budget
+ 
+         self.sandbox = DockerSandbox(
+             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
+@@ -292,6 +304,7 @@ class CodexSolver:
+             self.meta, distfile_names, container_arch=container_arch,
+             has_named_tools=True,
+             allow_internet=self.allow_internet,
++            knowledge_enabled=self.knowledge_enabled,
+         )
+ 
+         self._proc = await asyncio.create_subprocess_exec(
+@@ -619,11 +632,104 @@ class CodexSolver:
+             "success": success,
+         })
+ 
++    @staticmethod
++    def _query_outcome(diagnostic: dict, results: list) -> str:
++        """Map service diagnostics to the unified query_outcome terminal state
++        (Stage 3 S3.1): ok / no_hit / invalid_query / invalid_params / timeout /
++        store_error. budget_exhausted and cache_hit are handled by the caller."""
++        status = diagnostic.get("status")
++        if status == "invalid":
++            reason = diagnostic.get("reason", "")
++            return "invalid_query" if reason in ("empty_query", "query_too_long") else "invalid_params"
++        if status == "timeout":
++            return "timeout"
++        if status == "error":
++            return "store_error"
++        return "ok" if results else "no_hit"
++
++    def _knowledge_cache_key(self, args: dict) -> tuple:
++        """Dedupe key: normalized query + filters. Corpus changes invalidate it
++        per challenge run (cache is per-solver and lives only for the run)."""
++        metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
++        raw_top_k = args.get("top_k")
++        top_k = int(raw_top_k) if raw_top_k is not None else int(getattr(self.settings, "knowledge_top_k", 5))
++        return (
++            str(args.get("query", "")).strip().lower(),
++            str(args.get("source_type") or "").strip().lower(),
++            tuple(sorted((str(k), str(v)) for k, v in metadata.items())),
++            top_k,
++        )
++
+     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
+         if name == "search_knowledge":
+             if not self.knowledge_service:
+                 return "Knowledge search is disabled for this run."
++            self._knowledge_tool_calls += 1
++            # Stage 3 S3.1 budgets: turn -> solver -> cumulative context -> challenge.
++            if self._turn_knowledge_queries >= self._knowledge_turn_budget:
++                self._knowledge_budget_rejections += 1
++                return (
++                    f"Knowledge budget exhausted for this turn "
++                    f"({self._knowledge_turn_budget} query max). Continue with sandbox analysis."
++                )
++            if self._knowledge_queries >= self._knowledge_solver_budget:
++                self._knowledge_budget_rejections += 1
++                return (
++                    f"Knowledge budget exhausted for this challenge "
++                    f"({self._knowledge_solver_budget} queries max). Continue with sandbox analysis."
++                )
++            if self._knowledge_chars >= self._knowledge_context_budget:
++                self._knowledge_budget_rejections += 1
++                return (
++                    f"Knowledge context budget exhausted "
++                    f"({self._knowledge_context_budget} chars max). Continue with sandbox analysis."
++                )
++            if self._knowledge_challenge_budget is not None and not self._knowledge_challenge_budget.consume():
++                self._knowledge_budget_rejections += 1
++                return (
++                    f"Challenge knowledge budget exhausted "
++                    f"({self._knowledge_challenge_budget.limit} queries max). Continue with sandbox analysis."
++                )
++            # Dedupe: an identical query+filters in the same run is a cache hit,
++            # not a new backend query.
++            cache_key = self._knowledge_cache_key(args)
++            cached = self._knowledge_cache.get(cache_key)
++            if cached is not None:
++                self._knowledge_cache_hits += 1
++                results, diagnostic = cached
++                outcome = "cache_hit"
++                returned_chars = sum(len(result.text) for result in results)
++                self._knowledge_chars += returned_chars
++                self._knowledge_hits += len(results)
++                self.tracer.event(
++                    "knowledge_searched",
++                    query_hash=diagnostic.get("query_hash", ""),
++                    hit_count=len(results),
++                    returned_chars=returned_chars,
++                    elapsed_ms=diagnostic.get("elapsed_ms"),
++                    status=diagnostic.get("status", "unknown"),
++                    query_outcome=outcome,
++                )
++                if self.evidence_board:
++                    self.evidence_board.record(
++                        self.solver_label,
++                        "worker",
++                        "knowledge_searched",
++                        {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or "", "query_outcome": outcome},
++                        provenance={
++                            "source_kind": "knowledge",
++                            "query_hash": diagnostic.get("query_hash", ""),
++                            "cache_hit": True,
++                            "results": [result.provenance for result in results],
++                        },
++                        dedupe_key=f"knowledge:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
++                    )
++                return json.dumps(
++                    {"results": [result.__dict__ for result in results], "diagnostic": {**diagnostic, "query_outcome": outcome}},
++                    ensure_ascii=False,
++                )
+             self._knowledge_queries += 1
++            self._turn_knowledge_queries += 1
+             results = self.knowledge_service.search(
+                 str(args.get("query", "")),
+                 source_type=args.get("source_type"),
+@@ -632,23 +738,32 @@ class CodexSolver:
+             )
+             self._knowledge_hits += len(results)
+             self._knowledge_chars += sum(len(result.text) for result in results)
+-            diagnostic = self.knowledge_service.last_diagnostic
++            diagnostic = dict(self.knowledge_service.last_diagnostic)
++            outcome = self._query_outcome(diagnostic, results)
++            diagnostic["query_outcome"] = outcome
++            self._knowledge_elapsed_ms += float(diagnostic.get("elapsed_ms") or 0.0)
++            # Cache the outcome even for no-hit/invalid results: a repeated
++            # identical query must not re-hit the store.
++            self._knowledge_cache[cache_key] = (results, diagnostic)
+             self.tracer.event(
+                 "knowledge_searched",
+                 query_hash=diagnostic.get("query_hash", ""),
+                 hit_count=len(results),
+                 returned_chars=sum(len(result.text) for result in results),
++                elapsed_ms=diagnostic.get("elapsed_ms"),
+                 status=diagnostic.get("status", "unknown"),
++                query_outcome=outcome,
+             )
+             if self.evidence_board:
+                 self.evidence_board.record(
+                     self.solver_label,
+                     "worker",
+                     "knowledge_searched",
+-                    {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or ""},
++                    {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or "", "query_outcome": outcome},
+                     provenance={
+                         "source_kind": "knowledge",
+                         "query_hash": diagnostic.get("query_hash", ""),
++                        "query_outcome": outcome,
+                         "results": [result.provenance for result in results],
+                     },
+                     dedupe_key=f"knowledge:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
+@@ -901,6 +1016,7 @@ class CodexSolver:
+         for attempt in range(1, max_attempts + 1):
+             try:
+                 self._turn_done.clear()
++                self._turn_knowledge_queries = 0
+                 self._structured_output = None
+                 self._turn_error = None
+                 await self._rpc("turn/start", {
+@@ -1025,6 +1141,10 @@ class CodexSolver:
+             knowledge_queries=self._knowledge_queries,
+             knowledge_hits=self._knowledge_hits,
+             knowledge_chars=self._knowledge_chars,
++            knowledge_elapsed_ms=round(self._knowledge_elapsed_ms, 3),
++            knowledge_tool_calls=self._knowledge_tool_calls,
++            knowledge_cache_hits=self._knowledge_cache_hits,
++            knowledge_budget_rejections=self._knowledge_budget_rejections,
+         )
+ 
+     async def stop(self) -> None:
+diff --git a/backend/agents/swarm.py b/backend/agents/swarm.py
+index 87203fd..1360827 100755
+--- a/backend/agents/swarm.py
++++ b/backend/agents/swarm.py
+@@ -105,9 +105,17 @@ class ChallengeSwarm:
+     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
+     run_id: str = ""
+     evidence_board: EvidenceBoard | None = field(default=None, init=False, repr=False)
++    # Shared per-challenge knowledge query budget (Stage 3 S3.1); one object
++    # for every solver of this challenge.
++    _knowledge_challenge_budget: object | None = field(default=None, init=False, repr=False)
+ 
+     def __post_init__(self) -> None:
+         """Create one persistent board per challenge run and seed worker intents."""
++        from backend.knowledge.budget import KnowledgeBudget
++
++        self._knowledge_challenge_budget = KnowledgeBudget(
++            int(getattr(self.settings, "knowledge_challenge_budget", 24))
++        )
+         db_path = getattr(self.settings, "evidence_db_path", "logs/evidence.sqlite3")
+         self.evidence_board = EvidenceBoard.open(db_path, self.meta.name, self.run_id or None)
+         self.run_id = self.evidence_board.run_id
+@@ -197,6 +205,7 @@ class ChallengeSwarm:
+                 notify_coordinator=_notify,
+                 solver_label=solver_label,
+                 evidence_board=self.evidence_board,
++                knowledge_challenge_budget=self._knowledge_challenge_budget,
+             )
+ 
+         return self._create_pydantic_solver(model_spec, solver_label=solver_label)
+diff --git a/backend/benchmarks/models.py b/backend/benchmarks/models.py
+index d4fec56..329b9ab 100644
+--- a/backend/benchmarks/models.py
++++ b/backend/benchmarks/models.py
+@@ -19,6 +19,8 @@ class BenchmarkLimits:
+     max_solvers_per_swarm: int = 3
+     rag_enabled: bool = True
+     knowledge_db_path: str = "logs/knowledge.sqlite3"
++    knowledge_top_k: int = 5
++    knowledge_max_chars: int = 8_000
+ 
+ 
+ @dataclass(frozen=True)
+@@ -71,6 +73,10 @@ class BenchmarkResult:
+     knowledge_queries: int = 0
+     knowledge_hits: int = 0
+     knowledge_chars: int = 0
++    knowledge_elapsed_ms: float = 0.0
++    knowledge_tool_calls: int = 0
++    knowledge_cache_hits: int = 0
++    knowledge_budget_rejections: int = 0
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return asdict(self)
+diff --git a/backend/benchmarks/runner.py b/backend/benchmarks/runner.py
+index 5e8a409..2bcfdd8 100644
+--- a/backend/benchmarks/runner.py
++++ b/backend/benchmarks/runner.py
+@@ -53,6 +53,14 @@ def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult
+         knowledge_queries=sum(int(getattr(solver, "_knowledge_queries", 0)) for solver in solver_list),
+         knowledge_hits=sum(int(getattr(solver, "_knowledge_hits", 0)) for solver in solver_list),
+         knowledge_chars=sum(int(getattr(solver, "_knowledge_chars", 0)) for solver in solver_list),
++        knowledge_elapsed_ms=round(
++            sum(float(getattr(solver, "_knowledge_elapsed_ms", 0.0)) for solver in solver_list), 3
++        ),
++        knowledge_tool_calls=sum(int(getattr(solver, "_knowledge_tool_calls", 0)) for solver in solver_list),
++        knowledge_cache_hits=sum(int(getattr(solver, "_knowledge_cache_hits", 0)) for solver in solver_list),
++        knowledge_budget_rejections=sum(
++            int(getattr(solver, "_knowledge_budget_rejections", 0)) for solver in solver_list
++        ),
+     )
+ 
+ 
+@@ -111,6 +119,8 @@ class BenchmarkRunner:
+                     max_solvers_per_swarm=self.limits.max_solvers_per_swarm,
+                     knowledge_enabled=self.limits.rag_enabled,
+                     knowledge_db_path=self.limits.knowledge_db_path,
++                    knowledge_top_k=self.limits.knowledge_top_k,
++                    knowledge_max_chars=self.limits.knowledge_max_chars,
+                 )
+                 meta = ChallengeMeta.from_yaml(prepared.challenge_dir / "metadata.yml")
+                 swarm = ChallengeSwarm(
+@@ -180,6 +190,10 @@ class BenchmarkRunner:
+             knowledge_queries=solver_result.knowledge_queries if solver_result else 0,
+             knowledge_hits=solver_result.knowledge_hits if solver_result else 0,
+             knowledge_chars=solver_result.knowledge_chars if solver_result else 0,
++            knowledge_elapsed_ms=solver_result.knowledge_elapsed_ms if solver_result else 0.0,
++            knowledge_tool_calls=solver_result.knowledge_tool_calls if solver_result else 0,
++            knowledge_cache_hits=solver_result.knowledge_cache_hits if solver_result else 0,
++            knowledge_budget_rejections=solver_result.knowledge_budget_rejections if solver_result else 0,
+         )
+ 
+     def _write_results(self) -> None:
+@@ -204,6 +218,12 @@ class BenchmarkRunner:
+                 "knowledge_queries": sum(result.knowledge_queries for result in self.results),
+                 "knowledge_hits": sum(result.knowledge_hits for result in self.results),
+                 "knowledge_chars": sum(result.knowledge_chars for result in self.results),
++                "knowledge_elapsed_ms": round(
++                    sum(result.knowledge_elapsed_ms for result in self.results), 3
++                ),
++                "knowledge_tool_calls": sum(result.knowledge_tool_calls for result in self.results),
++                "knowledge_cache_hits": sum(result.knowledge_cache_hits for result in self.results),
++                "knowledge_budget_rejections": sum(result.knowledge_budget_rejections for result in self.results),
+             },
+             "results": [result.to_dict() for result in self.results],
+         }
+diff --git a/backend/config.py b/backend/config.py
+index d917690..6e57804 100755
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -43,5 +43,11 @@ class Settings(BaseSettings):
+     knowledge_top_k: int = 5
+     knowledge_max_chars: int = 8_000
+     knowledge_query_timeout_ms: int = 200
++    # Stage 3 S3.1 retrieval budgets: per-turn / per-solver / per-challenge
++    # query limits and the cumulative context-char budget.
++    knowledge_turn_budget: int = 1
++    knowledge_solver_budget: int = 8
++    knowledge_challenge_budget: int = 24
++    knowledge_context_chars_budget: int = 32_000
+ 
+     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+diff --git a/backend/knowledge/budget.py b/backend/knowledge/budget.py
+new file mode 100644
+index 0000000..5b688cb
+--- /dev/null
++++ b/backend/knowledge/budget.py
+@@ -0,0 +1,27 @@
++"""Shared, per-run knowledge query budget (Stage 3 S3.1)."""
++
++from __future__ import annotations
++
++
++class KnowledgeBudget:
++    """Swarm-wide knowledge query budget shared by all solvers of one challenge.
++
++    The runner is asyncio single-threaded, so no lock is required: solvers
++    interleave on one event loop and `consume()` is atomic between awaits.
++    """
++
++    def __init__(self, limit: int) -> None:
++        if limit < 1:
++            raise ValueError("knowledge challenge budget must be at least 1")
++        self.limit = limit
++        self.used = 0
++
++    def consume(self, amount: int = 1) -> bool:
++        """Reserve `amount` queries; False when the budget is exhausted."""
++        if self.used + amount > self.limit:
++            return False
++        self.used += amount
++        return True
++
++    def remaining(self) -> int:
++        return max(0, self.limit - self.used)
+diff --git a/backend/knowledge/service.py b/backend/knowledge/service.py
+index 5411602..cd6640e 100644
+--- a/backend/knowledge/service.py
++++ b/backend/knowledge/service.py
+@@ -1,4 +1,20 @@
+-"""Stable, bounded service facade for agent-facing knowledge search."""
++"""Stable, bounded service facade for agent-facing knowledge search.
++
++Failure contract:
++
++- Invalid *parameters* (top_k, oversized metadata) raise ``ValueError``; the
++  CLI maps this to a stable error code and the agent tool path surfaces it as
++  a readable "Tool error". The diagnostic is recorded before raising so every
++  rejection is auditable.
++- Invalid *query content* (empty or over-long query) returns an empty list and
++  records a structured diagnostic; the agent tool converts "no usable
++  results" into a readable message.
++- Storage failures and in-query timeouts are isolated: they return an empty
++  list with a structured diagnostic and never kill the solver main chain.
++- A query that *completes* after the deadline is still returned: the in-query
++  progress handler enforces the hard deadline, and post-hoc latency is
++  diagnostic-only, so cold caches cannot silently disable RAG.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -18,6 +34,12 @@ class KnowledgeService:
+     DEFAULT_MAX_CHARS = 8_000
+     DEFAULT_TIMEOUT_MS = 200
+     ALLOWED_SOURCE_TYPES = frozenset({"official", "reference", "internal_notes"})
++    # Bounds for model-supplied inputs. The FTS tokenizer output is bounded by
++    # the progress handler, but Python-level dict/list work is not, so cap the
++    # request surface before it reaches the store.
++    MAX_QUERY_CHARS = 512
++    MAX_METADATA_ITEMS = 8
++    MAX_METADATA_VALUE_CHARS = 256
+ 
+     def __init__(
+         self,
+@@ -54,11 +76,40 @@ class KnowledgeService:
+             raise ValueError("top_k must be at least 1")
+         return min(value, KnowledgeService.MAX_TOP_K)
+ 
++    @staticmethod
++    def _validated_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
++        """Return a flat metadata filter or raise ValueError for oversized input."""
++        if not metadata:
++            return {}
++        if not isinstance(metadata, dict):
++            raise ValueError("metadata must be a flat object")
++        if len(metadata) > KnowledgeService.MAX_METADATA_ITEMS:
++            raise ValueError(
++                f"metadata must have at most {KnowledgeService.MAX_METADATA_ITEMS} keys"
++            )
++        oversized = [
++            (key, len(str(value)))
++            for key, value in metadata.items()
++            if len(str(key)) > KnowledgeService.MAX_METADATA_VALUE_CHARS
++            or len(str(value)) > KnowledgeService.MAX_METADATA_VALUE_CHARS
++        ]
++        if oversized:
++            raise ValueError(
++                f"metadata keys/values must be at most {KnowledgeService.MAX_METADATA_VALUE_CHARS} chars"
++            )
++        return dict(metadata)
++
++    @staticmethod
++    def _normalized_source_type(source_type: Any) -> str | None:
++        if isinstance(source_type, str) and source_type.strip():
++            return source_type.strip().lower()
++        return None
++
+     def search(
+         self,
+         query: str,
+         *,
+-        source_type: str | None = None,
++        source_type: Any = None,
+         metadata: dict[str, Any] | None = None,
+         top_k: int | None = None,
+     ) -> list[SearchResult]:
+@@ -66,11 +117,27 @@ class KnowledgeService:
+         if not normalized_query:
+             self.last_diagnostic = {"status": "invalid", "reason": "empty_query"}
+             return []
+-        bounded_top_k = self._bounded_top_k(top_k)
++        if len(normalized_query) > self.MAX_QUERY_CHARS:
++            self.last_diagnostic = {
++                "status": "invalid",
++                "reason": "query_too_long",
++                "max_chars": self.MAX_QUERY_CHARS,
++            }
++            return []
++        try:
++            bounded_top_k = self._bounded_top_k(top_k)
++        except ValueError:
++            self.last_diagnostic = {"status": "invalid", "reason": "invalid_top_k"}
++            raise
++        try:
++            metadata = self._validated_metadata(metadata)
++        except ValueError:
++            self.last_diagnostic = {"status": "invalid", "reason": "invalid_metadata"}
++            raise
+         request = SearchRequest(
+             query=normalized_query,
+-            source_type=source_type.strip().lower() if source_type else None,
+-            metadata=dict(metadata or {}),
++            source_type=self._normalized_source_type(source_type),
++            metadata=metadata,
+             # Fetch a wider candidate set so policy filtering cannot consume
+             # the caller's requested top-k slots.
+             top_k=100,
+@@ -93,14 +160,6 @@ class KnowledgeService:
+             }
+             return []
+         elapsed_ms = (time.perf_counter() - started) * 1000
+-        if elapsed_ms > self.timeout_ms:
+-            self.last_diagnostic = {
+-                "status": "timeout",
+-                "elapsed_ms": round(elapsed_ms, 3),
+-                "timeout_ms": self.timeout_ms,
+-                "query_hash": self._query_hash(normalized_query),
+-            }
+-            return []
+ 
+         results = [result for result in results if result.source_type in self.ALLOWED_SOURCE_TYPES]
+         bounded: list[SearchResult] = []
+@@ -121,13 +180,19 @@ class KnowledgeService:
+                 break
+             bounded.append(result)
+             chars += len(result.text)
+-        self.last_diagnostic = {
++        diagnostic: dict[str, Any] = {
+             "status": "ok",
+             "elapsed_ms": round(elapsed_ms, 3),
+             "query_hash": self._query_hash(normalized_query),
+             "hit_count": len(bounded),
+             "returned_chars": chars,
+         }
++        if elapsed_ms > self.timeout_ms:
++            # Completed results are never discarded for being slow: the
++            # in-query progress handler enforces the hard deadline. Record the
++            # overshoot so evaluation can track cold-cache impact.
++            diagnostic["exceeded_timeout_ms"] = round(elapsed_ms - self.timeout_ms, 3)
++        self.last_diagnostic = diagnostic
+         return bounded
+ 
+     @staticmethod
+diff --git a/backend/knowledge/store.py b/backend/knowledge/store.py
+index 9bc1a9f..e6d5e24 100644
+--- a/backend/knowledge/store.py
++++ b/backend/knowledge/store.py
+@@ -18,7 +18,11 @@ from backend.knowledge.models import KnowledgeDocument, SearchRequest, SearchRes
+ 
+ TRUST_WEIGHT = {"official": 1.20, "high": 1.10, "medium": 1.00, "low": 0.80}
+ TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]+")
+-SCHEMA_VERSION = 1
++CJK_RUN_RE = re.compile(r"[\u3400-\u9fff]+")
++# v1 indexed a contiguous CJK run as ONE unicode61 token (useless for Chinese
++# search); v2 inserts a space between CJK characters so each char is its own
++# token, and rebuilds the FTS table on migration.
++SCHEMA_VERSION = 2
+ _INIT_LOCK = threading.Lock()
+ 
+ 
+@@ -96,9 +100,42 @@ class SQLiteKnowledgeBase:
+             if version > SCHEMA_VERSION:
+                 raise RuntimeError(f"unsupported knowledge schema version: {version}")
+             if version < SCHEMA_VERSION:
++                self._migrate(version)
+                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+             self._conn.commit()
+ 
++    @staticmethod
++    def _fts_search_text(text: str) -> str:
++        """Split adjacent CJK characters so unicode61 indexes each char as its
++        own token (v2 Chinese search 口径). ASCII text is left untouched."""
++        return re.sub(r"([\u3400-\u9fff])", r" \1 ", text)
++
++    def _migrate(self, from_version: int) -> None:
++        """Explicit, serialized schema migrations (v1 -> v2 = CJK re-tokenize)."""
++        if from_version < 1:
++            return  # fresh database: current DDL is already in place
++        if from_version < 2:
++            # v1 FTS rows tokenize CJK runs as single tokens; re-insert every
++            # chunk's text/title/section with per-character CJK separation.
++            self._conn.execute("DELETE FROM knowledge_fts")
++            rows = self._conn.execute(
++                """SELECT c.chunk_id, d.title, c.section, c.text
++                   FROM knowledge_chunks AS c
++                   JOIN knowledge_documents AS d ON d.document_id = c.document_id"""
++            ).fetchall()
++            self._conn.executemany(
++                "INSERT INTO knowledge_fts(chunk_id, title, section, text) VALUES (?, ?, ?, ?)",
++                [
++                    (
++                        row[0],
++                        self._fts_search_text(row[1]),
++                        self._fts_search_text(row[2]),
++                        self._fts_search_text(row[3]),
++                    )
++                    for row in rows
++                ],
++            )
++
+     def close(self) -> None:
+         self._conn.close()
+ 
+@@ -131,6 +168,7 @@ class SQLiteKnowledgeBase:
+         trust_level: str = "medium",
+         document_id: str | None = None,
+         max_chars: int = 1600,
++        line_offset: int = 0,
+     ) -> KnowledgeDocument:
+         source_type = source_type.strip().lower()
+         if not source_type:
+@@ -139,6 +177,8 @@ class SQLiteKnowledgeBase:
+             raise ValueError("benchmark corpus must not be indexed as RAG knowledge")
+         if trust_level not in TRUST_WEIGHT:
+             raise ValueError(f"unsupported trust_level: {trust_level}")
++        if line_offset < 0:
++            raise ValueError("line_offset must be non-negative")
+         normalized_text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+         if not normalized_text:
+             raise ValueError("knowledge document cannot be empty")
+@@ -175,11 +215,25 @@ class SQLiteKnowledgeBase:
+                     """INSERT INTO knowledge_chunks
+                     (chunk_id, document_id, ordinal, text, section, line_start, line_end, metadata)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+-                    (chunk_id, doc_id, chunk.ordinal, chunk.text, chunk.section, chunk.line_start, chunk.line_end, self._json(chunk_metadata)),
++                    (
++                        chunk_id,
++                        doc_id,
++                        chunk.ordinal,
++                        chunk.text,
++                        chunk.section,
++                        chunk.line_start + line_offset if chunk.line_start is not None else None,
++                        chunk.line_end + line_offset if chunk.line_end is not None else None,
++                        self._json(chunk_metadata),
++                    ),
+                 )
+                 self._conn.execute(
+                     "INSERT INTO knowledge_fts(chunk_id, title, section, text) VALUES (?, ?, ?, ?)",
+-                    (chunk_id, title, chunk.section, chunk.text),
++                    (
++                        chunk_id,
++                        self._fts_search_text(title),
++                        self._fts_search_text(chunk.section),
++                        self._fts_search_text(chunk.text),
++                    ),
+                 )
+         return KnowledgeDocument(
+             document_id=doc_id,
+@@ -219,8 +273,22 @@ class SQLiteKnowledgeBase:
+ 
+     @staticmethod
+     def _fts_query(query: str) -> str:
+-        tokens = TOKEN_RE.findall(query)
+-        return " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
++        """Build an FTS5 MATCH expression from a free-text query.
++
++        - ASCII tokens are exact-quoted: `"x86" OR "64"`.
++        - A CJK run is expanded into per-character AND terms: `("格" AND "式"
++          AND "化")`, because v2 indexes each CJK char as its own token. Runs
++          are OR-combined with each other and with ASCII terms. This 口径 is
++          pinned by tests/test_knowledge.py.
++        """
++        terms: list[str] = []
++        for match in TOKEN_RE.finditer(query):
++            token = match.group(0)
++            if CJK_RUN_RE.fullmatch(token):
++                terms.append("(" + " AND ".join(f'"{char}"' for char in token) + ")")
++            else:
++                terms.append(f'"{token.replace(chr(34), "")}"')
++        return " OR ".join(terms)
+ 
+     @staticmethod
+     def _matches_metadata(metadata: dict[str, Any], expected: dict[str, Any]) -> bool:
+@@ -237,7 +305,7 @@ class SQLiteKnowledgeBase:
+             self._conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+         try:
+             rows = self._conn.execute(
+-                """SELECT f.chunk_id, f.text, f.section, bm25(knowledge_fts, 1.0, 0.7, 1.2) AS rank,
++                """SELECT f.chunk_id, c.text, f.section, bm25(knowledge_fts, 1.0, 0.7, 1.2) AS rank,
+                           d.document_id, d.title, d.source_type, d.source_url, d.metadata AS doc_metadata,
+                           d.trust_level, c.line_start, c.line_end, c.metadata AS chunk_metadata
+                    FROM knowledge_fts AS f
+diff --git a/backend/prompts.py b/backend/prompts.py
+index 35cc93d..712d9e8 100755
+--- a/backend/prompts.py
++++ b/backend/prompts.py
+@@ -61,12 +61,15 @@ def build_prompt(
+     container_arch: str = "unknown",
+     has_named_tools: bool = True,
+     allow_internet: bool = True,
++    knowledge_enabled: bool = False,
+ ) -> str:
+     """Build the system prompt.
+ 
+     has_named_tools: True for Pydantic AI solver (has view_image, webhook_create, etc.
+     as discrete tools). False for Claude SDK (bash-only — model should use
+     steghide/exiftool/curl instead). Codex has named dynamic tools so uses True.
++    knowledge_enabled: adds the Knowledge Base usage section (Codex path only;
++    other solvers keep the tool-less prompt unless they register the tool).
+     """
+     conn_info = _rewrite_connection_info(meta.connection_info.strip())
+ 
+@@ -165,6 +168,19 @@ def build_prompt(
+         )
+         submit_hint = "**Verify every candidate with `submit_flag '<flag>'`** (bash command) before reporting."
+ 
++    if knowledge_enabled:
++        lines += [
++            "",
++            "## Knowledge Base",
++            "A local reviewed knowledge base is available through the `search_knowledge` tool:",
++            "- Topics: CWE/memory-safety, ELF/PE and file formats, protocols, gdb/radare2/pwntools/z3/Volatility, and CTF technique patterns (XOR/RSA/padding-oracle/ROP/format-string/pickle/JWT/...).",
++            "- Use it when the challenge involves an ABI, file format, protocol, or technique you are NOT sure about, or when you need exact tool syntax.",
++            "- Do NOT use it for the flag itself, challenge-specific answers, or anything directly observable with sandbox tools.",
++            "- Results are reference material: verify critical claims with real tool output.",
++            "- At most ONE knowledge query per turn; do not repeat the same query.",
++            "",
++        ]
++
+     lines += [
+         "",
+         "## Instructions",
+diff --git a/backend/solver_base.py b/backend/solver_base.py
+index fc225bb..d447a13 100755
+--- a/backend/solver_base.py
++++ b/backend/solver_base.py
+@@ -27,6 +27,10 @@ class SolverResult:
+     knowledge_queries: int = 0
+     knowledge_hits: int = 0
+     knowledge_chars: int = 0
++    knowledge_elapsed_ms: float = 0.0
++    knowledge_tool_calls: int = 0
++    knowledge_cache_hits: int = 0
++    knowledge_budget_rejections: int = 0
+ 
+ 
+ class SolverProtocol(Protocol):
+diff --git a/scripts/analyze_rag_compare.py b/scripts/analyze_rag_compare.py
+new file mode 100644
+index 0000000..677fd95
+--- /dev/null
++++ b/scripts/analyze_rag_compare.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""Summarize a RAG off/on comparison run for the labeled knowledge probe.
++
++Reads `--results-dir/rag_comparison.json` (written by run_rag_eval --compare-rag)
++and the labeled manifest, then prints:
++
++- per-challenge table: off/on solved/status/cost/tokens + knowledge usage
++- group aggregates: knowledge-needed vs not-needed (Recall@K proxy = hits per
++  query; invalid-call rate = queries on not-needed challenges)
++- three-way attribution hints: corpus (hits=0), recall (hits>0 but wrong
++  content), solver usage (queries=0 despite tool available)
++
++Usage:
++  .venv/bin/python scripts/analyze_rag_compare.py \
++      --results-dir results/rag_eval \
++      --manifest benchmarks/rag_eval/knowledge_probe.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--results-dir", type=Path, default=ROOT / "results" / "rag_eval")
++    parser.add_argument("--manifest", type=Path, default=ROOT / "benchmarks" / "rag_eval" / "knowledge_probe.json")
++    args = parser.parse_args()
++
++    comparison = json.loads((args.results_dir / "rag_comparison.json").read_text(encoding="utf-8"))
++    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
++    labels = {item["challenge_id"]: item for item in manifest["items"]}
++
++    # New format: {"manifests": [{manifest, replicates, aggregate}]}; old
++    # format was a bare list of comparisons — wrap it as one replicate.
++    if "manifests" in comparison:
++        rows = comparison["manifests"]
++    else:
++        rows = [{"manifest": row["manifest"], "replicates": [row], "aggregate": None} for row in comparison]
++
++    for manifest_row in rows:
++        print(f"=== manifest: {manifest_row['manifest']} "
++              f"(replicates={len(manifest_row['replicates'])})")
++        aggregate = manifest_row.get("aggregate")
++        if aggregate:
++            off, on = aggregate["off"], aggregate["on"]
++            print(f"  aggregate: off {off['solved']}/{off['total']} ($ {off['cost_usd']:.2f}, {off['total_tokens']} tok) "
++                  f"on {on['solved']}/{on['total']} ($ {on['cost_usd']:.2f}, {on['total_tokens']} tok) "
++                  f"delta_solved={aggregate['delta_solved_mean']:+.2f} "
++                  f"delta_cost=${aggregate['delta_cost_usd_mean']:+.4f}")
++            print(f"  knowledge(on): calls={on['knowledge_tool_calls']} queries={on['knowledge_queries']} "
++                  f"hits={on['knowledge_hits']} cache={on['knowledge_cache_hits']} "
++                  f"rejections={on['knowledge_budget_rejections']} chars={on['knowledge_chars']} "
++                  f"elapsed_ms={on['knowledge_elapsed_ms']}")
++            if aggregate["incomplete_pairs"]:
++                print(f"  INCOMPLETE pairs: {aggregate['incomplete_pairs']}")
++
++        for row in manifest_row["replicates"]:
++            off, on = row["off"], row["on"]
++            print(f"  rep{row.get('replicate', '?')} (order={row.get('order', 'off,on')}): "
++                  f"off {off['solved']}/{off['total']} on {on['solved']}/{on['total']} "
++                  f"delta={row['delta_solved']:+d} $delta={row['delta_cost_usd']:+.3f} "
++                  f"kq={on['knowledge_queries']} kh={on['knowledge_hits']}")
++            print("    per challenge:")
++            needed_hits, needed_queries, not_needed_queries = 0, 0, 0
++            for item in row["per_challenge"]:
++                cid = item["challenge_id"]
++                label = labels.get(cid, {})
++                needed = label.get("knowledge_needed")
++                expected = ",".join(label.get("expected_knowledge", [])) or "-"
++                on_item, off_item = item["on"], item["off"]
++                flag = " (timeout)" if on_item["status"] == "timeout" and not on_item["solved"] else ""
++                if needed:
++                    needed_queries += on_item["knowledge_queries"]
++                    needed_hits += on_item["knowledge_hits"]
++                else:
++                    not_needed_queries += on_item["knowledge_queries"]
++                print(
++                    f"      {'KNOW' if needed else 'NONE':4s} {cid.split('/')[-1][:30]:30s} "
++                    f"off:{'Y' if off_item['solved'] else 'N'}{off_item['status'][:6]:6s} "
++                    f"on:{'Y' if on_item['solved'] else 'N'}{on_item['status'][:6]:6s} "
++                    f"Δ={item['delta_solved']:+d} $on={on_item['cost_usd'] or 0:.3f} "
++                    f"kq={on_item['knowledge_queries']} kh={on_item['knowledge_hits']} "
++                    f"expect[{expected}]{flag}"
++                )
++            print(
++                f"    group: KNOW hits/queries={needed_hits}/{needed_queries} "
++                f"(recall proxy {needed_hits / needed_queries:.2f} if queries>0); "
++                f"NONE queries={not_needed_queries} (invalid-call rate)"
++            )
++        print()
++
++    # Three-way attribution summary across all manifests
++    print("=== attribution hints")
++    print("  solver-usage: knowledge_queries==0 on knowledge-needed challenges -> model never uses the tool")
++    print("  corpus/recall: queries>0 but hits==0 -> corpus missing the topic; queries>0, hits>0 -> check recall quality")
++    print("  cost: delta_cost_usd quantifies the price of enabling RAG")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/bootstrap_knowledge.py b/scripts/bootstrap_knowledge.py
+new file mode 100644
+index 0000000..6b1beab
+--- /dev/null
++++ b/scripts/bootstrap_knowledge.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python3
++"""Build the reviewed Stage 2 corpus from the knowledge/ directory tree."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++from backend.knowledge.store import SCHEMA_VERSION, SQLiteKnowledgeBase
++
++SOURCE_TYPES = ("official", "reference", "internal_notes")
++PROVENANCE_KEYS = {
++    "source_url",
++    "source_title",
++    "source_version",
++    "publisher",
++    "license",
++    "retrieved_at",
++    "topic",
++    "tool_name",
++    "cwe_id",
++}
++
++
++def read_markdown(path: Path) -> tuple[str, dict[str, str], int]:
++    """Read optional YAML front matter and preserve body line numbers."""
++    text = path.read_text(encoding="utf-8")
++    if not text.startswith("---\n"):
++        return text, {}, 0
++    lines = text.splitlines(keepends=True)
++    end = next(
++        (index for index in range(1, len(lines)) if lines[index].strip() in {"---", "..."}),
++        None,
++    )
++    if end is None:
++        raise ValueError("front matter starts with '---' but has no closing delimiter")
++    raw = yaml.safe_load("".join(lines[1:end])) or {}
++    if not isinstance(raw, dict):
++        raise ValueError("front matter must be a mapping")
++    provenance: dict[str, str] = {}
++    for key in PROVENANCE_KEYS:
++        value = raw.get(key)
++        if value is not None:
++            if isinstance(value, (dict, list, tuple, set)):
++                raise ValueError(f"front matter field {key!r} must be scalar")
++            provenance[key] = str(value)
++    # Keep leading blank lines so indexer line_start/line_end refer to the source file.
++    return "".join(lines[end + 1 :]), provenance, end + 1
++
++
++def build_corpus(root: Path, database: str, *, max_chars: int = 1600) -> dict[str, Any]:
++    root = root.resolve()
++    knowledge = SQLiteKnowledgeBase(database)
++    report: dict[str, Any] = {
++        "root": str(root),
++        "schema_version": SCHEMA_VERSION,
++        "files": [],
++        "failed": [],
++        "chunks": 0,
++        "deleted_documents": 0,
++    }
++    try:
++        for source_type in SOURCE_TYPES:
++            source_root = root / source_type
++            source_root.mkdir(parents=True, exist_ok=True)
++            files = sorted(
++                path for path in source_root.rglob("*.md")
++                if path.is_file() and path.name != "README.md" and not path.name.startswith("_")
++            )
++            keep_source_urls: set[str] = set()
++            for path in files:
++                try:
++                    relative = path.relative_to(source_root)
++                    category = relative.parts[0] if len(relative.parts) > 1 else "general"
++                    text, provenance, line_offset = read_markdown(path)
++                except (OSError, UnicodeError, ValueError) as exc:
++                    report["failed"].append(
++                        {"path": str(path.relative_to(root)), "source_type": source_type, "error": str(exc)}
++                    )
++                    continue
++                # Files that parse keep their previous index even if ingest
++                # fails below; only files we can no longer read are dropped.
++                keep_source_urls.add(provenance.get("source_url", "") or str(path))
++                try:
++                    metadata = {
++                        "path": str(path.relative_to(root)),
++                        "format": path.suffix.lstrip("."),
++                        "category": category,
++                        **provenance,
++                    }
++                    document = knowledge.ingest(
++                        title=provenance.get("source_title", path.stem),
++                        text=text,
++                        source_type=source_type,
++                        source_url=provenance.get("source_url", str(path)),
++                        trust_level="official" if source_type == "official" else "medium",
++                        metadata=metadata,
++                        max_chars=max_chars,
++                        line_offset=line_offset,
++                    )
++                    chunks = knowledge.chunk_count(document.document_id)
++                    report["files"].append(
++                        {
++                            "path": str(path.relative_to(root)),
++                            "source_type": source_type,
++                            "source_url": document.source_url,
++                            "provenance": provenance,
++                            "document_id": document.document_id,
++                            "content_hash": document.content_hash,
++                            "chunks": chunks,
++                        }
++                    )
++                    report["chunks"] += chunks
++                except (OSError, UnicodeError, ValueError) as exc:
++                    report["failed"].append(
++                        {"path": str(path.relative_to(root)), "source_type": source_type, "error": str(exc)}
++                    )
++            # Stale-doc cleanup must match the STORED source_url (frontmatter
++            # URL or local path), not only local paths: use pure set membership
++            # without a path prefix, otherwise removing a frontmatter-URL file
++            # would leave its old document searchable forever.
++            report["deleted_documents"] += knowledge.delete_source_except(
++                source_type, keep_source_urls
++            )
++    finally:
++        knowledge.close()
++    return report
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--root", type=Path, default=Path("knowledge"))
++    parser.add_argument("--db", default="logs/knowledge.sqlite3")
++    parser.add_argument("--report", type=Path, default=Path("logs/knowledge.manifest.json"))
++    parser.add_argument("--max-chars", type=int, default=1600)
++    args = parser.parse_args()
++    report = build_corpus(args.root, args.db, max_chars=args.max_chars)
++    args.report.parent.mkdir(parents=True, exist_ok=True)
++    args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
++    print(f"indexed {len(report['files'])} document(s), chunks={report['chunks']}, report={args.report}")
++    return 2 if report["failed"] else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/generate_stage3_gate.py b/scripts/generate_stage3_gate.py
+new file mode 100644
+index 0000000..50b96fc
+--- /dev/null
++++ b/scripts/generate_stage3_gate.py
+@@ -0,0 +1,135 @@
++#!/usr/bin/env python3
++"""Generate the immutable Stage 3 S3.0 gate artifact (Stage 2 acceptance).
++
++Collects everything needed to reproduce an evaluation conclusion:
++git state, environment, corpus manifest + bootstrap report + DB hash,
++static/test check results, the frozen publishing matrix and benchmark limits.
++
++Usage:
++  .venv/bin/python scripts/generate_stage3_gate.py [--output logs/stage3_gate_<ts>.json]
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import platform
++import sqlite3
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++PY = sys.executable
++
++
++def _run(args: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess:
++    return subprocess.run(args, capture_output=True, text=True, cwd=cwd, timeout=600)
++
++
++def _git(*args: str) -> str:
++    proc = _run(["git", *args])
++    return proc.stdout.strip()
++
++
++def _load_json(path: Path) -> dict | None:
++    if not path.exists():
++        return None
++    try:
++        return json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++
++
++def _db_summary(path: Path) -> dict:
++    if not path.exists():
++        return {"path": str(path), "exists": False}
++    digest = hashlib.sha256(path.read_bytes()).hexdigest()
++    summary: dict = {"path": str(path), "exists": True, "sha256": digest}
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
++        summary["schema_version"] = conn.execute("PRAGMA user_version").fetchone()[0]
++        summary["documents"] = conn.execute("SELECT COUNT(*) FROM knowledge_documents").fetchone()[0]
++        summary["chunks"] = conn.execute("SELECT COUNT(*) FROM knowledge_chunks").fetchone()[0]
++        conn.close()
++    except sqlite3.Error as exc:
++        summary["error"] = str(exc)
++    return summary
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=Path, default=ROOT / "logs" / f"stage3_gate_{time.strftime('%Y%m%d-%H%M%S')}.json")
++    args = parser.parse_args()
++
++    pytest = _run([PY, "-m", "pytest", "-q"], cwd=ROOT)
++    ruff = _run([PY, "-m", "ruff", "check", "backend", "tests", "scripts"], cwd=ROOT)
++    compileall = _run([PY, "-m", "compileall", "-q", "backend", "scripts"], cwd=ROOT)
++
++    status = _run(["git", "status", "--short"], cwd=ROOT).stdout.strip().splitlines()
++    gate: dict = {
++        "gate": "S3.0-stage2-acceptance",
++        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
++        "git": {
++            "head": _git("rev-parse", "HEAD"),
++            "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
++            "dirty_files": status,
++            "diff_stat": _run(["git", "diff", "--stat"]).stdout.strip().splitlines(),
++        },
++        "environment": {
++            "python": sys.version.split()[0],
++            "platform": platform.platform(),
++            "codex_cli": _run(["codex", "--version"]).stdout.strip().splitlines()[:1],
++        },
++        "corpus": {
++            "policy_manifest": _load_json(ROOT / "knowledge" / "manifest.json"),
++            "bootstrap_report": _load_json(ROOT / "logs" / "knowledge.manifest.json"),
++            "db": _db_summary(ROOT / "logs" / "knowledge.sqlite3"),
++            "doc_count": len(list((ROOT / "knowledge").rglob("*.md"))),
++        },
++        "checks": {
++            "pytest": {"exit": pytest.returncode, "tail": pytest.stdout.strip().splitlines()[-3:]},
++            "ruff": {"exit": ruff.returncode, "tail": ruff.stdout.strip().splitlines()[-3:]},
++            "compileall": {"exit": compileall.returncode, "tail": compileall.stdout.strip().splitlines()[-3:]},
++            "test_db_tmp": "pytest uses tmp_path for knowledge DBs; logs/ DBs are not written by tests",
++        },
++        "publishing_matrix": {
++            "codex": "required — search_knowledge tool + budgets + provenance (Stage 3 must-pass)",
++            "pydantic_ai": "disabled for RAG — no search_knowledge registration; keep out of release matrix until parity adapter lands",
++            "claude_sdk": "disabled for RAG — bash-only solver path; keep out of release matrix until parity adapter lands",
++        },
++        "benchmark_defaults": {
++            "model": "codex/gpt-5.5",
++            "timeout_seconds": 1800,
++            "max_tokens": 1000000,
++            "concurrency": 1,
++            "solvers_per_swarm": 3,
++            "rag_enabled": True,
++            "knowledge_db_path": "logs/knowledge.sqlite3",
++            "knowledge_top_k": 5,
++            "knowledge_max_chars": 8000,
++            "knowledge_query_timeout_ms": 200,
++            "knowledge_turn_budget": 1,
++            "knowledge_solver_budget": 8,
++            "knowledge_challenge_budget": 24,
++            "knowledge_context_chars_budget": 32000,
++        },
++        "notes": [
++            "Gate is a development gate; evaluation/release gates must re-run this script and archive the JSON with the run artifacts.",
++            "Corpus version tracking: bump knowledge/manifest.json 'name' or add a version field on material corpus changes.",
++        ],
++    }
++
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    args.output.write_text(json.dumps(gate, indent=2, ensure_ascii=False), encoding="utf-8")
++    print(f"gate artifact written: {args.output}")
++    print(f"  pytest exit={pytest.returncode} | ruff exit={ruff.returncode} | compileall exit={compileall.returncode}")
++    print(f"  corpus: {gate['corpus']['doc_count']} md files, "
++          f"db docs={gate['corpus']['db'].get('documents')}, chunks={gate['corpus']['db'].get('chunks')}")
++    return 0 if (pytest.returncode == 0 and ruff.returncode == 0 and compileall.returncode == 0) else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/index_knowledge.py b/scripts/index_knowledge.py
+index 308be1c..5f2a6d1 100644
+--- a/scripts/index_knowledge.py
++++ b/scripts/index_knowledge.py
+@@ -10,6 +10,22 @@ from pathlib import Path
+ from backend.knowledge.store import SQLiteKnowledgeBase
+ 
+ ALLOWED_SOURCE_TYPES = ("official", "reference", "internal_notes")
++# Benchmark corpus must never be indexed as RAG knowledge: the policy guard
++# lives at the store layer (source_type) AND here at the path layer, so an
++# accidental `--root benchmarks/...` run is rejected before ingestion.
++REPO_ROOT = Path(__file__).resolve().parents[1]
++BENCHMARK_ROOTS = tuple(
++    root.resolve() for root in (REPO_ROOT / "benchmarks",) if (REPO_ROOT / "benchmarks").exists()
++)
++
++
++def _validate_root(root: Path) -> None:
++    resolved = root.resolve()
++    if any(resolved == bench or bench in resolved.parents for bench in BENCHMARK_ROOTS):
++        raise SystemExit(
++            f"refusing to index benchmark corpus root: {root}\n"
++            "benchmark challenges, attachments and flags must never enter the RAG corpus"
++        )
+ 
+ 
+ def main() -> int:
+@@ -24,6 +40,7 @@ def main() -> int:
+     args = parser.parse_args()
+ 
+     base = args.root.resolve()
++    _validate_root(base)
+     files = sorted(path for path in base.glob(args.pattern) if path.is_file())
+     if not files:
+         parser.error(f"no files matched {args.pattern!r} under {base}")
+@@ -38,7 +55,9 @@ def main() -> int:
+                     source_type=args.source_type,
+                     source_url=str(path),
+                     trust_level=args.trust_level,
+-                    metadata={"path": str(path), "format": path.suffix.lstrip(".")},
++                    # Relative path keeps manifests comparable across machines;
++                    # source_url keeps the absolute path for stale-doc cleanup.
++                    metadata={"path": str(path.relative_to(base)), "format": path.suffix.lstrip(".")},
+                     max_chars=args.max_chars,
+                 )
+                 chunks = knowledge.chunk_count(document.document_id)
+diff --git a/scripts/rag_tool_probe.py b/scripts/rag_tool_probe.py
+new file mode 100644
+index 0000000..5dde010
+--- /dev/null
++++ b/scripts/rag_tool_probe.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python3
++"""Minimal end-to-end probe: can a real Codex thread see and call search_knowledge?
++
++Spawns `codex app-server` and drives the same JSON-RPC flow as CodexSolver
++(initialize -> thread/start -> turn/start -> tool call -> turn/completed), but
++instructs the model to call search_knowledge immediately and report the result.
++
++Purpose: prove the tool is callable over the real protocol with the real local
++knowledge DB (costs a fraction of a cent), separate from whether the model
++chooses to call it during benchmark runs.
++
++Exit codes:
++  0  model called search_knowledge and the loop completed
++  1  no search_knowledge call was observed
++  2  protocol failure (start/thread error)
++"""
++
++from __future__ import annotations
++
++import asyncio
++import itertools
++import json
++import sys
++
++from backend.agents.codex_solver import SANDBOX_TOOLS
++from backend.knowledge.service import KnowledgeService
++from backend.output_types import solver_output_json_schema
++
++MODEL = "gpt-5.5"
++INSTRUCTION = (
++    "Protocol verification session. Your ONLY task: call the search_knowledge tool "
++    "exactly once with query 'ELF e_entry', then report the returned source_url and title. "
++    "Do not call any other tool and do not perform any analysis."
++)
++
++
++async def run() -> int:
++    tool = next(tool for tool in SANDBOX_TOOLS if tool["name"] == "search_knowledge")
++    proc = await asyncio.create_subprocess_exec(
++        "codex", "app-server",
++        stdin=asyncio.subprocess.PIPE,
++        stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.PIPE,
++    )
++    ids = itertools.count(1)
++    pending: dict[int, asyncio.Future] = {}
++    service = KnowledgeService.from_path("logs/knowledge.sqlite3")
++    called = False
++    turn_done = asyncio.Event()
++
++    async def rpc(method: str, params: dict | None = None) -> dict:
++        msg_id = next(ids)
++        msg: dict = {"id": msg_id, "method": method}
++        if params:
++            msg["params"] = params
++        future = asyncio.get_running_loop().create_future()
++        pending[msg_id] = future
++        proc.stdin.write((json.dumps(msg) + "\n").encode())
++        await proc.stdin.drain()
++        return await asyncio.wait_for(future, 300)
++
++    async def notify(method: str, params: dict | None = None) -> None:
++        msg: dict = {"method": method}
++        if params:
++            msg["params"] = params
++        proc.stdin.write((json.dumps(msg) + "\n").encode())
++        await proc.stdin.drain()
++
++    async def respond(request_id: int, result: dict) -> None:
++        proc.stdin.write((json.dumps({"id": request_id, "result": result}) + "\n").encode())
++        await proc.stdin.drain()
++
++    async def read_loop() -> None:
++        nonlocal called
++        while True:
++            line = await proc.stdout.readline()
++            if not line:
++                turn_done.set()
++                break
++            try:
++                msg = json.loads(line)
++            except json.JSONDecodeError:
++                continue
++            msg_id = msg.get("id")
++            if msg_id is not None and ("result" in msg or "error" in msg):
++                future = pending.pop(msg_id, None)
++                if future and not future.done():
++                    if "error" in msg:
++                        future.set_exception(RuntimeError(f"RPC error: {msg['error']}"))
++                    else:
++                        future.set_result(msg)
++                continue
++            method = msg.get("method", "")
++            params = msg.get("params", {})
++            if method == "item/tool/call" and msg_id is not None:
++                tool_name = params.get("tool", "")
++                args = params.get("arguments", {})
++                print(f"[probe] tool call received: {tool_name} {json.dumps(args, ensure_ascii=False)}", flush=True)
++                if tool_name == "search_knowledge":
++                    called = True
++                    results = service.search(str(args.get("query", "")))
++                    payload = {
++                        "results": [result.__dict__ for result in results],
++                        "diagnostic": service.last_diagnostic,
++                    }
++                    text = json.dumps(payload, ensure_ascii=False)
++                else:
++                    text = f"unexpected tool: {tool_name}"
++                await respond(msg_id, {"contentItems": [{"type": "inputText", "text": text}], "success": True})
++            elif method == "item/completed":
++                item = params.get("item", params)
++                if item.get("type") == "agentMessage" and item.get("text"):
++                    print(f"[probe] assistant: {item['text'][:400]}", flush=True)
++            elif method == "turn/completed":
++                print(f"[probe] turn/completed status={params.get('turn', {}).get('status')}", flush=True)
++                turn_done.set()
++
++    reader = asyncio.create_task(read_loop())
++    try:
++        await rpc("initialize", {
++            "clientInfo": {"name": "ctf-agent-probe", "version": "0.1"},
++            "capabilities": {"experimentalApi": True},
++        })
++        await notify("initialized", {})
++        resp = await rpc("thread/start", {
++            "model": MODEL,
++            "personality": "pragmatic",
++            "baseInstructions": INSTRUCTION,
++            "cwd": "/tmp",
++            "approvalPolicy": "on-request",
++            "sandbox": "read-only",
++            "serviceTier": "flex",
++            "dynamicTools": [tool],
++        })
++        thread_id = resp["result"]["thread"]["id"]
++        print(f"[probe] thread started: {thread_id}", flush=True)
++        await rpc("turn/start", {
++            "threadId": thread_id,
++            "input": [{"type": "text", "text": "Begin now."}],
++            "outputSchema": solver_output_json_schema(),
++        })
++        try:
++            await asyncio.wait_for(turn_done.wait(), 240)
++        except TimeoutError:
++            print("[probe] timeout waiting for turn completion", file=sys.stderr)
++    finally:
++        proc.terminate()
++        try:
++            await asyncio.wait_for(proc.wait(), 5)
++        except TimeoutError:
++            proc.kill()
++        service.close()
++        reader.cancel()
++
++    if not called:
++        print("[probe] search_knowledge was NOT called by the model", file=sys.stderr)
++        return 1
++    print("[probe] search_knowledge callable end-to-end: OK")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(asyncio.run(run()))
+diff --git a/scripts/run_rag_eval.py b/scripts/run_rag_eval.py
+index 5fe4285..1759e45 100644
+--- a/scripts/run_rag_eval.py
++++ b/scripts/run_rag_eval.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ import argparse
+ import asyncio
+ import json
++import time
+ from pathlib import Path
+ 
+ from backend.benchmarks.models import BenchmarkLimits
+@@ -31,6 +32,136 @@ def provider_impl(provider: str, image: str):
+     raise ValueError(f"Unsupported provider in manifest: {provider}")
+ 
+ 
++def _aggregate(results: list[dict]) -> dict:
++    """Aggregate per-challenge result dicts into comparable summary metrics."""
++    total = len(results)
++    solved = sum(1 for result in results if result.get("solved"))
++    knowledge_chars = sum(result.get("knowledge_chars", 0) for result in results)
++    return {
++        "solved": solved,
++        "total": total,
++        "solve_rate": round(solved / total, 4) if total else 0,
++        "timeouts": sum(1 for result in results if result.get("status") == "timeout"),
++        "errors": sum(1 for result in results if result.get("status") == "error"),
++        "tool_calls_avg": round(sum(result.get("tool_calls", 0) for result in results) / total, 3) if total else 0,
++        "total_tokens": sum(result.get("total_tokens", 0) for result in results),
++        "cost_usd": round(sum(result.get("cost_usd", 0) for result in results), 6),
++        "elapsed_avg": round(sum(result.get("elapsed_seconds", 0) for result in results) / total, 3) if total else 0,
++        "knowledge_queries": sum(result.get("knowledge_queries", 0) for result in results),
++        "knowledge_hits": sum(result.get("knowledge_hits", 0) for result in results),
++        "knowledge_chars": knowledge_chars,
++        "knowledge_elapsed_ms": round(sum(result.get("knowledge_elapsed_ms", 0) for result in results), 3),
++        "knowledge_tool_calls": sum(result.get("knowledge_tool_calls", 0) for result in results),
++        "knowledge_cache_hits": sum(result.get("knowledge_cache_hits", 0) for result in results),
++        "knowledge_budget_rejections": sum(result.get("knowledge_budget_rejections", 0) for result in results),
++        # Rough estimate of the extra context tokens the knowledge tool paid
++        # for (chars/4); exact accounting requires per-turn token deltas.
++        "knowledge_est_extra_tokens": knowledge_chars // 4,
++    }
++
++
++def _incomplete_pairs(off_results: list[dict], on_results: list[dict]) -> list[dict]:
++    """Challenges that ran on one side only — marked incomplete, not unsolved."""
++    off_ids = {r.get("challenge_id") for r in off_results}
++    on_ids = {r.get("challenge_id") for r in on_results}
++    missing: list[dict] = []
++    for challenge_id in sorted(off_ids - on_ids):
++        missing.append({"challenge_id": challenge_id, "missing_side": "on"})
++    for challenge_id in sorted(on_ids - off_ids):
++        missing.append({"challenge_id": challenge_id, "missing_side": "off"})
++    return missing
++
++
++def _aggregate_replicates(pairs: list[tuple[dict, dict]]) -> dict:
++    """Cross-replicate aggregation: mean solve rates/costs/tokens and
++    per-challenge solved counts, plus incomplete-pair accounting.
++
++    `pairs` is a list of (off_run, on_run) raw run outputs, one per replicate."""
++    n = max(1, len(pairs))
++    off_rows = [row for off, _ in pairs for row in off["results"]]
++    on_rows = [row for _, on in pairs for row in on["results"]]
++    agg_off = _aggregate(off_rows)
++    agg_on = _aggregate(on_rows)
++    challenges: dict[str, dict] = {}
++    for off, on in pairs:
++        on_by_id = {result.get("challenge_id"): result for result in on["results"]}
++        for off_result in off["results"]:
++            cid = off_result.get("challenge_id")
++            on_result = on_by_id.get(cid) or {}
++            entry = challenges.setdefault(cid, {"off_solved": 0, "on_solved": 0, "total": 0, "knowledge_queries": 0})
++            entry["total"] += 1
++            entry["off_solved"] += int(bool(off_result.get("solved")))
++            entry["on_solved"] += int(bool(on_result.get("solved")))
++            entry["knowledge_queries"] += int(on_result.get("knowledge_queries", 0))
++    return {
++        "replicates": len(pairs),
++        "off": agg_off,
++        "on": agg_on,
++        "delta_solved_mean": round(agg_on["solved"] / n - agg_off["solved"] / n, 4) if agg_off["total"] else 0,
++        "delta_cost_usd_mean": round(agg_on["cost_usd"] / n - agg_off["cost_usd"] / n, 6),
++        "delta_tokens_mean": round(agg_on["total_tokens"] / n - agg_off["total_tokens"] / n, 3),
++        "per_challenge": [
++            {
++                "challenge_id": cid,
++                "off_solved_replicates": entry["off_solved"],
++                "on_solved_replicates": entry["on_solved"],
++                "delta_solved_total": entry["on_solved"] - entry["off_solved"],
++                "knowledge_queries_total": entry["knowledge_queries"],
++            }
++            for cid, entry in sorted(challenges.items())
++        ],
++        "incomplete_pairs": [p for off, on in pairs for p in _incomplete_pairs(off["results"], on["results"])],
++    }
++
++
++def build_comparison(manifest_path: Path, off: dict, on: dict) -> dict:
++    """Compare one manifest's rag-off run against its rag-on run.
++
++    Per-challenge rows are matched by challenge_id so provider reordering can
++    never misalign the off/on pair."""
++    on_by_id = {result.get("challenge_id"): result for result in on["results"]}
++    off_agg = _aggregate(off["results"])
++    on_agg = _aggregate(on["results"])
++    per_challenge = []
++    for off_result in off["results"]:
++        challenge_id = off_result.get("challenge_id")
++        on_result = on_by_id.get(challenge_id) or {}
++        off_solved = bool(off_result.get("solved"))
++        on_solved = bool(on_result.get("solved"))
++        per_challenge.append(
++            {
++                "challenge_id": challenge_id,
++                "off": {
++                    "solved": off_solved,
++                    "status": off_result.get("status"),
++                    "tool_calls": off_result.get("tool_calls"),
++                    "tokens": off_result.get("total_tokens"),
++                    "cost_usd": off_result.get("cost_usd"),
++                },
++                "on": {
++                    "solved": on_solved,
++                    "status": on_result.get("status"),
++                    "tool_calls": on_result.get("tool_calls"),
++                    "tokens": on_result.get("total_tokens"),
++                    "cost_usd": on_result.get("cost_usd"),
++                    "knowledge_queries": on_result.get("knowledge_queries", 0),
++                    "knowledge_hits": on_result.get("knowledge_hits", 0),
++                },
++                "delta_solved": int(on_solved) - int(off_solved),
++            }
++        )
++    return {
++        "manifest": manifest_path.as_posix(),
++        "off": off_agg,
++        "on": on_agg,
++        "delta_solved": on_agg["solved"] - off_agg["solved"],
++        "delta_cost_usd": round(on_agg["cost_usd"] - off_agg["cost_usd"], 6),
++        "delta_tokens": on_agg["total_tokens"] - off_agg["total_tokens"],
++        "per_challenge": per_challenge,
++        "incomplete": _incomplete_pairs(off["results"], on["results"]),
++    }
++
++
+ async def run_manifest(
+     manifest_path: Path,
+     *,
+@@ -109,6 +240,8 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--allow-internet", action="store_true")
+     parser.add_argument("--rag", dest="rag_enabled", default=True, action=argparse.BooleanOptionalAction)
+     parser.add_argument("--compare-rag", action="store_true", help="Run the same manifests with RAG off and on")
++    parser.add_argument("--repeats", type=int, default=1, help="Number of off/on replicates per manifest (default 1)")
++    parser.add_argument("--seed", type=int, default=42, help="Random seed for off/on execution-order randomization")
+     parser.add_argument("--results-dir", type=Path, default=ROOT / "results" / "rag_eval")
+     return parser.parse_args()
+ 
+@@ -117,34 +250,57 @@ async def main() -> None:
+     args = parse_args()
+     manifests = args.manifest or DEFAULT_MANIFESTS
+     if args.compare_rag:
+-        comparisons = []
++        if args.repeats < 1:
++            raise SystemExit("--repeats must be at least 1")
++        import random
++
++        output = {
++            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
++            "seed": args.seed,
++            "repeats": args.repeats,
++            "manifests": [],
++        }
+         for manifest in manifests:
+-            runs = {}
+-            for enabled in (False, True):
+-                run_dir = args.results_dir / ("rag_on" if enabled else "rag_off")
+-                runs["on" if enabled else "off"] = await run_manifest(
+-                    manifest,
+-                    model=args.model,
+-                    timeout=args.timeout,
+-                    max_tokens=args.max_tokens,
+-                    concurrency=args.concurrency,
+-                    image=args.image,
+-                    allow_internet=args.allow_internet,
+-                    rag_enabled=enabled,
+-                    results_dir=run_dir,
+-                )
+-            off, on = runs["off"], runs["on"]
+-            comparisons.append({
+-                "manifest": manifest.as_posix(),
+-                "off": {"solved": off["solved"], "total": off["total"]},
+-                "on": {"solved": on["solved"], "total": on["total"]},
+-                "delta_solved": on["solved"] - off["solved"],
+-                "knowledge_queries": sum(item.get("knowledge_queries", 0) for item in on["results"]),
+-                "knowledge_hits": sum(item.get("knowledge_hits", 0) for item in on["results"]),
+-            })
++            comparisons = []
++            pairs: list[tuple[dict, dict]] = []
++            rng = random.Random(args.seed)
++            for replicate in range(1, args.repeats + 1):
++                # Randomize off/on execution order per replicate (Stage 3 §6.2)
++                # so fixed-order time/cache/service drift cannot bias results.
++                order = rng.sample(["off", "on"], 2)
++                runs: dict[str, dict] = {}
++                for side in order:
++                    enabled = side == "on"
++                    if args.repeats > 1:
++                        run_dir = args.results_dir / f"rep{replicate}" / ("rag_on" if enabled else "rag_off")
++                    else:
++                        run_dir = args.results_dir / ("rag_on" if enabled else "rag_off")
++                    runs[side] = await run_manifest(
++                        manifest,
++                        model=args.model,
++                        timeout=args.timeout,
++                        max_tokens=args.max_tokens,
++                        concurrency=args.concurrency,
++                        image=args.image,
++                        allow_internet=args.allow_internet,
++                        rag_enabled=enabled,
++                        results_dir=run_dir,
++                    )
++                comparison = build_comparison(manifest, runs["off"], runs["on"])
++                comparison["replicate"] = replicate
++                comparison["order"] = order
++                comparisons.append(comparison)
++                pairs.append((runs["off"], runs["on"]))
++            output["manifests"].append(
++                {
++                    "manifest": manifest.as_posix(),
++                    "replicates": comparisons,
++                    "aggregate": _aggregate_replicates(pairs),
++                }
++            )
+         args.results_dir.mkdir(parents=True, exist_ok=True)
+         (args.results_dir / "rag_comparison.json").write_text(
+-            json.dumps(comparisons, indent=2, ensure_ascii=False), encoding="utf-8"
++            json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8"
+         )
+         return
+     for manifest in manifests:
+diff --git a/scripts/search_knowledge.py b/scripts/search_knowledge.py
+index 08b744e..4243d7b 100644
+--- a/scripts/search_knowledge.py
++++ b/scripts/search_knowledge.py
+@@ -1,23 +1,63 @@
+ #!/usr/bin/env python3
+-"""Search the local Stage 2 FTS5 knowledge index and print provenance as JSON."""
++"""Search the local Stage 2 FTS5 knowledge index and print provenance as JSON.
++
++Exit codes (stable contract):
++  0  success (search printed results / document deleted)
++  1  --delete target document not found
++  2  invalid request parameters or unreadable database
++  3  database file does not exist (build it first with
++     scripts/bootstrap_knowledge.py or scripts/index_knowledge.py)
++"""
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ import json
++import sys
++from pathlib import Path
+ 
+ from backend.knowledge.service import KnowledgeService
++from backend.knowledge.store import SQLiteKnowledgeBase
++
++EXIT_OK = 0
++EXIT_NOT_FOUND = 1
++EXIT_INVALID = 2
++EXIT_NO_DB = 3
++
++
++def _require_db(db: str) -> Path:
++    """Fail fast with a stable code when the knowledge DB has never been built."""
++    path = Path(db)
++    if not path.exists():
++        raise FileNotFoundError(db)
++    return path
+ 
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("query")
++    parser.add_argument("query", nargs="?", help="search query (required unless --delete is used)")
+     parser.add_argument("--db", default="logs/knowledge.sqlite3")
+     parser.add_argument("--source-type")
+     parser.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
+     parser.add_argument("--top-k", type=int, default=5)
++    parser.add_argument("--delete", metavar="DOCUMENT_ID", help="delete one document and exit")
+     args = parser.parse_args()
+ 
++    if args.delete and args.query:
++        parser.error("--delete cannot be combined with a search query")
++    if not args.delete and not args.query:
++        parser.error("a search query or --delete is required")
++
++    try:
++        db_path = _require_db(args.db)
++    except FileNotFoundError:
++        print(
++            f"knowledge database does not exist: {args.db}\n"
++            "build it first: .venv/bin/python scripts/bootstrap_knowledge.py",
++            file=sys.stderr,
++        )
++        return EXIT_NO_DB
++
+     metadata: dict[str, str] = {}
+     for item in args.metadata:
+         if "=" not in item:
+@@ -27,10 +67,24 @@ def main() -> int:
+             parser.error("metadata key cannot be empty")
+         metadata[key] = value
+ 
++    if args.delete:
++        try:
++            knowledge = SQLiteKnowledgeBase(db_path)
++        except OSError as exc:
++            parser.exit(EXIT_INVALID, f"knowledge database unavailable: {exc}\n")
++        try:
++            deleted = knowledge.delete(args.delete)
++        finally:
++            knowledge.close()
++        if not deleted:
++            return EXIT_NOT_FOUND
++        print(json.dumps({"deleted": args.delete}, ensure_ascii=False))
++        return EXIT_OK
++
+     try:
+-        knowledge = KnowledgeService.from_path(args.db)
++        knowledge = KnowledgeService.from_path(db_path)
+     except OSError as exc:
+-        parser.exit(2, f"knowledge database unavailable: {exc}\n")
++        parser.exit(EXIT_INVALID, f"knowledge database unavailable: {exc}\n")
+     try:
+         try:
+             results = knowledge.search(
+@@ -40,11 +94,11 @@ def main() -> int:
+                 top_k=args.top_k,
+             )
+         except ValueError as exc:
+-            parser.exit(2, f"invalid search request: {exc}\n")
++            parser.exit(EXIT_INVALID, f"invalid search request: {exc}\n")
+         print(json.dumps([result.__dict__ for result in results], ensure_ascii=False, indent=2))
+     finally:
+         knowledge.close()
+-    return 0
++    return EXIT_OK
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
+index d625d7d..52fc5c6 100644
+--- a/tests/test_benchmark_policy.py
++++ b/tests/test_benchmark_policy.py
+@@ -48,6 +48,18 @@ def test_offline_prompt_states_network_policy() -> None:
+     assert "General internet and external webhooks are disabled" in prompt
+ 
+ 
++def test_prompt_knowledge_section_follows_knowledge_enabled() -> None:
++    enabled = build_prompt(
++        ChallengeMeta(name="demo"), [], allow_internet=False, knowledge_enabled=True
++    )
++    assert "## Knowledge Base" in enabled
++    assert "search_knowledge" in enabled
++    assert "ONE knowledge query per turn" in enabled
++
++    disabled = build_prompt(ChallengeMeta(name="demo"), [], allow_internet=False)
++    assert "## Knowledge Base" not in disabled
++
++
+ def test_timeout_result_preserves_solver_diagnostics() -> None:
+     class Tracer:
+         path = "/tmp/demo-trace.jsonl"
+diff --git a/tests/test_knowledge.py b/tests/test_knowledge.py
+index 10ad9e7..eb7e06c 100644
+--- a/tests/test_knowledge.py
++++ b/tests/test_knowledge.py
+@@ -151,5 +151,129 @@ def test_service_excludes_unapproved_source_types(tmp_path) -> None:
+ def test_schema_version_is_recorded(tmp_path) -> None:
+     knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+     version = knowledge._conn.execute("PRAGMA user_version").fetchone()[0]
+-    assert version == 1
++    assert version == 2
++    knowledge.close()
++
++
++def test_schema_migration_v1_to_v2_reindexes_cjk(tmp_path) -> None:
++    """A v1 database (CJK runs as single tokens) must be rebuilt on open so
++    per-character Chinese queries keep working after the upgrade."""
++    db = tmp_path / "knowledge.sqlite3"
++    knowledge = SQLiteKnowledgeBase(db)
++    knowledge.ingest(title="指南", text="格式化字符串利用", source_type="official")
++    chunk_id = knowledge._conn.execute("SELECT chunk_id FROM knowledge_chunks LIMIT 1").fetchone()[0]
++    with knowledge._conn:
++        # Simulate v1 FTS content: the whole CJK run is ONE token.
++        knowledge._conn.execute("DELETE FROM knowledge_fts")
++        knowledge._conn.execute(
++            "INSERT INTO knowledge_fts(chunk_id, title, section, text) VALUES (?, ?, ?, ?)",
++            (chunk_id, "指南", "", "格式化字符串利用"),
++        )
++        knowledge._conn.execute("PRAGMA user_version = 1")
++    knowledge.close()
++
++    knowledge = SQLiteKnowledgeBase(db)
++    try:
++        assert knowledge._conn.execute("PRAGMA user_version").fetchone()[0] == 2
++        hits = knowledge.search(SearchRequest("格式化"))
++        assert [hit.provenance["title"] for hit in hits] == ["指南"]
++    finally:
++        knowledge.close()
++
++
++def test_service_returns_completed_slow_results_instead_of_fake_timeout(tmp_path) -> None:
++    """A query that finishes after the deadline must still return results.
++
++    The in-query progress handler enforces the hard deadline; post-hoc latency
++    is diagnostic-only so cold caches cannot silently disable RAG."""
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="Guide", text="slow but completed z3 guide", source_type="official")
++    service = KnowledgeService(knowledge, timeout_ms=1)
++
++    real_search = knowledge.search
++    import time as _time
++
++    def slow_search(request, *, timeout_ms=None):
++        _time.sleep(0.05)
++        return real_search(request, timeout_ms=timeout_ms)
++
++    knowledge.search = slow_search  # type: ignore[method-assign]
++    try:
++        results = service.search("z3", top_k=5)
++    finally:
++        service.close()
++
++    assert len(results) == 1
++    assert service.last_diagnostic["status"] == "ok"
++    assert "exceeded_timeout_ms" in service.last_diagnostic
++
++
++def test_service_rejects_oversized_query_and_metadata(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++
++    assert service.search("z" * (KnowledgeService.MAX_QUERY_CHARS + 1)) == []
++    assert service.last_diagnostic["reason"] == "query_too_long"
++
++    try:
++        service.search("z3", metadata={f"key{i}": "v" for i in range(KnowledgeService.MAX_METADATA_ITEMS + 1)})
++    except ValueError:
++        assert service.last_diagnostic["reason"] == "invalid_metadata"
++    else:
++        raise AssertionError("oversized metadata must be rejected")
++
++    service.close()
++
++
++def test_service_records_diagnostic_for_invalid_top_k(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++    try:
++        service.search("z3", top_k=0)
++    except ValueError:
++        assert service.last_diagnostic["reason"] == "invalid_top_k"
++    else:
++        raise AssertionError("top_k=0 must be rejected")
++    service.close()
++
++
++def test_service_ignores_non_string_source_type(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="Guide", text="z3 guide", source_type="official")
++    service = KnowledgeService(knowledge)
++
++    results = service.search("z3", source_type=123)  # model garbage must not crash
++    assert len(results) == 1
++    service.close()
++
++
++def test_fts_cjk_query_uses_per_character_prefix_recall(tmp_path) -> None:
++    """unicode61 groups a contiguous CJK run into one index token, so the query
++    side expands CJK into per-character prefix terms. This pins the documented
++    Chinese query 口径: 格式化字符串 must recall 格式化字符串利用, and must not
++    recall unrelated runs (字节对齐)."""
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="指南", text="格式化字符串利用", source_type="official")
++    knowledge.ingest(title="对齐", text="字节对齐", source_type="reference")
++
++    hits = knowledge.search(SearchRequest("格式化字符串"))
++    assert [hit.provenance["title"] for hit in hits] == ["指南"]
++
++    # A space inside the CJK run must not break recall.
++    spaced = knowledge.search(SearchRequest("格式化 字符串"))
++    assert [hit.provenance["title"] for hit in spaced] == ["指南"]
++
++    assert [hit.provenance["title"] for hit in knowledge.search(SearchRequest("对齐"))] == ["对齐"]
++    knowledge.close()
++
++
++def test_fts_special_characters_are_sanitized_not_crashed(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="Asm", text="x86-64 assembly calling convention", source_type="official")
++
++    results = knowledge.search(SearchRequest('C++ "quoted" x86-64!?/'))
++    assert len(results) == 1
++    assert results[0].provenance["title"] == "Asm"
++    # Pure punctuation queries yield no tokens and no crash.
++    assert knowledge.search(SearchRequest("!!! ??? ###")) == []
+     knowledge.close()
+diff --git a/tests/test_knowledge_bootstrap.py b/tests/test_knowledge_bootstrap.py
+new file mode 100644
+index 0000000..1a869ca
+--- /dev/null
++++ b/tests/test_knowledge_bootstrap.py
+@@ -0,0 +1,115 @@
++from __future__ import annotations
++
++from backend.knowledge.models import SearchRequest
++from backend.knowledge.store import SQLiteKnowledgeBase
++from scripts.bootstrap_knowledge import build_corpus
++
++
++def test_bootstrap_indexes_only_controlled_source_directories(tmp_path) -> None:
++    root = tmp_path / "knowledge"
++    (root / "official" / "elf").mkdir(parents=True)
++    (root / "reference").mkdir()
++    (root / "internal_notes").mkdir()
++    (root / "official" / "elf" / "headers.md").write_text(
++        "# ELF\n\nThe e_entry field stores the entry address.", encoding="utf-8"
++    )
++    (root / "secret.md").write_text("flag should not be indexed", encoding="utf-8")
++
++    report = build_corpus(root, str(tmp_path / "knowledge.sqlite3"))
++
++    assert report["failed"] == []
++    assert [item["path"] for item in report["files"]] == ["official/elf/headers.md"]
++    assert report["chunks"] == 1
++
++
++def test_bootstrap_preserves_front_matter_provenance_and_body_lines(tmp_path) -> None:
++    root = tmp_path / "knowledge"
++    source = root / "official" / "elf"
++    source.mkdir(parents=True)
++    (source / "headers.md").write_text(
++        "---\n"
++        "source_url: https://example.test/elf\n"
++        "source_title: ELF specification notes\n"
++        "source_version: 1.2\n"
++        "publisher: Example Foundation\n"
++        "license: CC-BY-4.0\n"
++        "retrieved_at: 2026-08-31\n"
++        "---\n"
++        "# ELF\n\nThe e_entry field stores the entry address.\n",
++        encoding="utf-8",
++    )
++
++    database = str(tmp_path / "knowledge.sqlite3")
++    report = build_corpus(root, database)
++
++    assert report["failed"] == []
++    assert report["files"][0]["chunks"] == 1
++    assert report["files"][0]["source_url"] == "https://example.test/elf"
++    assert report["files"][0]["provenance"]["license"] == "CC-BY-4.0"
++    store = SQLiteKnowledgeBase(database)
++    try:
++        result = store.search(SearchRequest(query="entry address"))
++        assert result[0].provenance["source_url"] == "https://example.test/elf"
++        assert result[0].metadata["source_version"] == "1.2"
++        assert result[0].provenance["line_start"] == 9
++    finally:
++        store.close()
++
++
++def test_bootstrap_removes_stale_url_documents(tmp_path) -> None:
++    """Removing a frontmatter-URL file must drop its old document: cleanup
++    matches the STORED source_url (the URL), not the local file path."""
++    root = tmp_path / "knowledge"
++    source = root / "official" / "elf"
++    source.mkdir(parents=True)
++    (source / "a.md").write_text(
++        "---\nsource_url: https://example.test/a\n---\n\n# A\n\nA content.\n",
++        encoding="utf-8",
++    )
++    (source / "b.md").write_text(
++        "---\nsource_url: https://example.test/b\n---\n\n# B\n\nB content.\n",
++        encoding="utf-8",
++    )
++    database = str(tmp_path / "knowledge.sqlite3")
++
++    first = build_corpus(root, database)
++    assert [item["path"] for item in first["files"]] == ["official/elf/a.md", "official/elf/b.md"]
++
++    (source / "b.md").unlink()
++    second = build_corpus(root, database)
++
++    assert [item["path"] for item in second["files"]] == ["official/elf/a.md"]
++    assert second["deleted_documents"] == 1
++    store = SQLiteKnowledgeBase(database)
++    try:
++        assert [hit.provenance["source_url"] for hit in store.search(SearchRequest("content"))] == [
++            "https://example.test/a"
++        ]
++    finally:
++        store.close()
++
++
++def test_bootstrap_keeps_previous_doc_when_reingest_fails(tmp_path) -> None:
++    """A file that parses but fails to re-ingest keeps its previous index so a
++    transient build error cannot silently wipe searchable knowledge."""
++    root = tmp_path / "knowledge"
++    source = root / "official" / "elf"
++    source.mkdir(parents=True)
++    target = source / "guide.md"
++    target.write_text(
++        "---\nsource_url: https://example.test/guide\n---\n\n# Guide\n\nUseful z3 content.\n",
++        encoding="utf-8",
++    )
++    database = str(tmp_path / "knowledge.sqlite3")
++    build_corpus(root, database)
++
++    target.write_text("---\nsource_url: https://example.test/guide\n---\n", encoding="utf-8")
++    report = build_corpus(root, database)
++
++    assert report["failed"] and report["failed"][0]["path"] == "official/elf/guide.md"
++    assert report["deleted_documents"] == 0
++    store = SQLiteKnowledgeBase(database)
++    try:
++        assert store.search(SearchRequest("z3"))
++    finally:
++        store.close()
+diff --git a/tests/test_knowledge_cli.py b/tests/test_knowledge_cli.py
+new file mode 100644
+index 0000000..a0dc637
+--- /dev/null
++++ b/tests/test_knowledge_cli.py
+@@ -0,0 +1,77 @@
++"""Stable CLI return codes for the knowledge tooling (search/delete/index)."""
++
++from __future__ import annotations
++
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from backend.knowledge.models import SearchRequest
++from backend.knowledge.store import SQLiteKnowledgeBase
++
++SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
++SEARCH_CLI = SCRIPTS_DIR / "search_knowledge.py"
++
++
++def _run_cli(*args: str) -> subprocess.CompletedProcess:
++    return subprocess.run(
++        [sys.executable, str(SEARCH_CLI), *args],
++        capture_output=True,
++        text=True,
++        cwd=SCRIPTS_DIR.parent,
++    )
++
++
++def test_search_missing_db_has_stable_exit_code(tmp_path) -> None:
++    proc = _run_cli("z3", "--db", str(tmp_path / "missing.sqlite3"))
++    assert proc.returncode == 3
++    assert "does not exist" in proc.stderr
++
++
++def test_delete_contract_and_exit_codes(tmp_path) -> None:
++    db = tmp_path / "knowledge.sqlite3"
++    knowledge = SQLiteKnowledgeBase(db)
++    document = knowledge.ingest(
++        title="Guide", text="z3 guide", source_type="official", source_url="file:///docs/z3.md"
++    )
++    knowledge.close()
++
++    proc = _run_cli("--delete", "doc-does-not-exist", "--db", str(db))
++    assert proc.returncode == 1
++
++    proc = _run_cli("--delete", document.document_id, "--db", str(db))
++    assert proc.returncode == 0
++    assert f'"deleted": "{document.document_id}"' in proc.stdout
++
++    knowledge = SQLiteKnowledgeBase(db)
++    assert not knowledge.search(SearchRequest("z3"))
++    knowledge.close()
++
++
++def test_invalid_parameters_have_stable_exit_code(tmp_path) -> None:
++    db = tmp_path / "knowledge.sqlite3"
++    knowledge = SQLiteKnowledgeBase(db)
++    knowledge.ingest(title="Guide", text="z3 guide", source_type="official")
++    knowledge.close()
++
++    proc = _run_cli("z3", "--db", str(db), "--top-k", "0")
++    assert proc.returncode == 2
++    assert "invalid search request" in proc.stderr
++
++    proc = _run_cli("z3", "--db", str(db), "--metadata", "broken")
++    assert proc.returncode == 2
++    assert "KEY=VALUE" in proc.stderr
++
++
++def test_index_script_refuses_benchmark_corpus_root() -> None:
++    from scripts.index_knowledge import REPO_ROOT, _validate_root
++
++    benchmark_root = REPO_ROOT / "benchmarks"
++    if not benchmark_root.exists():
++        pytest.skip("benchmarks submodules not checked out")
++    with pytest.raises(SystemExit, match="refusing to index benchmark corpus root"):
++        _validate_root(benchmark_root)
++    with pytest.raises(SystemExit, match="refusing to index benchmark corpus root"):
++        _validate_root(benchmark_root / "cybench" / "benchmark")
+diff --git a/tests/test_knowledge_tool.py b/tests/test_knowledge_tool.py
+new file mode 100644
+index 0000000..081d1d8
+--- /dev/null
++++ b/tests/test_knowledge_tool.py
+@@ -0,0 +1,256 @@
++"""Offline protocol-level tests for the Codex search_knowledge tool contract.
++
++These tests drive `CodexSolver._exec_tool` directly (no app-server) and pin
++the agent-facing contract: schema shape, parameter defaults, result JSON
++shape with provenance, the empty-result message and failure isolation.
++"""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from backend.agents.codex_solver import SANDBOX_TOOLS, CodexSolver
++from backend.knowledge.service import KnowledgeService
++from backend.knowledge.store import SQLiteKnowledgeBase
++
++
++def _tool_schema() -> dict:
++    tool = next(tool for tool in SANDBOX_TOOLS if tool["name"] == "search_knowledge")
++    return tool["inputSchema"]
++
++
++def _solver_with(service: KnowledgeService | None) -> CodexSolver:
++    solver = object.__new__(CodexSolver)
++    solver.knowledge_service = service
++    solver._knowledge_queries = 0
++    solver._knowledge_hits = 0
++    solver._knowledge_chars = 0
++    solver._knowledge_elapsed_ms = 0.0
++    solver._knowledge_tool_calls = 0
++    solver._knowledge_cache_hits = 0
++    solver._knowledge_budget_rejections = 0
++    solver._turn_knowledge_queries = 0
++    solver._knowledge_cache = {}
++    solver._knowledge_turn_budget = 1
++    solver._knowledge_solver_budget = 8
++    solver._knowledge_context_budget = 32_000
++    solver._knowledge_challenge_budget = None
++    solver.settings = SimpleNamespace(knowledge_top_k=5)
++    solver.tracer = SimpleNamespace(event=lambda *_args, **_kwargs: None)
++    solver.evidence_board = None
++    return solver
++
++
++def test_tool_schema_contract() -> None:
++    schema = _tool_schema()
++    assert schema["type"] == "object"
++    assert schema["required"] == ["query"]
++    props = schema["properties"]
++    assert props["top_k"] == {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}
++    assert set(props) == {"query", "source_type", "metadata", "top_k"}
++
++
++def test_tool_disabled_service_returns_readable_message() -> None:
++    solver = _solver_with(None)
++    import asyncio
++
++    message = asyncio.run(solver._exec_tool("search_knowledge", {"query": "z3"}))
++    assert message == "Knowledge search is disabled for this run."
++
++
++def test_tool_success_returns_json_with_provenance(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    document = knowledge.ingest(
++        title="ELF guide",
++        text="# ELF\n\nThe e_entry field stores the entry address.",
++        source_type="official",
++        source_url="file:///docs/elf.md",
++        metadata={"topic": "binary"},
++    )
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    import asyncio
++
++    try:
++        payload = json.loads(asyncio.run(solver._exec_tool("search_knowledge", {"query": "e_entry"})))
++    finally:
++        service.close()
++
++    assert payload["diagnostic"]["status"] == "ok"
++    assert solver._knowledge_queries == 1
++    assert solver._knowledge_hits == 1
++    assert solver._knowledge_chars > 0
++    results = payload["results"]
++    assert len(results) == 1
++    provenance = results[0]["provenance"]
++    assert provenance["document_id"] == document.document_id
++    assert provenance["chunk_id"] == f"{document.document_id}:0"
++    assert provenance["source_url"] == "file:///docs/elf.md"
++    assert provenance["trust_level"] == "medium"
++    assert provenance["line_start"] == 1
++    assert results[0]["metadata"]["topic"] == "binary"
++
++
++def test_tool_empty_result_returns_readable_message(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    import asyncio
++
++    try:
++        message = asyncio.run(solver._exec_tool("search_knowledge", {"query": "no-such-topic-xyz"}))
++    finally:
++        service.close()
++
++    assert "no usable results" in message
++    assert "Continue with sandbox analysis" in message
++    assert solver._knowledge_queries == 1
++    assert solver._knowledge_hits == 0
++
++
++def test_tool_top_k_default_and_bounds_are_applied(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    for index in range(3):
++        knowledge.ingest(
++            title=f"Doc {index}",
++            text=f"shared z3 knowledge #{index}",
++            source_type="official",
++            source_url=f"file:///docs/{index}.md",
++        )
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    import asyncio
++
++    try:
++        payload = json.loads(asyncio.run(solver._exec_tool("search_knowledge", {"query": "shared z3"})))
++        assert len(payload["results"]) == 3
++
++        solver._knowledge_queries = 0
++        solver._knowledge_hits = 0
++        solver._turn_knowledge_queries = 0  # fresh turn
++        limited = json.loads(asyncio.run(solver._exec_tool("search_knowledge", {"query": "shared z3", "top_k": 2})))
++        assert len(limited["results"]) == 2
++
++        solver._turn_knowledge_queries = 0
++        with pytest.raises(ValueError):
++            asyncio.run(solver._exec_tool("search_knowledge", {"query": "shared z3", "top_k": 0}))
++    finally:
++        service.close()
++
++
++def test_tool_failure_is_isolated_to_the_call(tmp_path) -> None:
++    """Storage failure surfaces as an empty result + diagnostic; the caller
++    (`_handle_tool_call`) converts remaining errors into readable text."""
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++    knowledge.close()  # simulate store loss after service creation
++
++    solver = _solver_with(service)
++    import asyncio
++
++    message = asyncio.run(solver._exec_tool("search_knowledge", {"query": "anything"}))
++    assert "no usable results" in message
++    assert service.last_diagnostic["status"] == "error"
++
++
++def test_tool_turn_budget_rejects_second_query_in_same_turn(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="Guide", text="z3 guide", source_type="official")
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    import asyncio
++
++    try:
++        asyncio.run(solver._exec_tool("search_knowledge", {"query": "z3"}))
++        assert solver._knowledge_queries == 1
++        # Same turn: second call must be budget-rejected, not executed.
++        second = asyncio.run(solver._exec_tool("search_knowledge", {"query": "gdb"}))
++        assert "budget exhausted" in second
++        assert solver._knowledge_budget_rejections == 1
++        assert solver._knowledge_queries == 1  # no new backend query
++        # Next turn: budget resets and the query runs.
++        solver._turn_knowledge_queries = 0
++        third = asyncio.run(solver._exec_tool("search_knowledge", {"query": "guide"}))
++        assert solver._knowledge_queries == 2
++        assert "guide" in third
++    finally:
++        service.close()
++
++
++def test_tool_solver_budget_rejects_after_limit(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    solver._knowledge_solver_budget = 2
++    import asyncio
++
++    try:
++        for query in ("zz1", "zz2"):
++            asyncio.run(solver._exec_tool("search_knowledge", {"query": query}))
++            solver._turn_knowledge_queries = 0  # simulate fresh turns
++        assert solver._knowledge_queries == 2
++        solver._turn_knowledge_queries = 0
++        message = asyncio.run(solver._exec_tool("search_knowledge", {"query": "zz3"}))
++        assert "budget exhausted for this challenge" in message
++        assert solver._knowledge_budget_rejections == 1
++    finally:
++        service.close()
++
++
++def test_tool_same_query_is_cache_hit_not_second_query(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    knowledge.ingest(title="Guide", text="z3 guide", source_type="official")
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    import asyncio
++
++    try:
++        asyncio.run(solver._exec_tool("search_knowledge", {"query": "z3", "top_k": 2}))
++        assert solver._knowledge_queries == 1
++        solver._turn_knowledge_queries = 0  # fresh turn
++        second = asyncio.run(solver._exec_tool("search_knowledge", {"query": "z3", "top_k": 2}))
++        payload = json.loads(second)
++        assert payload["diagnostic"]["query_outcome"] == "cache_hit"
++        assert solver._knowledge_queries == 1  # not counted as a backend query
++        assert solver._knowledge_cache_hits == 1
++        assert solver._knowledge_tool_calls == 2
++        # A DIFFERENT query is not a cache hit.
++        solver._turn_knowledge_queries = 0
++        asyncio.run(solver._exec_tool("search_knowledge", {"query": "gdb", "top_k": 2}))
++        assert solver._knowledge_queries == 2
++    finally:
++        service.close()
++
++
++def test_tool_query_outcome_mapping(tmp_path) -> None:
++    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
++    service = KnowledgeService(knowledge)
++    solver = _solver_with(service)
++    import asyncio
++
++    try:
++        no_hit = asyncio.run(solver._exec_tool("search_knowledge", {"query": "qqqq-zzzz-nothing"}))
++        assert "no usable results" in no_hit
++        assert solver._knowledge_cache[(solver._knowledge_cache_key({"query": "qqqq-zzzz-nothing"}))][1]["query_outcome"] == "no_hit"
++        solver._turn_knowledge_queries = 0
++        invalid = asyncio.run(solver._exec_tool("search_knowledge", {"query": "   "}))
++        assert "no usable results" in invalid
++        outcome = solver._knowledge_cache[solver._knowledge_cache_key({"query": "   "})][1]["query_outcome"]
++        assert outcome == "invalid_query"
++    finally:
++        service.close()
++
++
++def test_shared_challenge_budget_is_consumed_across_solvers() -> None:
++    from backend.knowledge.budget import KnowledgeBudget
++
++    budget = KnowledgeBudget(2)
++    assert budget.consume()
++    assert budget.consume()
++    assert not budget.consume()
++    assert budget.remaining() == 0
++    with pytest.raises(ValueError):
++        KnowledgeBudget(0)
+diff --git a/tests/test_rag_eval_sets.py b/tests/test_rag_eval_sets.py
+index cf0293d..35d85ec 100644
+--- a/tests/test_rag_eval_sets.py
++++ b/tests/test_rag_eval_sets.py
+@@ -3,6 +3,13 @@ from __future__ import annotations
+ import json
+ from pathlib import Path
+ 
++from scripts.run_rag_eval import (
++    _aggregate,
++    _aggregate_replicates,
++    _incomplete_pairs,
++    build_comparison,
++)
++
+ 
+ def _load(name: str) -> dict:
+     path = Path("benchmarks/rag_eval") / f"{name}.json"
+@@ -28,3 +35,163 @@ def test_rag_eval_manifests_are_fixed_and_nested() -> None:
+     sensitive_counts = sensitive["summary"]["by_provider"]
+     assert sensitive_counts["cybench"] == 37
+     assert sensitive_counts["nyu"] == 63
++
++
++def test_knowledge_probe_subset_is_labeled_and_contained_in_smoke_20() -> None:
++    probe = _load("knowledge_probe")
++    smoke = _load("smoke_20")
++
++    assert len(probe["items"]) == 6
++    smoke_keys = {(item["provider"], item["challenge_id"]) for item in smoke["items"]}
++    for item in probe["items"]:
++        assert isinstance(item["knowledge_needed"], bool)
++        assert isinstance(item["expected_knowledge"], list)
++        if item["knowledge_needed"]:
++            assert item["expected_knowledge"], "knowledge-needed items must list expected topics"
++        else:
++            assert item["expected_knowledge"] == []
++        assert (item["provider"], item["challenge_id"]) in smoke_keys
++
++    needed = [item for item in probe["items"] if item["knowledge_needed"]]
++    not_needed = [item for item in probe["items"] if not item["knowledge_needed"]]
++    assert len(needed) == 3 and len(not_needed) == 3
++
++
++def test_knowledge_probe_v2_is_corpus_anchored() -> None:
++    """v2 probe rules: knowledge-needed items must point at existing corpus
++    docs; controls must not; ids must exist in the candidate pools."""
++    probe = _load("knowledge_probe_v2")
++    pool = {}
++    for name in ("smoke_20", "main_100", "rag_sensitive_100"):
++        for item in _load(name)["items"]:
++            pool[(item["provider"], item["challenge_id"])] = item
++
++    items = probe["items"]
++    assert len(items) == 11
++    needed = [item for item in items if item["knowledge_needed"]]
++    controls = [item for item in items if not item["knowledge_needed"]]
++    assert len(needed) == 8 and len(controls) == 3
++
++    corpus_dir = Path("knowledge")
++    for item in items:
++        assert (item["provider"], item["challenge_id"]) in pool, item["challenge_id"]
++        assert isinstance(item["relevant_corpus_docs"], list)
++        if item["knowledge_needed"]:
++            assert item["expected_knowledge"]
++            assert item["relevant_corpus_docs"], "knowledge-needed items must cite corpus docs"
++            for doc in item["relevant_corpus_docs"]:
++                assert (corpus_dir / doc).is_file(), f"missing corpus doc: {doc}"
++        else:
++            assert item["expected_knowledge"] == []
++            assert item["relevant_corpus_docs"] == []
++
++    # Topic spread sanity: no two knowledge-needed items should share the same
++    # primary corpus doc (each probes a different corpus area).
++    primary = [item["relevant_corpus_docs"][0] for item in needed]
++    assert len(set(primary)) == len(primary)
++
++
++def test_build_comparison_aggregates_and_pairs_by_challenge_id() -> None:
++    off_results = [
++        {
++            "challenge_id": "a", "solved": True, "status": "flag_found",
++            "tool_calls": 10, "total_tokens": 1000, "cost_usd": 0.1,
++            "elapsed_seconds": 60, "knowledge_queries": 0,
++        },
++        {
++            "challenge_id": "b", "solved": False, "status": "timeout",
++            "tool_calls": 3, "total_tokens": 800, "cost_usd": 0.08,
++            "elapsed_seconds": 120, "knowledge_queries": 0,
++        },
++    ]
++    on_results = [
++        # Reordered on purpose: pairing must be by challenge_id, not position.
++        {
++            "challenge_id": "b", "solved": True, "status": "flag_found",
++            "tool_calls": 5, "total_tokens": 900, "cost_usd": 0.09,
++            "elapsed_seconds": 90, "knowledge_queries": 2,
++            "knowledge_hits": 1, "knowledge_chars": 400, "knowledge_elapsed_ms": 0.5,
++        },
++        {
++            "challenge_id": "a", "solved": True, "status": "flag_found",
++            "tool_calls": 12, "total_tokens": 1100, "cost_usd": 0.11,
++            "elapsed_seconds": 70, "knowledge_queries": 3,
++            "knowledge_hits": 3, "knowledge_chars": 900, "knowledge_elapsed_ms": 0.7,
++        },
++    ]
++    comparison = build_comparison(Path("benchmarks/rag_eval/knowledge_probe.json"), {
++        "results": off_results,
++    }, {
++        "results": on_results,
++    })
++
++    assert comparison["delta_solved"] == 1  # b flipped timeout -> solved
++    assert comparison["off"]["solve_rate"] == 0.5
++    assert comparison["on"]["knowledge_queries"] == 5
++    assert comparison["on"]["knowledge_hits"] == 4
++    assert comparison["on"]["knowledge_chars"] == 1300
++    assert comparison["on"]["knowledge_elapsed_ms"] == 1.2
++    assert comparison["on"]["knowledge_est_extra_tokens"] == 325  # 1300 // 4
++    assert comparison["delta_tokens"] == 200
++    assert comparison["delta_cost_usd"] == 0.02
++
++    rows = {row["challenge_id"]: row for row in comparison["per_challenge"]}
++    assert rows["a"]["delta_solved"] == 0
++    assert rows["b"]["delta_solved"] == 1
++    assert rows["b"]["on"]["knowledge_queries"] == 2
++
++
++def test_aggregate_is_empty_safe() -> None:
++    summary = _aggregate([])
++    assert summary["solve_rate"] == 0
++    assert summary["tool_calls_avg"] == 0
++    assert summary["elapsed_avg"] == 0
++    assert summary["knowledge_est_extra_tokens"] == 0
++
++
++def _run(challenge_id: str, solved: bool, status: str = "flag_found", kq: int = 0) -> dict:
++    return {
++        "challenge_id": challenge_id, "solved": solved, "status": status,
++        "tool_calls": 3, "total_tokens": 100, "cost_usd": 0.1,
++        "elapsed_seconds": 60, "knowledge_queries": kq,
++    }
++
++
++def test_incomplete_pairs_detects_missing_sides() -> None:
++    off = [_run("a", True)]
++    on = [_run("a", True), _run("b", False)]
++    missing = _incomplete_pairs(off, on)
++    # b ran only in the rag-on run: the off side of its pair is missing.
++    assert missing == [{"challenge_id": "b", "missing_side": "off"}]
++
++
++def test_aggregate_replicates_means_and_incomplete() -> None:
++    # rep1: a solved off+on, b unsolved off / solved on (delta +1)
++    # rep2: a solved both, b solved off / timeout on (delta -1) -> mean delta 0
++    pairs = [
++        (
++            {"results": [_run("a", True), _run("b", False, "timeout")]},
++            {"results": [_run("a", True), _run("b", True, "flag_found", kq=2)]},
++        ),
++        (
++            {"results": [_run("a", True), _run("b", True)]},
++            {"results": [_run("a", True), _run("b", False, "timeout", kq=1)]},
++        ),
++    ]
++    agg = _aggregate_replicates(pairs)
++    assert agg["replicates"] == 2
++    assert agg["off"]["solved"] == 3 and agg["on"]["solved"] == 3
++    assert agg["delta_solved_mean"] == 0.0
++    rows = {row["challenge_id"]: row for row in agg["per_challenge"]}
++    assert rows["b"]["delta_solved_total"] == 0
++    assert rows["b"]["knowledge_queries_total"] == 3
++    assert agg["incomplete_pairs"] == []
++
++
++def test_build_comparison_marks_incomplete_pairs() -> None:
++    comparison = build_comparison(
++        Path("benchmarks/rag_eval/knowledge_probe_v2.json"),
++        {"results": [_run("a", True)]},
++        {"results": [_run("a", True), _run("b", True)]},
++    )
++    assert comparison["incomplete"] == [{"challenge_id": "b", "missing_side": "off"}]
+> ```
+---
