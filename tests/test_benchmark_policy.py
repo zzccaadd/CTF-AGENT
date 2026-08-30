@@ -11,7 +11,7 @@ from backend.prompts import ChallengeMeta, build_prompt
 def test_default_benchmark_limits_are_fixed_and_offline() -> None:
     limits = BenchmarkLimits()
     assert limits.model == "codex/gpt-5.5"
-    assert limits.timeout_seconds == 1_800
+    assert limits.timeout_seconds == 300
     assert limits.max_tokens == 1_000_000
     assert limits.allow_internet is False
     assert limits.attempts == 1

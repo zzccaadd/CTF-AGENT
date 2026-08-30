@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     sandbox_network: str = ""
     allow_internet: bool = True
     max_tokens_per_challenge: int = 1_000_000
-    challenge_timeout_seconds: int = 1_800
+    challenge_timeout_seconds: int = 300
     solvers_per_swarm: int = 3
     max_solvers_per_swarm: int = 3
     evidence_db_path: str = "logs/evidence.sqlite3"

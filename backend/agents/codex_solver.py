@@ -173,7 +173,7 @@ SANDBOX_TOOLS = [
     },
     {
         "name": "search_knowledge",
-        "description": "Search the local reviewed knowledge base (CWE/memory-safety, ELF/PE and file formats, protocols, gdb/radare2/pwntools/z3/Volatility, CTF technique patterns). Use it when the challenge involves an ABI, format, protocol or technique you are unsure about, or when you need exact tool syntax. Returns source URL, version, license and line provenance. Local and fast.",
+        "description": "Search the local reviewed knowledge base (free, instant, no network). Has docs on CWE-119/125/190/416/502/787, ELF/PE/PNG/ZIP/PDF/pcap, HTTP/DNS/TCP/TLS/WebSocket/X.509, gdb/radare2/pwntools/z3/RsaCtfTool/steghide/Volatility, and technique patterns (MT19937/LCG, RSA attacks, padding oracle, CBC bit-flipping, XOR reuse, ROP, format string, canary, UPX unpacking, anti-debug, pyc, LSB stego, PCAP, JWT, pickle, SQLi, SSTI, command injection). Use a CONCRETE term as query. Returns source URL, version, license and line provenance.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -777,7 +777,12 @@ class CodexSolver:
                 )
             if not results:
                 status = diagnostic.get("status", "empty")
-                return f"Knowledge search returned no usable results ({status}). Continue with sandbox analysis."
+                hint = (
+                    " Try a more concrete term (e.g. 'CWE-119', 'MT19937', 'padding oracle')."
+                    if outcome == "no_hit"
+                    else ""
+                )
+                return f"Knowledge search returned no usable results ({status}).{hint} Continue with sandbox analysis."
             return json.dumps(
                 {"results": [result.__dict__ for result in results], "diagnostic": diagnostic},
                 ensure_ascii=False,

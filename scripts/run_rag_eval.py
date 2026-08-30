@@ -263,10 +263,10 @@ def parse_args() -> argparse.Namespace:
         help="Manifest JSON path. May be repeated. Defaults to all three curated manifests.",
     )
     parser.add_argument("--model", default="codex/gpt-5.5")
-    parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument("--max-tokens", type=int, default=500_000)
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--max-tokens", type=int, default=1_000_000)
     parser.add_argument("--concurrency", type=int, default=1)
-    parser.add_argument("--solvers-per-swarm", type=int, default=1, help="Codex workers per challenge (default 1)")
+    parser.add_argument("--solvers-per-swarm", type=int, default=3, help="Codex workers per challenge (default 3)")
     parser.add_argument("--image", default="ctf-sandbox")
     parser.add_argument("--allow-internet", action="store_true")
     parser.add_argument("--rag", dest="rag_enabled", default=True, action=argparse.BooleanOptionalAction)

@@ -10,7 +10,7 @@ from typing import Any
 @dataclass(frozen=True)
 class BenchmarkLimits:
     model: str = "codex/gpt-5.5"
-    timeout_seconds: int = 1_800
+    timeout_seconds: int = 300
     max_tokens: int = 1_000_000
     allow_internet: bool = False
     attempts: int = 1

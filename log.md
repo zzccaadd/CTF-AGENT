@@ -16365,3 +16365,33 @@ index cf0293d..35d85ec 100644
 > 【本轮改动已随 fix 提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【52】
+> 时间：2026-08-31
+> 会话ID：【默认配置调整 + RAG 使用率分析 + 提示词强化】
+> 涉及文件：scripts/run_rag_eval.py / backend/benchmarks/models.py / backend/config.py / backend/prompts.py / backend/agents/codex_solver.py / tests/test_benchmark_policy.py / log.md
+> 需求/遇到的问题：
+> v2 对照（记录【50】【51】）与 3-solver 实验汇总后：所有单 solver 运行 knowledge_queries=0，仅 3-solver 模式出现 1 次真实调用（query_outcome=no_hit）——提示词改造未显著提升使用率。用户要求：默认 max_tokens 提到 1M、超时 5 分钟、默认 solver 3；并分析 RAG 使用率低的根因与修复方案。
+
+> 我的原始提问Prompt：
+> > max tokens提高到1M，然后RAG使用率，你再分析一下原因可能是什么，应该怎么修复，并且超时时间改为5min。默认solver为3。
+
+> 分析与根因（RAG 使用率 0/1 调用）：
+> 1) 提示词引导是"可选"而非"行动"：原 Knowledge 段为 "Use it when you are NOT sure..."——模型对自身知识高度自信，永远"确定"，从不触发（对比 submit_flag 的强制指令 "**Verify every candidate**"）；2) 模型不知道语料具体有什么：原描述只有类别概述，模型不知道存在 MT19937/RSA 攻击族/padding oracle/UPX 脱壳等具体主题，没有"值得查"的感知；3) easy 题不产生"缺知识"时刻：PackedAway 直接 upx -d、Data Siege 直接 tshark，bash 即可解决；4) 单 solver 无协作触发：首次真实调用出现在 3-solver 竞争模式（黑板上另一个 worker 可能已用）；5) 查询质量差：唯一调用是 no_hit（术语太宽泛）。
+
+> 修复方案（已实现）：
+> 1) 提示词 Knowledge 段改为行动指令：明确"若题目涉及清单中任何你拿不准的格式/协议/算法/技术，先用具体术语查一次再猜"；说明本地免费、不占网络/求解时间；2) 主题清单具体化（40+ 具体主题：MT19937/LCG、RSA 攻击族、padding oracle、CBC 位翻转、XOR 密钥流、ROP、格式化字符串、canary、UPX、反调试、pyc、LSB、PCAP、JWT、pickle、SQLi、SSTI、命令注入）；3) search_knowledge 工具描述同步具体化并提示使用具体术语；4) no_hit 返回消息附加"尝试更具体术语（如 CWE-119/MT19937/padding oracle）"引导。配置：run_rag_eval 默认 --timeout 300（5 分钟）、--max-tokens 1_000_000、--solvers-per-swarm 3；BenchmarkLimits/Settings 同步（timeout_seconds/challenge_timeout_seconds=300，max_tokens 本就 1M，solvers_per_swarm 本就 3）。
+
+> 可选解决方案对比（后续候选，未实现）：
+> 方案A（已实现）：提示词/描述强化——低成本、无副作用，但依赖模型自觉，效果待下一轮实验验证。
+> 方案B（建议下一步）：类别自动检索注入（knowledge_auto_inject feature flag）——solver 启动时按 challenge category/tags 自动执行 1-2 次检索（pwn→bof/ROP，forensics→stego/PCAP…）并将结果注入首轮上下文，不依赖模型自觉，保证 RAG 至少被使用、可直接测 recall；需要新增 settings 与启动逻辑。
+> 方案C：把知识检索作为某些类别题目的强制前置步骤（提示词内"第 0 步先查"）——与 A 叠加，风险是 easy 题浪费一次调用（预算 8 次足够）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：80 passed（78→80，含 timeout 默认值断言更新）；ruff 通过。3-solver-on 运行（bash-13）仍在收尾（NYU 2 题），完成后补汇总。遗留：方案 B（自动注入）待用户确认后实现。
+
+> 本次完整代码Diff：
+> ```diff
+> 【配置默认值 + 提示词/工具描述强化，已随本轮提交推送；详见 git log。】
+> ```
+---

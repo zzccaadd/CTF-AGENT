@@ -87,9 +87,10 @@ def main() -> int:
                     f"kq={on_item['knowledge_queries']} kh={on_item['knowledge_hits']} "
                     f"expect[{expected}]{flag}"
                 )
+            recall_proxy = (needed_hits / needed_queries) if needed_queries else 0.0
             print(
                 f"    group: KNOW hits/queries={needed_hits}/{needed_queries} "
-                f"(recall proxy {needed_hits / needed_queries:.2f} if queries>0); "
+                f"(recall proxy {recall_proxy:.2f}); "
                 f"NONE queries={not_needed_queries} (invalid-call rate)"
             )
         print()

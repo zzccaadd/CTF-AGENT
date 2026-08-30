@@ -172,12 +172,14 @@ def build_prompt(
         lines += [
             "",
             "## Knowledge Base",
-            "A local reviewed knowledge base is available through the `search_knowledge` tool:",
-            "- Topics: CWE/memory-safety, ELF/PE and file formats, protocols, gdb/radare2/pwntools/z3/Volatility, and CTF technique patterns (XOR/RSA/padding-oracle/ROP/format-string/pickle/JWT/...).",
-            "- Use it when the challenge involves an ABI, file format, protocol, or technique you are NOT sure about, or when you need exact tool syntax.",
-            "- Do NOT use it for the flag itself, challenge-specific answers, or anything directly observable with sandbox tools.",
-            "- Results are reference material: verify critical claims with real tool output.",
-            "- At most ONE knowledge query per turn; do not repeat the same query.",
+            "A local knowledge base (free, instant, no network) is available through the `search_knowledge` tool. It has reviewed docs on:",
+            "- CWE/memory safety: CWE-119/125/190/416/476/502/787/798",
+            "- Formats: ELF dynamic linking & relocations, PE, PNG, ZIP, PDF, pcap",
+            "- Protocols: HTTP, DNS, TCP/IP, TLS, WebSocket, X.509",
+            "- Tools: gdb, radare2, pwntools, z3, RsaCtfTool, steghide/zsteg, Volatility, readelf/objdump, pyghidra",
+            "- Technique patterns: MT19937/LCG prediction, RSA attacks, padding oracle, CBC bit-flipping, XOR keystream reuse, ROP, ret2libc, format string, canary bypass, heap basics, seccomp, UPX unpacking, anti-debug, pyc reversing, LSB stego, PCAP analysis, ZIP tricks, SQLi, XSS, SSTI, JWT alg confusion, pickle RCE, command injection",
+            "If the challenge involves any format, protocol, algorithm, or technique in this list that you are not certain about, run ONE `search_knowledge` query with a concrete term (e.g. 'MT19937', 'padding oracle', 'UPX') BEFORE guessing — the query is local and does not use network or solver time.",
+            "At most ONE knowledge query per turn, up to 8 per challenge. Results are reference material: verify critical claims with real sandbox output.",
             "",
         ]
 
