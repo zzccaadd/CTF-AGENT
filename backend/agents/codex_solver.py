@@ -178,7 +178,11 @@ SANDBOX_TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "source_type": {"type": "string"},
+                "source_type": {
+                    "type": "string",
+                    "enum": ["official", "reference", "internal_notes"],
+                    "description": "Optional corpus source type. Omit it to search all sources; other values are ignored.",
+                },
                 "metadata": {"type": "object"},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
             },

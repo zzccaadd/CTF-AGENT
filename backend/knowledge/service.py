@@ -101,8 +101,15 @@ class KnowledgeService:
 
     @staticmethod
     def _normalized_source_type(source_type: Any) -> str | None:
+        """Return a whitelisted source_type or None.
+
+        Model-supplied values outside the allowed set (e.g. "all",
+        "ctf_pattern") are IGNORED, not used as an exact-match filter: a
+        non-whitelisted filter would silently zero out every result."""
         if isinstance(source_type, str) and source_type.strip():
-            return source_type.strip().lower()
+            normalized = source_type.strip().lower()
+            if normalized in KnowledgeService.ALLOWED_SOURCE_TYPES:
+                return normalized
         return None
 
     def search(

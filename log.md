@@ -16420,3 +16420,28 @@ index cf0293d..35d85ec 100644
 > 【新增 knowledge_probe_v3_fast.json 一个清单文件。】
 > ```
 ---
+
+# 开发记录【54】
+> 时间：2026-08-31
+> 会话ID：【RAG 调用决策逻辑分析 + source_type 过滤 bug 修复（11 次 no_hit 根因）】
+> 涉及文件：backend/knowledge/service.py / backend/agents/codex_solver.py / tests/test_knowledge.py / log.md
+> 需求/遇到的问题：
+> 用户要求：1) v3 快题集跑完后加 medium 题、并发调 4；2) 从日志分析模型是否调用 RAG、怎么决定调用的思考逻辑。分析 trace 后发现**此前所有评估的 knowledge_queries=0 是双重假象**：(a) 旧 runner 在 swarm 无 winner 时清零知识指标（记录【51】已修）；(b) 真实存在 11 次 search_knowledge 调用但**全部 no_hit**。
+
+> 我的原始提问Prompt：
+> > 这个完了可以加一些medium题来，并发调整到4。然后能不能从当前日志分析一下模型的思考逻辑和是否选择调用是怎么作的？
+
+> 分析与根因（模型调用决策逻辑，来自 2564 个 tool_call 事件的 trace 分析）：
+> 1) **模型会主动调用**：11 次调用分布在 7 个 trace（v1 的 cvv 3 次、v2 on 的 robust-cbc 3 次、3-solver 的 Data Siege/PackedAway/Labyrinth/randsubware 各 1-2 次）——工具可见性与提示词引导有效；2) **调用时机符合"知识感知"**：模型在遇到不确定技术时调用（Apache Velocity SSTI、CBC-MAC forgery、SPN integral attack、radare2 UPX unpack），查询词是具体技术术语，质量良好；也出现不应有的"查题目本身"（cvv 查 'csaw quals 2017 misc cvv flag weakness solution'，3 次不同词）；3) **全部 no_hit 的根因**：模型把 source_type 参数当成自由标签（传 "ctf_pattern"/"ctf-technique"/"ctf"/"all"），而 service 把它当精确匹配过滤器（白名单 official/reference/internal_notes）→ 全部结果被过滤清零 → 模型连续 3 次 0 命中后放弃继续查询（cvv/robust-cbc 模式一致）；4) 重放验证：同一查询无 source_type 时 3 命中、带 "ctf_pattern" 时 0 命中——实锤；5) 结果文件 kq=0 另一层：旧 runner swarm-None 清零（已修）。
+
+> 代码改动说明：
+> backend/knowledge/service.py：_normalized_source_type 改为白名单校验——值不在 ALLOWED_SOURCE_TYPES 时返回 None（忽略过滤而非精确匹配清零），模型传 "all"/"ctf_pattern" 等不再吞掉结果；白名单内值仍精确过滤。backend/agents/codex_solver.py：search_knowledge 工具 schema 的 source_type 增加 enum ["official","reference","internal_notes"] + description（"省略则搜索全部来源，其他值被忽略"）。tests/test_knowledge.py：新增 test_service_ignores_non_whitelisted_source_type_filter（"all"/"ctf_pattern"/"ctf-technique-pattern"/"ctf" 均被忽略、白名单过滤仍生效）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：81 passed（80→81）；ruff 通过。重放验证：Labyrinth SSTI 查询带 source_type="ctf_pattern"/"all" 均恢复 3 命中。v3 运行（bash-14）因旧代码产生全 no_hit 废数据已终止，修复后重启。遗留：medium 题加入与并发 4 待 v3 首轮完成后执行。
+
+> 本次完整代码Diff：
+> ```diff
+> 【service/schema 修复已随本轮提交推送；详见 git log。】
+> ```
+---

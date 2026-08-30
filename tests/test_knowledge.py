@@ -247,6 +247,24 @@ def test_service_ignores_non_string_source_type(tmp_path) -> None:
     service.close()
 
 
+def test_service_ignores_non_whitelisted_source_type_filter(tmp_path) -> None:
+    """A model-supplied source_type outside the whitelist (e.g. "all",
+    "ctf_pattern") must NOT zero out results: it is ignored, not treated as
+    an exact-match filter. This was the root cause of 11 no_hit knowledge
+    calls across the eval runs."""
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="Guide", text="z3 guide", source_type="official")
+    service = KnowledgeService(knowledge)
+
+    for bad in ("all", "ctf_pattern", "ctf-technique-pattern", "ctf"):
+        results = service.search("z3", source_type=bad)
+        assert len(results) == 1, f"source_type={bad!r} must be ignored, got {len(results)}"
+
+    # A whitelisted filter still applies.
+    assert service.search("z3", source_type="reference") == []
+    service.close()
+
+
 def test_fts_cjk_query_uses_per_character_prefix_recall(tmp_path) -> None:
     """unicode61 groups a contiguous CJK run into one index token, so the query
     side expands CJK into per-character prefix terms. This pins the documented
