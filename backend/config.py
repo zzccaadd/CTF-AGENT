@@ -33,7 +33,11 @@ class Settings(BaseSettings):
     allow_internet: bool = True
     max_tokens_per_challenge: int = 1_000_000
     challenge_timeout_seconds: int = 1_800
-    solvers_per_swarm: int = 1
-    max_solvers_per_swarm: int = 5
+    solvers_per_swarm: int = 3
+    max_solvers_per_swarm: int = 3
+    evidence_db_path: str = "logs/evidence.sqlite3"
+    blackboard_default_worker_lease_seconds: int = 300
+    blackboard_intent_max_attempts: int = 3
+    knowledge_db_path: str = "logs/knowledge.sqlite3"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

@@ -15,6 +15,9 @@ from backend.agents.coordinator_core import (
     do_fetch_challenges,
     do_get_solve_status,
     do_kill_swarm,
+    do_list_blackboard_intents,
+    do_propose_intent,
+    do_read_blackboard,
     do_read_solver_trace,
     do_spawn_swarm,
     do_submit_flag,
@@ -33,6 +36,7 @@ Your job is to maximize the number of challenges solved while minimizing cost.
 
 Strategy:
 - Spawn swarms for unsolved challenges, prioritizing by solve count (easy first)
+- After a swarm starts, read its blackboard and propose focused intents based on verified facts and ruled-out paths
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read their traces, then craft targeted bumps with specific technical guidance
 - Use broadcast to share cross-solver insights (e.g. flag format discovery, shared vulnerabilities)
@@ -45,6 +49,7 @@ CRITICAL RULES:
 - When a solver seems stuck, bump it with very specific technical guidance based on
   its trace. Tell it exactly what to try next — specific tools, techniques, approaches.
 - Cost is not a concern. Keep all swarms running.
+- The blackboard is the durable source of challenge state; message broadcasts are only compatibility notifications.
 
 You will receive event messages. Respond with tool calls to manage the competition.
 """
@@ -129,6 +134,25 @@ COORDINATOR_TOOLS = [
                 "last_n": {"type": "integer", "default": 20},
             },
             "required": ["challenge_name", "model_spec"],
+        },
+    },
+    {
+        "name": "read_blackboard",
+        "description": "Read the persistent blackboard summary for a running challenge.",
+        "inputSchema": {"type": "object", "properties": {"challenge_name": {"type": "string"}}, "required": ["challenge_name"]},
+    },
+    {
+        "name": "list_blackboard_intents",
+        "description": "List all blackboard intents and their lifecycle state.",
+        "inputSchema": {"type": "object", "properties": {"challenge_name": {"type": "string"}}, "required": ["challenge_name"]},
+    },
+    {
+        "name": "propose_intent",
+        "description": "Create a concrete next task from blackboard evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"challenge_name": {"type": "string"}, "goal": {"type": "string"}, "acceptance": {"type": "string"}},
+            "required": ["challenge_name", "goal"],
         },
     },
 ]
@@ -318,6 +342,12 @@ class CodexCoordinator:
             return await do_broadcast(deps, args["challenge_name"], args["message"])
         elif name == "read_solver_trace":
             return await do_read_solver_trace(deps, args["challenge_name"], args["model_spec"], args.get("last_n", 20))
+        elif name == "read_blackboard":
+            return await do_read_blackboard(deps, args["challenge_name"])
+        elif name == "list_blackboard_intents":
+            return await do_list_blackboard_intents(deps, args["challenge_name"])
+        elif name == "propose_intent":
+            return await do_propose_intent(deps, args["challenge_name"], args["goal"], args.get("acceptance", ""))
         else:
             return f"Unknown tool: {name}"
 

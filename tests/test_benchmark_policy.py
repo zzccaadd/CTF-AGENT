@@ -14,19 +14,17 @@ def test_default_benchmark_limits_are_fixed_and_offline() -> None:
     assert limits.allow_internet is False
     assert limits.attempts == 1
     assert limits.concurrency == 1
-    assert limits.solvers_per_swarm == 1
-    assert limits.max_solvers_per_swarm == 5
+    assert limits.solvers_per_swarm == 3
+    assert limits.max_solvers_per_swarm == 3
 
 
-def test_single_model_solver_replicas_get_unique_labels_and_cap_at_five() -> None:
-    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=5)
-    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 5
+def test_single_model_solver_replicas_get_unique_labels_and_cap_at_three() -> None:
+    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=3)
+    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 3
     assert [slot.label for slot in slots] == [
         "codex/gpt-5.5#1",
         "codex/gpt-5.5#2",
         "codex/gpt-5.5#3",
-        "codex/gpt-5.5#4",
-        "codex/gpt-5.5#5",
     ]
 
 

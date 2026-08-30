@@ -21,6 +21,9 @@ from backend.agents.coordinator_core import (
     do_fetch_challenges,
     do_get_solve_status,
     do_kill_swarm,
+    do_list_blackboard_intents,
+    do_propose_intent,
+    do_read_blackboard,
     do_read_solver_trace,
     do_spawn_swarm,
     do_submit_flag,
@@ -37,6 +40,7 @@ Your job is to maximize the number of challenges solved.
 
 Strategy:
 - Spawn swarms for unsolved challenges, prioritizing by solve count (easy first)
+- After a swarm starts, read its blackboard and propose focused intents based on verified facts and ruled-out paths
 - Use read_solver_trace to monitor what each solver is doing and where it's stuck
 - When agents are stuck, read their traces, then craft targeted bumps with specific technical guidance
 - Use broadcast to share cross-solver insights (e.g. flag format discovery, shared vulnerabilities)
@@ -49,6 +53,7 @@ CRITICAL RULES:
 - When a solver seems stuck, bump it with very specific technical guidance based on
   its trace. Tell it exactly what to try next — specific tools, techniques, approaches.
 - Cost is not a concern. Keep all swarms running.
+- The blackboard is the durable source of challenge state; message broadcasts are only compatibility notifications.
 
 You will receive event messages. Respond with tool calls to manage the competition.
 """
@@ -98,10 +103,23 @@ def _build_coordinator_mcp(deps: CoordinatorDeps):
     async def read_solver_trace(args: dict) -> dict:
         return _text(await do_read_solver_trace(deps, args["challenge_name"], args["model_spec"], args.get("last_n", 20)))
 
+    @tool("read_blackboard", "Read the persistent blackboard summary for a running challenge.", {"challenge_name": str})
+    async def read_blackboard(args: dict) -> dict:
+        return _text(await do_read_blackboard(deps, args["challenge_name"]))
+
+    @tool("list_blackboard_intents", "List all blackboard intents and their lifecycle state.", {"challenge_name": str})
+    async def list_blackboard_intents(args: dict) -> dict:
+        return _text(await do_list_blackboard_intents(deps, args["challenge_name"]))
+
+    @tool("propose_intent", "Create a concrete next task from blackboard evidence.", {"challenge_name": str, "goal": str, "acceptance": str})
+    async def propose_intent(args: dict) -> dict:
+        return _text(await do_propose_intent(deps, args["challenge_name"], args["goal"], args.get("acceptance", "")))
+
     return create_sdk_mcp_server(
         name="coordinator", version="1.0.0",
         tools=[fetch_challenges, get_solve_status, spawn_swarm, check_swarm_status,
-               submit_flag, kill_swarm, bump_agent, broadcast, read_solver_trace],
+               submit_flag, kill_swarm, bump_agent, broadcast, read_solver_trace,
+               read_blackboard, list_blackboard_intents, propose_intent],
     )
 
 
@@ -128,6 +146,8 @@ async def run_claude_coordinator(
         "mcp__coordinator__submit_flag", "mcp__coordinator__kill_swarm",
         "mcp__coordinator__bump_agent", "mcp__coordinator__broadcast",
         "mcp__coordinator__read_solver_trace",
+        "mcp__coordinator__read_blackboard", "mcp__coordinator__list_blackboard_intents",
+        "mcp__coordinator__propose_intent",
         "ToolSearch",
         "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "TaskOutput", "TaskStop",
     }

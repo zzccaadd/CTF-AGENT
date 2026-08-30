@@ -1,0 +1,2929 @@
+# Worktree diff snapshot generated at 2026-08-31T00:22:05+08:00
+# Includes tracked changes and non-ignored untracked files.
+
+diff --git a/.gitignore b/.gitignore
+index b7342b9..6b96bdc 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -3,6 +3,7 @@
+ .env.*
+ creds.json
+ .codex/
++.codex-diffs/
+ .claude/scheduled_tasks.lock
+ 
+ # Logs, traces, and benchmark outputs
+diff --git a/backend/agents/codex_solver.py b/backend/agents/codex_solver.py
+index 396ed32..231477a 100755
+--- a/backend/agents/codex_solver.py
++++ b/backend/agents/codex_solver.py
+@@ -21,6 +21,7 @@ import time
+ from typing import TYPE_CHECKING, Any
+ 
+ from backend.cost_tracker import CostTracker
++from backend.evidence import EvidenceBoard
+ from backend.loop_detect import LoopDetector
+ from backend.models import model_id_from_spec, supports_vision
+ from backend.output_types import solver_output_json_schema
+@@ -127,6 +128,26 @@ SANDBOX_TOOLS = [
+         "description": "Send a strategic message to the coordinator (e.g. flag format discovery, shared vulnerability, request for help).",
+         "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]},
+     },
++    {
++        "name": "blackboard_summary",
++        "description": "Read the current shared blackboard summary for this challenge.",
++        "inputSchema": {"type": "object", "properties": {}},
++    },
++    {
++        "name": "blackboard_fact",
++        "description": "Record a concise fact observed in real tool output.",
++        "inputSchema": {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]},
++    },
++    {
++        "name": "blackboard_hypothesis",
++        "description": "Record an unverified hypothesis for other workers.",
++        "inputSchema": {"type": "object", "properties": {"hypothesis": {"type": "string"}}, "required": ["hypothesis"]},
++    },
++    {
++        "name": "blackboard_dead_end",
++        "description": "Record a route that real testing ruled out.",
++        "inputSchema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
++    },
+ ]
+ 
+ INTERNET_TOOL_NAMES = {"web_fetch", "webhook_create", "webhook_get_requests"}
+@@ -155,10 +176,15 @@ class CodexSolver:
+         message_bus=None,
+         notify_coordinator=None,
+         solver_label: str | None = None,
++        evidence_board: EvidenceBoard | None = None,
+     ) -> None:
+         self.model_spec = model_spec
+         self.model_id = model_id_from_spec(model_spec)
+         self.solver_label = solver_label or model_spec
++        self.evidence_board = evidence_board
++        self.intent_id: str | None = None
++        self._intent_goal = ""
++        self._intent_acceptance = ""
+         self.challenge_dir = challenge_dir
+         self.meta = meta
+         self.message_bus = message_bus
+@@ -190,6 +216,8 @@ class CodexSolver:
+         self._flag: str | None = None
+         self._confirmed = False
+         self._findings = ""
++        self._last_tool_output = ""
++        self._last_tool_was_external = False
+         self._cost_usd = 0.0
+         self._bump_insights: str | None = None
+         self._structured_output: dict | None = None
+@@ -197,6 +225,8 @@ class CodexSolver:
+         self._compact_requested = False
+         self._pending_responses: dict[int, asyncio.Future] = {}
+         self._reader_task: asyncio.Task | None = None
++        self._intent_heartbeat_task: asyncio.Task | None = None
++        self._intent_lease_seconds = 300
+         self._turn_done: asyncio.Event = asyncio.Event()
+         self._total_tokens = 0
+         self._token_budget_exhausted = False
+@@ -460,13 +490,32 @@ class CodexSolver:
+ 
+         self._step_count += 1
+         self.tracer.tool_call(tool_name, args, self._step_count)
++        if self.evidence_board:
++            event_args = {
++                key: (value[:2000] if isinstance(value, str) else value)
++                for key, value in args.items()
++            }
++            self.evidence_board.record(
++                self.solver_label,
++                "worker",
++                "tool_call",
++                {"tool": tool_name, "args": event_args, "step": self._step_count, "intent_id": self.intent_id or ""},
++                provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
++                dedupe_key=f"tool-call:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
++            )
+ 
+         loop_status = self.loop_detector.check(tool_name, args)
++        success = True
+         if loop_status == "break":
+             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
+             result = "Loop detected — try a completely different approach."
+         else:
+-            result = await self._exec_tool(tool_name, args)
++            try:
++                result = await self._exec_tool(tool_name, args)
++            except Exception as exc:
++                logger.exception("[%s] Tool %s failed", self.agent_name, tool_name)
++                result = f"Tool error: {exc}"
++                success = False
+             if loop_status == "warn" and isinstance(result, str):
+                 from backend.loop_detect import LOOP_WARNING_MESSAGE
+                 result = f"{result}\n\n{LOOP_WARNING_MESSAGE}"
+@@ -476,10 +525,35 @@ class CodexSolver:
+             image_bytes, mime_type = result
+             data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
+             content_items = [{"type": "inputImage", "imageUrl": data_url}]
+-            self.tracer.tool_result(tool_name, f"image:{mime_type}:{len(image_bytes)}b", self._step_count)
++            image_summary = f"image:{mime_type}:{len(image_bytes)}b"
++            self._last_tool_output = image_summary
++            self._last_tool_was_external = True
++            self.tracer.tool_result(tool_name, image_summary, self._step_count)
++            if self.evidence_board:
++                self.evidence_board.record(
++                    self.solver_label,
++                    "worker",
++                    "tool_result",
++                    {"tool": tool_name, "step": self._step_count, "result": image_summary, "intent_id": self.intent_id or ""},
++                    provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
++                    dedupe_key=f"tool:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
++                )
+         else:
+             result_text = str(result)
++            self._last_tool_output = result_text
++            self._last_tool_was_external = tool_name not in {
++                "blackboard_summary", "blackboard_fact", "blackboard_hypothesis", "blackboard_dead_end",
++            }
+             self.tracer.tool_result(tool_name, result_text[:500], self._step_count)
++            if self.evidence_board:
++                self.evidence_board.record(
++                    self.solver_label,
++                    "worker",
++                    "tool_result",
++                    {"tool": tool_name, "step": self._step_count, "result": result_text[:2000], "intent_id": self.intent_id or ""},
++                    provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
++                    dedupe_key=f"tool:{self.meta.name}:{self.evidence_board.run_id if self.evidence_board else self.tracer.path}:{self.solver_label}:{self._step_count}",
++                )
+ 
+             if self._step_count % 5 == 0 and self.message_bus:
+                 from backend.tools.core import do_check_findings
+@@ -491,10 +565,44 @@ class CodexSolver:
+ 
+         await self._respond_to_request(request_id, {
+             "contentItems": content_items,
+-            "success": True,
++            "success": success,
+         })
+ 
+     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
++        if name == "blackboard_summary":
++            return self.evidence_board.summary() if self.evidence_board else "No shared blackboard available."
++        elif name == "blackboard_fact":
++            if not self.evidence_board:
++                return "No shared blackboard available."
++            fact = str(args.get("fact", ""))[:2000]
++            verified = bool(self._last_tool_was_external and fact and fact in self._last_tool_output)
++            event = self.evidence_board.add_fact(
++                self.solver_label,
++                fact,
++                verified=verified,
++                provenance={
++                    "source_kind": "trace" if verified else "worker_explicit",
++                    "trace_path": self.tracer.path,
++                    "source_excerpt": self._last_tool_output[:500],
++                },
++                intent_id=self.intent_id,
++            )
++            label = "verified fact" if verified else "unverified candidate"
++            return f"Recorded {label} event {event.event_id}."
++        elif name == "blackboard_hypothesis":
++            if not self.evidence_board:
++                return "No shared blackboard available."
++            event = self.evidence_board.add_hypothesis(
++                self.solver_label, str(args.get("hypothesis", ""))[:2000], intent_id=self.intent_id
++            )
++            return f"Recorded hypothesis event {event.event_id}."
++        elif name == "blackboard_dead_end":
++            if not self.evidence_board:
++                return "No shared blackboard available."
++            event = self.evidence_board.add_dead_end(
++                self.solver_label, str(args.get("reason", ""))[:2000], intent_id=self.intent_id
++            )
++            return f"Recorded dead-end event {event.event_id}."
+         if name == "bash":
+             return await do_bash(self.sandbox, args.get("command", ""), args.get("timeout_seconds", 60))
+         elif name == "read_file":
+@@ -537,12 +645,67 @@ class CodexSolver:
+             return "No coordinator connected."
+         return f"Unknown tool: {name}"
+ 
++    def _claim_next_intent(self) -> str:
++        if not self.evidence_board:
++            return ""
++        if self.intent_id:
++            return self.intent_id
++        for intent in self.evidence_board.open_intents():
++            claimed = self.evidence_board.claim(
++                self.solver_label,
++                intent.intent_id,
++                int(getattr(self.settings, "blackboard_default_worker_lease_seconds", 300)),
++            )
++            if claimed:
++                self.intent_id = claimed.intent_id
++                self._intent_goal = claimed.goal
++                self._intent_acceptance = claimed.acceptance
++                self._intent_lease_seconds = int(
++                    getattr(self.settings, "blackboard_default_worker_lease_seconds", 300)
++                )
++                self._intent_heartbeat_task = asyncio.create_task(self._intent_heartbeat())
++                return self.intent_id
++        return ""
++
++    async def _intent_heartbeat(self) -> None:
++        """Keep a claimed intent leased while a long Codex turn is running."""
++        while self.evidence_board and self.intent_id:
++            try:
++                await asyncio.sleep(max(1, min(60, self._intent_lease_seconds // 3)))
++            except asyncio.CancelledError:
++                return
++            if self.intent_id:
++                self.evidence_board.store.heartbeat(
++                    intent_id=self.intent_id,
++                    worker_id=self.solver_label,
++                    lease_seconds=self._intent_lease_seconds,
++                )
++
++    def _complete_current_intent(self, result: str, status: str = "completed") -> None:
++        if self.evidence_board and self.intent_id:
++            self.evidence_board.complete(self.solver_label, self.intent_id, result, status=status)
++            self.intent_id = None
++            self._intent_goal = ""
++            self._intent_acceptance = ""
++            if self._intent_heartbeat_task:
++                self._intent_heartbeat_task.cancel()
++                self._intent_heartbeat_task = None
++
+     async def run_until_done_or_gave_up(self) -> SolverResult:
+         if not self._proc:
+             await self.start()
+         assert self._thread_id
+ 
+         t0 = time.monotonic()
++        intent_id = self._claim_next_intent() if self.evidence_board else ""
++        if self.evidence_board and not intent_id:
++            return self._result(GAVE_UP)
++        task_context = ""
++        if self.evidence_board:
++            board_context = self.evidence_board.summary()
++            task_context = f"\n\nYour assigned shared-blackboard task (intent {intent_id}): {self._intent_goal}\n"
++            task_context += f"Acceptance: {self._intent_acceptance}\n"
++            task_context += f"\nCurrent blackboard:\n{board_context}\n"
+         if self._bump_insights:
+             prompt_text = (
+                 "Your previous attempt did not find the flag. "
+@@ -551,9 +714,16 @@ class CodexSolver:
+             )
+             self._bump_insights = None
+         elif self._step_count == 0:
+-            prompt_text = "Solve this CTF challenge."
++            prompt_text = (
++                "Work only on your assigned intent. Use the blackboard tools to record facts, hypotheses, and dead ends."
++                if self.evidence_board else "Solve this CTF challenge."
++            )
+         else:
+-            prompt_text = "Continue solving. Try a different approach."
++            prompt_text = (
++                "Continue your assigned intent and record the result on the blackboard."
++                if self.evidence_board else "Continue solving."
++            )
++        prompt_text += task_context
+ 
+         max_attempts = 3
+         for attempt in range(1, max_attempts + 1):
+@@ -574,6 +744,7 @@ class CodexSolver:
+ 
+                 if self._token_budget_exhausted:
+                     self._findings = f"Token budget exhausted at {self._total_tokens} tokens."
++                    self._complete_current_intent(self._findings, "blocked")
+                     return self._result(CANCELLED)
+ 
+                 if self._turn_error:
+@@ -581,6 +752,7 @@ class CodexSolver:
+                     # Context overflow is terminal — don't fallback, just error
+                     if "context_length" in err or "context window" in err:
+                         self._findings = f"Turn failed: {self._turn_error}"
++                        self._complete_current_intent(self._findings, "failed")
+                         return self._result(ERROR)
+                     if self._is_transient_turn_error(err):
+                         if attempt < max_attempts:
+@@ -602,11 +774,14 @@ class CodexSolver:
+                             await asyncio.sleep(delay)
+                             continue
+                         self._findings = f"Turn failed: {self._turn_error}"
++                        self._complete_current_intent(self._findings, "failed")
+                         return self._result(ERROR)
+                     if any(k in err for k in ("quota", "rate", "capacity", "usage")):
+                         self._findings = f"Turn failed: {self._turn_error}"
++                        self._complete_current_intent(self._findings, "failed")
+                         return self._result(QUOTA_ERROR)
+                     self._findings = f"Turn failed: {self._turn_error}"
++                    self._complete_current_intent(self._findings, "failed")
+                     return self._result(ERROR)
+ 
+                 if self._structured_output and self._structured_output.get("type") == "flag_found":
+@@ -616,10 +791,13 @@ class CodexSolver:
+                         self._confirmed = True
+ 
+                 if self._confirmed and self._flag:
++                    self._complete_current_intent("flag verified", "completed")
+                     return self._result(FLAG_FOUND)
++                self._complete_current_intent(self._findings or "intent completed", "completed")
+                 return self._result(GAVE_UP)
+ 
+             except asyncio.CancelledError:
++                self._complete_current_intent("worker cancelled", "blocked")
+                 return self._result(CANCELLED)
+             except Exception as e:
+                 error_str = str(e)
+@@ -645,7 +823,9 @@ class CodexSolver:
+                     continue
+                 self._findings = f"Error: {e}"
+                 if "quota" in error_str.lower() or "rate" in error_str.lower():
++                    self._complete_current_intent(self._findings, "failed")
+                     return self._result(QUOTA_ERROR)
++                self._complete_current_intent(self._findings, "failed")
+                 return self._result(ERROR)
+ 
+     def bump(self, insights: str) -> None:
+@@ -663,6 +843,9 @@ class CodexSolver:
+         )
+ 
+     async def stop(self) -> None:
++        if self._intent_heartbeat_task:
++            self._intent_heartbeat_task.cancel()
++            self._intent_heartbeat_task = None
+         self.tracer.event("stop", step_count=self._step_count)
+         self.tracer.close()
+         if self._reader_task:
+diff --git a/backend/agents/coordinator_loop.py b/backend/agents/coordinator_loop.py
+index 42e0ece..c201a28 100755
+--- a/backend/agents/coordinator_loop.py
++++ b/backend/agents/coordinator_loop.py
+@@ -47,8 +47,8 @@ def build_deps(
+         cost_tracker=cost_tracker,
+         settings=settings,
+         model_specs=specs,
+-        solvers_per_swarm=getattr(settings, "solvers_per_swarm", 1),
+-        max_solvers_per_swarm=getattr(settings, "max_solvers_per_swarm", 5),
++        solvers_per_swarm=min(3, max(1, int(getattr(settings, "solvers_per_swarm", 3)))),
++        max_solvers_per_swarm=min(3, max(1, int(getattr(settings, "max_solvers_per_swarm", 3)))),
+         challenges_root=challenges_root,
+         no_submit=no_submit,
+         max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
+diff --git a/backend/agents/swarm.py b/backend/agents/swarm.py
+index 85a163e..6e7fd6d 100755
+--- a/backend/agents/swarm.py
++++ b/backend/agents/swarm.py
+@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
+ 
+ from backend.agents.solver import Solver
+ from backend.cost_tracker import CostTracker
++from backend.evidence import EvidenceBoard
+ from backend.message_bus import ChallengeMessageBus
+ from backend.models import DEFAULT_MODELS, provider_from_spec
+ from backend.prompts import ChallengeMeta
+@@ -85,7 +86,7 @@ class ChallengeSwarm:
+     settings: Settings
+     model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
+     solvers_per_model: int = 1
+-    max_solvers: int = 5
++    max_solvers: int = 3
+     no_submit: bool = False
+     coordinator_inbox: asyncio.Queue | None = None
+ 
+@@ -98,7 +99,31 @@ class ChallengeSwarm:
+     _submit_count: dict[str, int] = field(default_factory=dict)  # per-solver wrong submission count
+     _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
+     _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-solver last submit timestamp
++    _intent_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
++    _next_intent_index: int = field(default=4, init=False)
+     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
++    run_id: str = ""
++    evidence_board: EvidenceBoard | None = field(default=None, init=False, repr=False)
++
++    def __post_init__(self) -> None:
++        """Create one persistent board per challenge run and seed worker intents."""
++        db_path = getattr(self.settings, "evidence_db_path", "logs/evidence.sqlite3")
++        self.evidence_board = EvidenceBoard.open(db_path, self.meta.name, self.run_id or None)
++        self.run_id = self.evidence_board.run_id
++        self.evidence_board.start("swarm")
++        # Three focused bootstrap tasks give the initial Codex workers distinct work.
++        goals = (
++            "Recon the challenge files, target, and exposed services",
++            "Analyze the challenge implementation or artifacts for the primary weakness",
++            "Try an independent exploitation or decoding path and verify results",
++        )
++        for idx, goal in enumerate(goals, 1):
++            self.evidence_board.propose(
++                "coordinator",
++                goal,
++                acceptance="Write verified facts or a dead end, then complete the intent",
++                intent_id=f"bootstrap:{self.meta.name}:{self.run_id}:{idx}",
++            )
+ 
+     def _solver_slots(self) -> list[SolverSlot]:
+         max_solvers = min(self.max_solvers, getattr(self.settings, "max_solvers_per_swarm", self.max_solvers))
+@@ -152,6 +177,7 @@ class ChallengeSwarm:
+                 message_bus=self.message_bus,
+                 notify_coordinator=_notify,
+                 solver_label=solver_label,
++                evidence_board=self.evidence_board,
+             )
+ 
+         return self._create_pydantic_solver(model_spec, solver_label=solver_label)
+@@ -200,6 +226,24 @@ class ChallengeSwarm:
+                 parts.append(f"[{label}]: {finding}")
+         return "\n\n".join(parts) if parts else "No sibling insights available yet."
+ 
++    async def _ensure_followup_intent(self, source: str) -> None:
++        """Keep a small amount of work available after bootstrap intents finish."""
++        if not self.evidence_board or self.cancel_event.is_set():
++            return
++        async with self._intent_lock:
++            if self.evidence_board.open_intents():
++                return
++            if self._next_intent_index > 12:
++                return
++            idx = self._next_intent_index
++            self._next_intent_index += 1
++            self.evidence_board.propose(
++                "coordinator",
++                f"Continue investigation using the latest blackboard evidence (round {idx})",
++                acceptance="Record evidence or a dead end, then complete the intent",
++                intent_id=f"followup:{self.meta.name}:{self.run_id}:{idx}",
++            )
++
+     # Escalating cooldowns after incorrect submissions (per solver)
+     SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]  # 0s, 30s, 2min, 5min, 10min
+ 
+@@ -235,8 +279,21 @@ class ChallengeSwarm:
+ 
+             from backend.tools.core import do_submit_flag
+             display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
++            if self.evidence_board:
++                self.evidence_board.record(
++                    solver_label, "worker", "submission_result",
++                    {"flag": normalized, "display": display, "confirmed": is_confirmed},
++                    verified=is_confirmed,
++                    provenance={"source_kind": "submission", "source_excerpt": display[:500]},
++                    dedupe_key=f"submission:{self.meta.name}:{self.run_id}:{solver_label}:{normalized}",
++                )
+             if is_confirmed:
+                 self.confirmed_flag = normalized
++                if self.evidence_board:
++                    self.evidence_board.verify_flag(
++                        solver_label, normalized,
++                        provenance={"source_kind": "submission", "source_excerpt": display[:500]},
++                    )
+             else:
+                 self._submit_count[solver_label] = wrong_count + 1
+                 self._last_submit_time[solver_label] = time.monotonic()
+@@ -282,6 +339,13 @@ class ChallengeSwarm:
+                 self.findings[solver_label] = result.findings_summary
+                 await self.message_bus.post(solver_label, result.findings_summary[:500])
+ 
++            if self.evidence_board and result.findings_summary and result.status not in (ERROR, QUOTA_ERROR):
++                self.evidence_board.add_hypothesis(
++                    solver_label,
++                    result.findings_summary[:1000],
++                    intent_id=getattr(solver, "intent_id", None),
++                )
++
+             if result.status == FLAG_FOUND:
+                 self.cancel_event.set()
+                 self.winner = result
+@@ -293,6 +357,8 @@ class ChallengeSwarm:
+             if result.status == CANCELLED:
+                 break
+ 
++            await self._ensure_followup_intent(solver_label)
++
+             # Quota exhaustion: fall back to API-backed Pydantic AI solver
+             if result.status == QUOTA_ERROR:
+                 fallback_spec = _quota_fallback_spec(model_spec)
+@@ -375,17 +441,23 @@ class ChallengeSwarm:
+                         for p in pending:
+                             p.cancel()
+                         await asyncio.gather(*pending, return_exceptions=True)
++                        if self.evidence_board:
++                            self.evidence_board.finish("swarm", "flag_verified")
+                         return result
+ 
+                 tasks = list(pending)
+ 
+             self.cancel_event.set()
++            if self.evidence_board:
++                self.evidence_board.finish("swarm", "workers_exhausted")
+             return self.winner
+         except asyncio.CancelledError:
+             self.cancel_event.set()
+             for task in tasks:
+                 task.cancel()
+             await asyncio.gather(*tasks, return_exceptions=True)
++            if self.evidence_board:
++                self.evidence_board.finish("swarm", "cancelled")
+             raise
+         except Exception as e:
+             logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
+@@ -393,6 +465,8 @@ class ChallengeSwarm:
+             for t in tasks:
+                 t.cancel()
+             await asyncio.gather(*tasks, return_exceptions=True)
++            if self.evidence_board:
++                self.evidence_board.finish("swarm", "swarm_error")
+             return None
+ 
+     def kill(self) -> None:
+@@ -401,7 +475,7 @@ class ChallengeSwarm:
+ 
+     def get_status(self) -> dict:
+         """Get per-agent progress and findings."""
+-        return {
++        status = {
+             "challenge": self.meta.name,
+             "cancelled": self.cancel_event.is_set(),
+             "winner": self.winner.flag if self.winner else None,
+@@ -415,3 +489,15 @@ class ChallengeSwarm:
+                 for slot in self._solver_slots()
+             },
+         }
++        if self.evidence_board:
++            snapshot = self.evidence_board.snapshot()
++            status["blackboard"] = {
++                "run_id": self.run_id,
++                "last_seq": snapshot.last_seq,
++                "active_intents": [i.intent_id for i in snapshot.intents if i.status in ("open", "claimed")],
++                "verified_facts": sum(1 for e in snapshot.facts if e.verified),
++                "hypotheses": len(snapshot.hypotheses),
++                "dead_ends": len(snapshot.dead_ends),
++                "flag": snapshot.flag,
++            }
++        return status
+diff --git a/backend/benchmarks/cli.py b/backend/benchmarks/cli.py
+index e117f83..d5ce867 100644
+--- a/backend/benchmarks/cli.py
++++ b/backend/benchmarks/cli.py
+@@ -26,7 +26,7 @@ console = Console()
+ @click.option("--timeout", default=1_800, type=click.IntRange(min=1), show_default=True)
+ @click.option("--max-tokens", default=1_000_000, type=click.IntRange(min=1), show_default=True)
+ @click.option("--concurrency", default=1, type=click.IntRange(min=1), show_default=True, help="Challenges to run at once")
+-@click.option("--solvers-per-swarm", default=1, type=click.IntRange(min=1, max=5), show_default=True, help="Single-model solver replicas per challenge")
++@click.option("--solvers-per-swarm", default=3, type=click.IntRange(min=1, max=3), show_default=True, help="Codex workers per challenge (max 3)")
+ @click.option("--allow-internet", is_flag=True, help="Allow solver internet access")
+ @click.option("--image", default="ctf-sandbox", show_default=True)
+ @click.option("--results", default="benchmark-results.json", type=click.Path(path_type=Path))
+diff --git a/backend/benchmarks/models.py b/backend/benchmarks/models.py
+index a8bfd34..4655d28 100644
+--- a/backend/benchmarks/models.py
++++ b/backend/benchmarks/models.py
+@@ -15,8 +15,8 @@ class BenchmarkLimits:
+     allow_internet: bool = False
+     attempts: int = 1
+     concurrency: int = 1
+-    solvers_per_swarm: int = 1
+-    max_solvers_per_swarm: int = 5
++    solvers_per_swarm: int = 3
++    max_solvers_per_swarm: int = 3
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/backend/cli.py b/backend/cli.py
+index fd14411..9574ff7 100755
+--- a/backend/cli.py
++++ b/backend/cli.py
+@@ -39,7 +39,7 @@ def _setup_logging(verbose: bool = False) -> None:
+ @click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.4-mini)")
+ @click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
+ @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
+-@click.option("--solvers-per-swarm", default=1, type=click.IntRange(min=1, max=5), help="Single-model solver replicas per challenge")
++@click.option("--solvers-per-swarm", default=3, type=click.IntRange(min=1, max=3), help="Codex workers per challenge (max 3)")
+ @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
+ @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
+ def main(
+diff --git a/backend/config.py b/backend/config.py
+index 5b0e970..e28602b 100755
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -33,7 +33,9 @@ class Settings(BaseSettings):
+     allow_internet: bool = True
+     max_tokens_per_challenge: int = 1_000_000
+     challenge_timeout_seconds: int = 1_800
+-    solvers_per_swarm: int = 1
+-    max_solvers_per_swarm: int = 5
++    solvers_per_swarm: int = 3
++    max_solvers_per_swarm: int = 3
++    evidence_db_path: str = "logs/evidence.sqlite3"
++    blackboard_default_worker_lease_seconds: int = 300
+ 
+     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+diff --git a/backend/deps.py b/backend/deps.py
+index cc77eb1..960f5e6 100755
+--- a/backend/deps.py
++++ b/backend/deps.py
+@@ -35,6 +35,8 @@ class SolverDeps:
+     no_submit: bool = False
+     allow_internet: bool = True
+     notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
++    evidence_board: Any | None = None
++    intent_id: str | None = None
+ 
+ 
+ @dataclass
+diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
+index ad899ec..beaab68 100644
+--- a/tests/test_benchmark_policy.py
++++ b/tests/test_benchmark_policy.py
+@@ -14,19 +14,17 @@ def test_default_benchmark_limits_are_fixed_and_offline() -> None:
+     assert limits.allow_internet is False
+     assert limits.attempts == 1
+     assert limits.concurrency == 1
+-    assert limits.solvers_per_swarm == 1
+-    assert limits.max_solvers_per_swarm == 5
++    assert limits.solvers_per_swarm == 3
++    assert limits.max_solvers_per_swarm == 3
+ 
+ 
+-def test_single_model_solver_replicas_get_unique_labels_and_cap_at_five() -> None:
+-    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=5)
+-    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 5
++def test_single_model_solver_replicas_get_unique_labels_and_cap_at_three() -> None:
++    slots = build_solver_slots(["codex/gpt-5.5"], solvers_per_model=7, max_solvers=3)
++    assert [slot.model_spec for slot in slots] == ["codex/gpt-5.5"] * 3
+     assert [slot.label for slot in slots] == [
+         "codex/gpt-5.5#1",
+         "codex/gpt-5.5#2",
+         "codex/gpt-5.5#3",
+-        "codex/gpt-5.5#4",
+-        "codex/gpt-5.5#5",
+     ]
+ 
+ 
+diff --git a/backend/evidence/__init__.py b/backend/evidence/__init__.py
+new file mode 100644
+index 0000000..cab576e
+--- /dev/null
++++ b/backend/evidence/__init__.py
+@@ -0,0 +1,7 @@
++"""Minimal persistent evidence blackboard for the CTF solver swarm."""
++
++from backend.evidence.board import EvidenceBoard
++from backend.evidence.models import BoardSnapshot, EvidenceEvent, Intent
++from backend.evidence.store import SQLiteEvidenceStore
++
++__all__ = ["BoardSnapshot", "EvidenceBoard", "EvidenceEvent", "Intent", "SQLiteEvidenceStore"]
+diff --git a/backend/evidence/board.py b/backend/evidence/board.py
+new file mode 100644
+index 0000000..6a9912c
+--- /dev/null
++++ b/backend/evidence/board.py
+@@ -0,0 +1,134 @@
++"""High-level blackboard operations used by coordinator and Codex workers."""
++
++from __future__ import annotations
++
++import uuid
++from pathlib import Path
++from typing import Any
++
++from backend.evidence.models import BoardSnapshot, EvidenceEvent, Intent
++from backend.evidence.store import SQLiteEvidenceStore
++
++
++class EvidenceBoard:
++    def __init__(self, store: SQLiteEvidenceStore, challenge_name: str, run_id: str) -> None:
++        self.store = store
++        self.challenge_name = challenge_name
++        self.run_id = run_id
++
++    @classmethod
++    def open(cls, path: str | Path, challenge_name: str, run_id: str | None = None) -> EvidenceBoard:
++        store = SQLiteEvidenceStore(path)
++        resolved_run_id = run_id or store.latest_run_id(challenge_name) or uuid.uuid4().hex
++        return cls(store, challenge_name, resolved_run_id)
++
++    def close(self) -> None:
++        self.store.close()
++
++    def record(self, actor_id: str, actor_type: str, kind: str, payload: dict[str, Any] | None = None, *, provenance: dict[str, Any] | None = None, artifact_id: str | None = None, verified: bool = False, dedupe_key: str | None = None, links: list[tuple[str, str]] | None = None) -> EvidenceEvent:
++        return self.store.append_event(
++            challenge_name=self.challenge_name,
++            run_id=self.run_id,
++            actor_id=actor_id,
++            actor_type=actor_type,
++            kind=kind,
++            payload=payload,
++            provenance=provenance,
++            artifact_id=artifact_id,
++            verified=verified,
++            dedupe_key=dedupe_key,
++            links=links,
++        )
++
++    def start(self, actor_id: str = "swarm") -> EvidenceEvent:
++        return self.record(actor_id, "swarm", "challenge_started", dedupe_key=f"start:{self.challenge_name}:{self.run_id}")
++
++    def finish(self, actor_id: str = "swarm", reason: str = "") -> EvidenceEvent:
++        return self.record(actor_id, "swarm", "challenge_finished", {"reason": reason}, dedupe_key=f"finish:{self.challenge_name}:{self.run_id}")
++
++    def propose(self, actor_id: str, goal: str, acceptance: str = "", intent_id: str | None = None, from_event_ids: list[str] | None = None) -> Intent:
++        return self.store.propose_intent(
++            challenge_name=self.challenge_name,
++            run_id=self.run_id,
++            actor_id=actor_id,
++            intent_id=intent_id or f"intent:{uuid.uuid4().hex[:12]}",
++            goal=goal,
++            acceptance=acceptance,
++            from_event_ids=from_event_ids,
++        )
++
++    def claim(self, worker_id: str, intent_id: str, lease_seconds: int = 300) -> Intent | None:
++        return self.store.claim_intent(
++            challenge_name=self.challenge_name,
++            run_id=self.run_id,
++            worker_id=worker_id,
++            intent_id=intent_id,
++            lease_seconds=lease_seconds,
++        )
++
++    def open_intents(self) -> list[Intent]:
++        return self.store.list_intents(self.challenge_name, self.run_id)
++
++    # Explicit names used by coordinator/worker integrations.
++    def list_open_intents(self) -> list[Intent]:
++        return self.open_intents()
++
++    def read_board_summary(self, max_items: int = 16) -> str:
++        return self.summary(max_items=max_items)
++
++    def complete(self, worker_id: str, intent_id: str, result: str, status: str = "completed", produced_event_ids: list[str] | None = None) -> Intent | None:
++        return self.store.complete_intent(
++            challenge_name=self.challenge_name,
++            run_id=self.run_id,
++            worker_id=worker_id,
++            intent_id=intent_id,
++            result=result,
++            status=status,
++            produced_event_ids=produced_event_ids,
++        )
++
++    def add_fact(self, actor_id: str, fact: str, *, verified: bool, provenance: dict[str, Any], intent_id: str | None = None, artifact_id: str | None = None) -> EvidenceEvent:
++        return self.record(actor_id, "worker", "fact_added", {"fact": fact, "intent_id": intent_id or ""}, provenance=provenance, artifact_id=artifact_id, verified=verified, dedupe_key=f"fact:{self.challenge_name}:{self.run_id}:{actor_id}:{fact.strip().lower()}")
++
++    def add_hypothesis(self, actor_id: str, text: str, *, intent_id: str | None = None) -> EvidenceEvent:
++        return self.record(actor_id, "worker", "hypothesis_added", {"hypothesis": text, "intent_id": intent_id or ""}, verified=False, dedupe_key=f"hyp:{self.challenge_name}:{self.run_id}:{actor_id}:{text.strip().lower()}")
++
++    def add_dead_end(self, actor_id: str, reason: str, *, intent_id: str | None = None) -> EvidenceEvent:
++        return self.record(actor_id, "worker", "dead_end_added", {"reason": reason, "intent_id": intent_id or ""}, dedupe_key=f"dead:{self.challenge_name}:{self.run_id}:{reason.strip().lower()}")
++
++    def verify_flag(self, actor_id: str, flag: str, *, provenance: dict[str, Any], intent_id: str | None = None) -> EvidenceEvent:
++        return self.record(actor_id, "worker", "flag_verified", {"flag": flag.strip(), "intent_id": intent_id or ""}, provenance=provenance, verified=True, dedupe_key=f"flag:{self.challenge_name}:{self.run_id}:{flag.strip()}")
++
++    def summary(self, max_items: int = 16) -> str:
++        events = self.store.events(self.challenge_name, self.run_id)
++        facts = [e for e in events if e.kind == "fact_added" and e.verified][-max_items:]
++        hypotheses = [e for e in events if e.kind == "hypothesis_added"][-max_items:]
++        dead_ends = [e for e in events if e.kind == "dead_end_added"][-max_items:]
++        intents = self.open_intents()
++        lines = [f"## Blackboard: {self.challenge_name}"]
++        if facts:
++            lines.append("\n### Verified facts")
++            lines.extend(f"- [{e.seq}] {e.payload.get('fact', '')}" for e in facts)
++        if hypotheses:
++            lines.append("\n### Hypotheses (unverified)")
++            lines.extend(f"- [{e.seq}] {e.payload.get('hypothesis', '')}" for e in hypotheses)
++        if dead_ends:
++            lines.append("\n### Dead ends")
++            lines.extend(f"- {e.payload.get('reason', '')}" for e in dead_ends)
++        lines.append("\n### Active intents")
++        lines.extend(f"- {i.intent_id}: {i.goal} ({i.status})" for i in intents)
++        return "\n".join(lines)
++
++    def snapshot(self) -> BoardSnapshot:
++        events = self.store.events(self.challenge_name, self.run_id)
++        flags = [e.payload.get("flag") for e in events if e.kind == "flag_verified" and e.payload.get("flag")]
++        return BoardSnapshot(
++            challenge_name=self.challenge_name,
++            run_id=self.run_id,
++            facts=[e for e in events if e.kind == "fact_added"],
++            hypotheses=[e for e in events if e.kind == "hypothesis_added"],
++            dead_ends=[e for e in events if e.kind == "dead_end_added"],
++            intents=self.store.list_intents(self.challenge_name, self.run_id, active_only=False),
++            flag=flags[0] if flags else None,
++            last_seq=events[-1].seq if events else 0,
++        )
+diff --git a/backend/evidence/models.py b/backend/evidence/models.py
+new file mode 100644
+index 0000000..988aa76
+--- /dev/null
++++ b/backend/evidence/models.py
+@@ -0,0 +1,52 @@
++"""Typed data objects for the Stage 1 evidence blackboard."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any
++
++
++@dataclass(frozen=True)
++class EvidenceEvent:
++    event_id: str
++    seq: int
++    ts: float
++    challenge_name: str
++    run_id: str
++    actor_id: str
++    actor_type: str
++    kind: str
++    payload: dict[str, Any] = field(default_factory=dict)
++    provenance: dict[str, Any] = field(default_factory=dict)
++    artifact_id: str | None = None
++    verified: bool = False
++    dedupe_key: str | None = None
++    schema_version: int = 1
++
++
++@dataclass(frozen=True)
++class Intent:
++    intent_id: str
++    challenge_name: str
++    run_id: str
++    goal: str
++    acceptance: str = ""
++    status: str = "open"
++    worker_id: str | None = None
++    lease_until: float | None = None
++    attempt: int = 0
++    created_event_id: str | None = None
++    result_event_id: str | None = None
++    result: str = ""
++
++
++@dataclass(frozen=True)
++class BoardSnapshot:
++    challenge_name: str
++    run_id: str
++    facts: list[EvidenceEvent] = field(default_factory=list)
++    hypotheses: list[EvidenceEvent] = field(default_factory=list)
++    dead_ends: list[EvidenceEvent] = field(default_factory=list)
++    intents: list[Intent] = field(default_factory=list)
++    flag: str | None = None
++    last_seq: int = 0
+diff --git a/backend/evidence/store.py b/backend/evidence/store.py
+new file mode 100644
+index 0000000..2e9a2fe
+--- /dev/null
++++ b/backend/evidence/store.py
+@@ -0,0 +1,461 @@
++"""SQLite event store with Muteki-style append/replay and atomic intent claims."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Any
++
++from backend.evidence.models import EvidenceEvent, Intent
++
++SCHEMA_VERSION = 1
++
++
++class SQLiteEvidenceStore:
++    """One process-safe connection over a shared SQLite evidence database."""
++
++    def __init__(self, path: str | Path) -> None:
++        self.path = str(path)
++        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
++        self._lock = threading.RLock()
++        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=5.0)
++        self._conn.row_factory = sqlite3.Row
++        self._conn.executescript(
++            """
++            PRAGMA journal_mode=WAL;
++            PRAGMA synchronous=NORMAL;
++            PRAGMA foreign_keys=ON;
++            PRAGMA busy_timeout=5000;
++            CREATE TABLE IF NOT EXISTS schema_meta (
++                key TEXT PRIMARY KEY,
++                value TEXT NOT NULL
++            );
++            INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', '1');
++            CREATE TABLE IF NOT EXISTS events (
++                event_id TEXT UNIQUE NOT NULL,
++                seq INTEGER PRIMARY KEY AUTOINCREMENT,
++                ts REAL NOT NULL,
++                challenge_name TEXT NOT NULL,
++                run_id TEXT NOT NULL,
++                actor_id TEXT NOT NULL,
++                actor_type TEXT NOT NULL,
++                kind TEXT NOT NULL,
++                schema_version INTEGER NOT NULL DEFAULT 1,
++                payload TEXT NOT NULL,
++                provenance TEXT NOT NULL,
++                artifact_id TEXT,
++                verified INTEGER NOT NULL DEFAULT 0,
++                dedupe_key TEXT UNIQUE
++            );
++            CREATE INDEX IF NOT EXISTS idx_events_challenge_seq
++                ON events(challenge_name, run_id, seq);
++            CREATE INDEX IF NOT EXISTS idx_events_kind
++                ON events(challenge_name, run_id, kind, seq);
++            CREATE TABLE IF NOT EXISTS intents (
++                intent_id TEXT PRIMARY KEY,
++                challenge_name TEXT NOT NULL,
++                run_id TEXT NOT NULL,
++                goal TEXT NOT NULL,
++                acceptance TEXT NOT NULL DEFAULT '',
++                status TEXT NOT NULL DEFAULT 'open',
++                worker_id TEXT,
++                lease_until REAL,
++                attempt INTEGER NOT NULL DEFAULT 0,
++                created_event_id TEXT NOT NULL,
++                result_event_id TEXT,
++                result TEXT NOT NULL DEFAULT ''
++            );
++            CREATE INDEX IF NOT EXISTS idx_intents_claimable
++                ON intents(challenge_name, run_id, status, lease_until, attempt);
++            CREATE TABLE IF NOT EXISTS event_links (
++                source_event_id TEXT NOT NULL,
++                target_event_id TEXT NOT NULL,
++                relation TEXT NOT NULL,
++                PRIMARY KEY(source_event_id, target_event_id, relation)
++            );
++            """
++        )
++        # CREATE TABLE IF NOT EXISTS does not add columns to databases created
++        # by an earlier Stage 1 revision. Keep this migration deliberately small
++        # and idempotent so a running installation can be upgraded in place.
++        event_columns = {
++            row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
++        }
++        if "schema_version" not in event_columns:
++            self._conn.execute(
++                "ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"
++            )
++        self._conn.commit()
++
++    def close(self) -> None:
++        with self._lock:
++            self._conn.close()
++
++    def latest_run_id(self, challenge_name: str) -> str | None:
++        """Return the most recently active run for restart recovery."""
++        with self._lock:
++            row = self._conn.execute(
++                """
++                SELECT run_id
++                FROM events
++                WHERE challenge_name=?
++                GROUP BY run_id
++                HAVING SUM(CASE WHEN kind='challenge_started' THEN 1 ELSE 0 END)
++                     > SUM(CASE WHEN kind='challenge_finished' THEN 1 ELSE 0 END)
++                ORDER BY MAX(seq) DESC
++                LIMIT 1
++                """,
++                (challenge_name,),
++            ).fetchone()
++        return str(row[0]) if row else None
++
++    @staticmethod
++    def _json(value: Any) -> str:
++        return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, default=str)
++
++    @staticmethod
++    def _fingerprint(
++        challenge_name: str,
++        run_id: str,
++        actor_id: str,
++        kind: str,
++        payload: dict[str, Any],
++    ) -> str:
++        raw = json.dumps(
++            [challenge_name, run_id, actor_id, kind, payload],
++            ensure_ascii=False,
++            sort_keys=True,
++            default=str,
++        ).encode()
++        return "auto:" + hashlib.sha256(raw).hexdigest()
++
++    def _append_event_locked(
++        self,
++        *,
++        challenge_name: str,
++        run_id: str,
++        actor_id: str,
++        actor_type: str,
++        kind: str,
++        payload: dict[str, Any] | None = None,
++        provenance: dict[str, Any] | None = None,
++        artifact_id: str | None = None,
++        verified: bool = False,
++        dedupe_key: str | None = None,
++        links: list[tuple[str, str]] | None = None,
++    ) -> EvidenceEvent:
++        """Insert or retrieve an event while the caller owns the DB lock/transaction."""
++        payload = dict(payload or {})
++        provenance = dict(provenance or {})
++        dedupe_key = dedupe_key or self._fingerprint(
++            challenge_name, run_id, actor_id, kind, payload
++        )
++        event_id = str(uuid.uuid4())
++        self._conn.execute(
++            """INSERT OR IGNORE INTO events
++            (event_id, ts, challenge_name, run_id, actor_id, actor_type,
++             kind, schema_version, payload, provenance, artifact_id, verified, dedupe_key)
++            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
++            (
++                event_id,
++                time.time(),
++                challenge_name,
++                run_id,
++                actor_id,
++                actor_type,
++                kind,
++                SCHEMA_VERSION,
++                self._json(payload),
++                self._json(provenance),
++                artifact_id,
++                int(verified),
++                dedupe_key,
++            ),
++        )
++        row = self._conn.execute(
++            "SELECT * FROM events WHERE dedupe_key = ?", (dedupe_key,)
++        ).fetchone()
++        if row is None:
++            raise RuntimeError("event insert was ignored without an existing dedupe record")
++        if row["event_id"] == event_id:
++            for target_id, relation in links or []:
++                self._conn.execute(
++                    "INSERT OR IGNORE INTO event_links(source_event_id, target_event_id, relation) VALUES (?, ?, ?)",
++                    (event_id, target_id, relation),
++                )
++        return self._event(row)
++
++    def append_event(
++        self,
++        *,
++        challenge_name: str,
++        run_id: str,
++        actor_id: str,
++        actor_type: str,
++        kind: str,
++        payload: dict[str, Any] | None = None,
++        provenance: dict[str, Any] | None = None,
++        artifact_id: str | None = None,
++        verified: bool = False,
++        dedupe_key: str | None = None,
++        links: list[tuple[str, str]] | None = None,
++    ) -> EvidenceEvent:
++        with self._lock:
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                event = self._append_event_locked(
++                    challenge_name=challenge_name,
++                    run_id=run_id,
++                    actor_id=actor_id,
++                    actor_type=actor_type,
++                    kind=kind,
++                    payload=payload,
++                    provenance=provenance,
++                    artifact_id=artifact_id,
++                    verified=verified,
++                    dedupe_key=dedupe_key,
++                    links=links,
++                )
++                self._conn.commit()
++            except Exception:
++                self._conn.rollback()
++                raise
++        return event
++
++    def _event(self, row: sqlite3.Row) -> EvidenceEvent:
++        return EvidenceEvent(
++            event_id=row["event_id"],
++            seq=int(row["seq"]),
++            ts=float(row["ts"]),
++            challenge_name=row["challenge_name"],
++            run_id=row["run_id"],
++            actor_id=row["actor_id"],
++            actor_type=row["actor_type"],
++            kind=row["kind"],
++            schema_version=int(row["schema_version"]),
++            payload=json.loads(row["payload"]),
++            provenance=json.loads(row["provenance"]),
++            artifact_id=row["artifact_id"],
++            verified=bool(row["verified"]),
++            dedupe_key=row["dedupe_key"],
++        )
++
++    def events(
++        self,
++        challenge_name: str,
++        run_id: str,
++        *,
++        kinds: list[str] | None = None,
++        after_seq: int = 0,
++    ) -> list[EvidenceEvent]:
++        with self._lock:
++            params: list[Any] = [challenge_name, run_id, int(after_seq)]
++            where = "challenge_name = ? AND run_id = ? AND seq > ?"
++            if kinds:
++                where += " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
++                params.extend(kinds)
++            rows = self._conn.execute(
++                f"SELECT * FROM events WHERE {where} ORDER BY seq", tuple(params)
++            ).fetchall()
++        return [self._event(row) for row in rows]
++
++    def propose_intent(
++        self,
++        *,
++        challenge_name: str,
++        run_id: str,
++        actor_id: str,
++        intent_id: str,
++        goal: str,
++        acceptance: str = "",
++        from_event_ids: list[str] | None = None,
++    ) -> Intent:
++        with self._lock:
++            existing = self._conn.execute(
++                "SELECT * FROM intents WHERE intent_id=? AND challenge_name=? AND run_id=?",
++                (intent_id, challenge_name, run_id),
++            ).fetchone()
++            if existing:
++                return self._intent(existing)
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                event = self._append_event_locked(
++                    challenge_name=challenge_name,
++                    run_id=run_id,
++                    actor_id=actor_id,
++                    actor_type="coordinator",
++                    kind="intent_proposed",
++                    payload={"intent_id": intent_id, "goal": goal, "acceptance": acceptance},
++                    links=[(eid, "supports") for eid in from_event_ids or []],
++                    dedupe_key=f"intent:{challenge_name}:{run_id}:{intent_id}",
++                )
++                self._conn.execute(
++                    """INSERT OR IGNORE INTO intents
++                    (intent_id, challenge_name, run_id, goal, acceptance, created_event_id)
++                    VALUES (?, ?, ?, ?, ?, ?)""",
++                    (intent_id, challenge_name, run_id, goal, acceptance, event.event_id),
++                )
++                self._conn.commit()
++            except Exception:
++                self._conn.rollback()
++                raise
++            row = self._conn.execute(
++                "SELECT * FROM intents WHERE intent_id=? AND challenge_name=? AND run_id=?",
++                (intent_id, challenge_name, run_id),
++            ).fetchone()
++        assert row is not None
++        return self._intent(row)
++
++    def _intent(self, row: sqlite3.Row) -> Intent:
++        return Intent(
++            intent_id=row["intent_id"],
++            challenge_name=row["challenge_name"],
++            run_id=row["run_id"],
++            goal=row["goal"],
++            acceptance=row["acceptance"],
++            status=row["status"],
++            worker_id=row["worker_id"],
++            lease_until=row["lease_until"],
++            attempt=int(row["attempt"]),
++            created_event_id=row["created_event_id"],
++            result_event_id=row["result_event_id"],
++            result=row["result"],
++        )
++
++    def list_intents(self, challenge_name: str, run_id: str, *, active_only: bool = True) -> list[Intent]:
++        now = time.time()
++        with self._lock:
++            if active_only:
++                rows = self._conn.execute(
++                    """SELECT * FROM intents WHERE challenge_name=? AND run_id=?
++                    AND (status='open' OR (status='claimed' AND lease_until < ?))
++                    ORDER BY attempt, intent_id""",
++                    (challenge_name, run_id, now),
++                ).fetchall()
++            else:
++                rows = self._conn.execute(
++                    "SELECT * FROM intents WHERE challenge_name=? AND run_id=? ORDER BY intent_id",
++                    (challenge_name, run_id),
++                ).fetchall()
++        return [self._intent(row) for row in rows]
++
++    def claim_intent(self, *, challenge_name: str, run_id: str, worker_id: str, intent_id: str, lease_seconds: int = 300) -> Intent | None:
++        now = time.time()
++        lease_until = now + max(1, int(lease_seconds))
++        with self._lock:
++            current = self._conn.execute(
++                """SELECT * FROM intents
++                WHERE intent_id=? AND challenge_name=? AND run_id=?""",
++                (intent_id, challenge_name, run_id),
++            ).fetchone()
++            if (
++                current is not None
++                and current["status"] == "claimed"
++                and current["worker_id"] == worker_id
++                and (current["lease_until"] or 0) >= now
++            ):
++                return self._intent(current)
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                cur = self._conn.execute(
++                    """UPDATE intents SET status='claimed', worker_id=?, lease_until=?, attempt=attempt+1
++                    WHERE intent_id=? AND challenge_name=? AND run_id=?
++                    AND (status='open' OR (status='claimed' AND lease_until < ?))""",
++                    (worker_id, lease_until, intent_id, challenge_name, run_id, now),
++                )
++                if cur.rowcount != 1:
++                    self._conn.rollback()
++                    return None
++                self._append_event_locked(
++                    challenge_name=challenge_name,
++                    run_id=run_id,
++                    actor_id=worker_id,
++                    actor_type="worker",
++                    kind="intent_claimed",
++                    payload={"intent_id": intent_id, "lease_until": lease_until},
++                    dedupe_key=f"claim:{intent_id}:{worker_id}:{int(lease_until)}",
++                )
++                self._conn.commit()
++            except Exception:
++                self._conn.rollback()
++                raise
++            row = self._conn.execute(
++                "SELECT * FROM intents WHERE intent_id=? AND challenge_name=? AND run_id=?",
++                (intent_id, challenge_name, run_id),
++            ).fetchone()
++        if not row:
++            return None
++        return self._intent(row)
++
++    def heartbeat(self, *, intent_id: str, worker_id: str, lease_seconds: int = 300) -> bool:
++        with self._lock:
++            cur = self._conn.execute(
++                "UPDATE intents SET lease_until=? WHERE intent_id=? AND status='claimed' AND worker_id=?",
++                (time.time() + max(1, int(lease_seconds)), intent_id, worker_id),
++            )
++            self._conn.commit()
++            return cur.rowcount == 1
++
++    def complete_intent(
++        self,
++        *,
++        challenge_name: str,
++        run_id: str,
++        worker_id: str,
++        intent_id: str,
++        result: str,
++        status: str = "completed",
++        produced_event_ids: list[str] | None = None,
++    ) -> Intent | None:
++        if status not in {"completed", "failed", "blocked"}:
++            raise ValueError(f"invalid intent terminal status: {status}")
++        with self._lock:
++            existing = self._conn.execute(
++                """SELECT * FROM intents
++                WHERE intent_id=? AND challenge_name=? AND run_id=?""",
++                (intent_id, challenge_name, run_id),
++            ).fetchone()
++            if existing is not None and existing["status"] in {"completed", "failed", "blocked"}:
++                if existing["status"] == status and existing["result"] == result[:2000]:
++                    return self._intent(existing)
++                return None
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                current = self._conn.execute(
++                    """SELECT * FROM intents
++                    WHERE intent_id=? AND challenge_name=? AND run_id=?
++                      AND status='claimed' AND worker_id=?""",
++                    (intent_id, challenge_name, run_id, worker_id),
++                ).fetchone()
++                if current is None:
++                    self._conn.rollback()
++                    return None
++                event = self._append_event_locked(
++                    challenge_name=challenge_name,
++                    run_id=run_id,
++                    actor_id=worker_id,
++                    actor_type="worker",
++                    kind="intent_completed",
++                    payload={"intent_id": intent_id, "result": result, "status": status},
++                    links=[(eid, "produces") for eid in produced_event_ids or []],
++                    dedupe_key=f"complete:{intent_id}:{worker_id}:{status}:{result[:200]}",
++                )
++                self._conn.execute(
++                    """UPDATE intents SET status=?, result=?, result_event_id=?, worker_id=NULL, lease_until=NULL
++                    WHERE intent_id=? AND challenge_name=? AND run_id=? AND worker_id=?""",
++                    (status, result[:2000], event.event_id, intent_id, challenge_name, run_id, worker_id),
++                )
++                self._conn.commit()
++            except Exception:
++                self._conn.rollback()
++                raise
++            row = self._conn.execute(
++                "SELECT * FROM intents WHERE intent_id=? AND challenge_name=? AND run_id=?",
++                (intent_id, challenge_name, run_id),
++            ).fetchone()
++        return self._intent(row) if row else None
+diff --git a/docs/rag_plan.md b/docs/rag_plan.md
+new file mode 100644
+index 0000000..861dc67
+--- /dev/null
++++ b/docs/rag_plan.md
+@@ -0,0 +1,325 @@
++# RAG 计划
++
++## 目标
++
++在不改变主链路的前提下，把 RAG 作为一个可插拔模块接入当前 CTF Agent，并先完成一个低成本、可复现、可评估的最小版本。
++
++默认 solver 模型：`codex/gpt-5.6-luna`
++
++## 总体原则
++
++- 不重写主 solver 调度
++- 先做结构化证据，再做检索
++- 先做 lexical MVP，再考虑向量检索
++- RAG 按需调用，不默认塞进系统提示词
++- 每一步都要能独立评估和回滚
++- 评估时同时看 solve rate、token、耗时、步数、失败类型和错误引用率，不只看单一指标
++
++## 术语说明
++
++### Evidence Graph
++
++Evidence Graph 不是直接为 RAG 检索服务的，它的作用是把题目推进过程结构化保存下来，方便：
++
++- 推理过程回放
++- 事实、猜测、死路的区分
++- trace / tool result 的追溯
++- 后续分析模型到底用了哪些证据
++
++它更像是解题记忆和审计层，不是知识库本身。
++
++### Corpus
++
++corpus 就是语料库 / 数据集。
++
++这里至少分两类：
++
++- benchmark corpus：只用于评估，不参与检索索引
++- RAG corpus：知识库内容，只用于检索
++
++### Lexical MVP
++
++lexical MVP 指最小可用的关键词检索版本。
++
++先不用向量检索，先用：
++
++- BM25
++- SQLite FTS5
++- 关键词匹配
++- metadata 过滤
++
++把 RAG 的第一版跑通。
++
++### Writeup
++
++writeup 指题目的解题说明、解法总结、分析笔记、官方或社区提供的题解材料。
++
++在这份计划里，writeup 也要进入知识库，但要打 `trust_level`，因为它高价值，也可能过拟合某道题。
++
++### Trust Level
++
++trust_level 用来标记知识可信度，例如：
++
++- `official`
++- `high`
++- `medium`
++- `low`
++
++这样检索时可以优先选更可信的来源，也方便后续分析错误引用。
++后续可以进一步约定：
++
++- `official` 优先进入默认检索
++- `high` / `medium` 可参与默认检索
++- `low` 仅在显式放开时参与，避免把噪声当经验
++
++## 阶段 0：建立基线和契约
++
++### 目标
++
++先把“不加 RAG 时”的表现记录清楚，作为后续对比基线。
++
++### 要做的事
++
++- 记录现有 Solver 的 solve rate
++- 记录平均步数、成本、耗时、失败类型
++- 明确 `KnowledgeDocument`、`KnowledgeChunk`、`SearchRequest`、`SearchResult` 四个核心模型
++- 定义 Benchmark corpus 与 RAG corpus 的隔离规则
++
++### SearchResult 最少字段
++
++- `text`
++- `source_type`
++- `metadata`
++- `score`
++- `provenance`
++
++### SearchResult 的 provenance
++
++provenance 建议至少包括：
++
++- `source_url`
++- `document_id`
++- `section`
++- `paragraph`
++- `chunk_id`
++- `line_start`
++- `line_end`
++
++这样结果可以溯源，也能减少幻觉式引用。
++
++### 默认检索参数
++
++- `top_k = 10`
++- metadata 过滤默认开启
++
++### 验收标准
++
++- 有 baseline 指标
++- 数据模型可落地
++- benchmark corpus 和 RAG corpus 不混用
++
++## 阶段 1：补 Shared Graph / 共享黑板
++
++### 目标
++
++把现有字符串 findings 和低级 trace，升级成对齐 `muteki-main` 的 shared graph 共享黑板。
++详细实现见 `docs/rag_stage1_plan.md`。
++
++### 建议事件类型
++
++- `fact_added`
++- `hypothesis_added`
++- `dead_end_added`
++- `intent_proposed`
++- `intent_claimed`
++- `intent_completed`
++- `flag_verified`
++
++### 实现思路
++
++- 新增独立的 `backend/evidence/` 模块
++- 黑板功能默认启用，且作为唯一主状态
++- coordinator / reason 负责生成 intent
++- solver 从单兵闭环模式迁移为 worker，按 intent 认领、执行、回写
++- 事件需要能关联原始 trace 和 tool result
++- 落盘优先用 SQLite
++- 支持增量恢复
++- 支持按 challenge 回放
++
++### 验收标准
++
++- 能按 challenge 查询全部证据
++- 能区分验证事实和模型猜测
++- 能关联原始 trace/tool result
++- 重启后事件不丢失
++
++## 阶段 2：实现 RAG Lexical MVP
++
++### 目标
++
++先做一个不依赖外部向量服务的关键词检索版本，验证 RAG 是否能带来收益。
++
++### 范围
++
++- CWE 和基础漏洞知识
++- 协议、文件格式、二进制基础
++- GDB、radare2、pwntools、z3、Volatility 等工具文档
++
++### 推荐实现
++
++- 新增 `backend/knowledge/`
++- 离线流程：
++  - 文档采集
++  - 清洗
++  - 按标题/代码块切分
++  - 生成 metadata
++  - 去重
++  - 建索引
++- 先用本地 SQLite FTS5 做 BM25/关键词检索
++- `SearchRequest` 先支持 `query`、`source_type`、`metadata`、`top_k=10`
++
++### metadata 建议
++
++- `source_type`
++- `category`
++- `topic`
++- `tool_name`
++- `cwe_id`
++- `version`
++- `document_id`
++- `section`
++- `trust_level`
++- `split`
++
++### 建议收录内容
++
++- 官方文档
++- 基础漏洞知识
++- 协议 / 文件格式 / 二进制基础
++- 工具文档
++- writeup / 解题笔记 / 题目分析
++- 特定题目的解法方法论和可复用套路
++
++### 不建议混入的内容
++
++- benchmark corpus 原始题目本体
++- 运行时临时日志
++- 没有来源标记的碎片化猜测
++
++### 验收标准
++
++- 能按 query 检索知识
++- 能按 metadata 过滤
++- 检索结果可追溯
++- 不需要向量库也能跑通
++- 新文档进入知识库前必须经过人工审核
++- 过期内容保留但降权
++
++## 阶段 3：接入 Agent 工具层
++
++### 目标
++
++把知识检索变成一个可由各个 solver 调用的标准工具。
++
++### 核心接口
++
++```python
++search_knowledge(query, source_type, metadata, top_k)
++```
++
++### 接入位置
++
++- Pydantic Solver：`backend/agents/solver.py`
++- Codex Solver：`backend/agents/codex_solver.py`
++- Claude Coordinator：后续再接，不作为当前主链路范围
++- Claude Solver：先不补 MCP，等主链路稳定后再决定是否补齐
++
++### 原则
++
++- 按需调用
++- 不自动灌进 system prompt
++- 各 solver 的 RAG 能力尽量一致
++- 先把主链路打通，再考虑补齐其他 solver 形态
++
++### 验收标准
++
++- 各 solver 都能调用同一套检索入口
++- 检索不破坏原有主链路
++- 调用日志可观察
++
++## 阶段 4：加入向量检索和 Reranker
++
++### 目标
++
++在 lexical recall 不够时，再增加向量检索和结果融合。
++
++### 组件
++
++- Embedding Provider
++- Vector Index
++- RRF / Score Fusion
++- Optional Reranker
++
++### 建议
++
++- 用 RRF 合并 BM25 和向量结果
++- 设置多轮检索上限，避免 token 循环
++- 默认最多重写 1 到 2 次
++
++### 评估指标
++
++- Recall@K
++- MRR 或 nDCG
++- 检索延迟
++- 额外 token 成本
++- Solver solve rate 变化
++- 错误知识引用率
++- smoke 集是否跑，作为可选检查项而不是强制项
++
++## 当前评估集
++
++### 主测试集
++
++- `benchmarks/rag_eval/main_100.json`
++
++### 快速 smoke 集
++
++- `benchmarks/rag_eval/smoke_20.json`
++
++### RAG-sensitive 集
++
++- `benchmarks/rag_eval/rag_sensitive_100.json`
++
++### 临时调试子集
++
++- `benchmarks/rag_eval/smoke_20_no_character.json`
++- `benchmarks/rag_eval/smoke_20_after_delulu.json`
++
++## 目前我认为还需要确认的点
++
++### 1. 知识更新节奏
++
++我建议先采用批量更新：
++- 每累计约 5 个已验证题目，或 5 次 solver 完成，触发一次知识库整理
++- 由人工审核后再入库
++- 如果增长太慢，再把阈值调低
++
++还需要确认：
++- 这个批次策略是否符合你的节奏
++- 是否要额外加入按周补充的兜底批次
++
++### 2. smoke 集使用方式
++
++smoke 集已确定为手动触发，这里只剩执行细节：
++- 是否只在检索层改动后跑
++- 是否允许临时指定子集
++
++## 建议下一步
++
++先把阶段 0 和阶段 1 做完，再进入阶段 2。
++
++这样做的好处是：
++- baseline 清楚
++- 证据可追溯
++- 后面检索效果能量化比较
++- 不会一上来就把系统改得太散
+diff --git a/docs/rag_stage1_plan.md b/docs/rag_stage1_plan.md
+new file mode 100644
+index 0000000..14eab21
+--- /dev/null
++++ b/docs/rag_stage1_plan.md
+@@ -0,0 +1,614 @@
++# RAG Stage 1 计划：Shared Graph / 共享黑板
++
++## 1. 目标
++
++把当前的字符串式 `findings` 和低级 trace，升级成和 `muteki-main/muteki/swarm/shared_graph.py` 同类的共享黑板。
++
++这一阶段的重点不是 RAG 检索，而是先把“解题过程中到底发生了什么、谁认领了什么、哪些路被证伪了、哪些事实该保留”记录清楚。
++
++### 本阶段要解决的问题
++
++- 题目推进过程没有统一证据结构
++- `findings` 只有字符串，无法稳定区分事实、猜测和死路
++- trace、tool result、flag submission、intent、review、branch 之间缺少统一索引
++- 重启后只能看日志，不能按 challenge 做结构化回放
++- 共享协作时缺少黑板式“事实 / 意图 / 约束 / 路线”视图
++
++## 2. 范围边界
++
++### 做什么
++
++- 新增独立的 `backend/evidence/` 模块
++- 将 solver / swarm / submission / coordinator 的关键动作写成结构化事件
++- 使用 SQLite 做持久化落盘
++- 支持增量恢复
++- 支持按 challenge 回放和查询
++- 支持黑板视图输出（board / reason summary / review summary）
++
++### 2.1 Stage 1 MVP
++
++这一阶段先只做最小闭环，目标是“能协作、能回放、能续跑”：
++
++- 事实能写入黑板
++- 猜测能和事实区分
++- 死路能标记
++- 意图能提出、认领、完成
++- 结果能追溯到 trace / tool result
++- coordinator / reason 视图能生成
++
++### 2.2 后置扩展
++
++这些内容不阻塞 stage1 MVP，可以后放：
++
++- PoC 生命周期
++- 事实挑战 / 重验证 / 合并 / 退役
++- routes / branches
++- operator directives / hitl requests
++- resource locks / lane locks
++- fact pins / compaction
++
++### 不做什么
++
++- 不保留无黑板的旧 solver 主链路
++- 不把共享黑板直接当知识库
++- 不做向量检索
++- 不做自动总结或自动分类替代人工判断
++- 不在 stage1 一次性实现 muteki 的全部高级能力
++
++## 3. 与现有代码的关系
++
++当前代码里已有三条相关链路：
++
++- `backend/message_bus.py`：挑战内的字符串 findings 共享通道
++- `backend/tracing.py`：每个 solver 的 JSONL 事件日志
++- `backend/agents/swarm.py`：协调多个 solver 并汇总结果
++
++Stage 1 的策略是“黑板唯一主链路”：
++
++- solver 不再按旧的单兵闭环方式独立求完整题
++- coordinator / reason 负责读黑板并生成 intent
++- solver 作为 worker 读取、认领、执行、回写 intent
++- `message_bus` 逐步退化为兼容适配层，最终以 shared graph 为唯一事实来源
++- shared graph 保存对 trace / tool result / submission / review 的引用
++
++### 3.1 Solver 迁移策略
++
++当前项目的 solver 以“单题闭环求解”为主，stage1 要把它改成黑板驱动的 worker。
++
++这里的最小侵入式不是保留旧流程，而是尽量复用现有底层能力：
++
++- 保留现有 sandbox、工具调用、trace、flag submission、成本统计
++- 移除 solver 自己从头到尾规划完整题目的默认职责
++- coordinator / reason 层负责生成任务与约束
++- worker solver 启动后先读黑板，再认领 intent
++- worker solver 执行 intent 后必须回写事实、猜测、死路或 flag
++- coordinator / reason 默认继续用当前最强的 planner 模型，例如 `codex/gpt-5.6-luna`
++- worker solver 不要求和 coordinator 同精度，只要求共享同一黑板契约
++
++这意味着 stage1 的目标是“当前 solver 代码最小改动地变成 worker”，不是保留两个并行体系。
++
++### 3.2 对齐 muteki-main/shared_graph 的核心含义
++
++`muteki-main` 里的 `shared_graph` 不是单纯日志，而是一个事件源黑板：
++
++- append-only 事件日志是事实来源
++- `facts` / `intents` / `routes` / `branches` / `pocs` / `locks` 是从事件折叠出来的工作视图
++- 每条事实都带 provenance gate
++- 意图认领是原子操作
++- 路线抑制、分支、事实审核、PoC 管理、资源锁都在黑板里统一表达
++
++换句话说，你现在说的 stage1，确实更接近这里的 shared_graph，而不是一个普通的 RAG evidence cache。
++
++## 4. 核心概念
++
++### 4.1 Shared Event
++
++最小事件单元，不是整段日志。
++
++每条事件应该表达一个可复用的证据动作，例如：
++
++- 发现一个事实
++- 提出一个假设
++- 进入一条死路
++- 完成一次 PoC
++- 提出 / 认领 / 完成一个意图
++- 提交 review
++- 确认 flag
++
++### 4.2 Evidence Graph
++
++由事件和事件间关系构成的有向图。
++
++它回答的问题是：
++
++- 这条结论是怎么来的
++- 谁提出的
++- 依据是什么
++- 哪个工具结果支撑了它
++- 哪些假设后来被证伪了
++
++### 4.3 Blackboard Views
++
++共享黑板至少要能导出这些可读视图：
++
++- full board
++- reason summary
++- review summary
++- fact pin context
++- timeline / replay
++- open / claimed / done intent 列表
++- active routes / suppressed routes
++- branches
++- active resource locks
++
++### 4.4 Provenance
++
++provenance 是可追溯来源信息，不是附属说明。
++
++至少要包含：
++
++- `source_kind`：`trace` / `tool_result` / `message_bus` / `submission` / `manual`
++- `trace_path`
++- `trace_event_index`
++- `tool_name`
++- `tool_step`
++- `source_excerpt`
++- `related_result_excerpt`
++
++如果某条证据是由工具结果推导出来的，还要保留原始工具输出片段。
++
++## 5. 事件类型
++
++事件定义和说明合并在一行；标记为 MVP 的事件必须在 stage1 实现，标记为后置的事件只保留设计位置。
++
++- `intent_proposed`：MVP；coordinator / reason 提出一个可执行任务。
++- `intent_claimed`：MVP；worker 原子认领一个任务，避免多个 solver 重复执行。
++- `intent_completed`：MVP；worker 完成任务并写入结果状态。
++- `fact_added`：MVP；写入已经被工具输出、文件内容、服务响应或提交结果支撑的事实。
++- `hypothesis_added`：MVP；写入尚未验证的推测，不能被当成事实使用。
++- `dead_end_added`：MVP；记录已经验证不可行或收益很低的路线，避免重复尝试。
++- `flag_verified`：MVP；flag 已被提交接口确认为正确。
++- `poc_added`：后置；记录可复现命令、脚本、EXP 或验证样例。
++- `review_submitted`：后置；人工或 review worker 对事实、路线、结果的复核意见。
++- `fact_challenged`：后置；事实被质疑，需要重新验证。
++- `fact_revalidated`：后置；被质疑的事实重新验证通过。
++- `fact_rejected`：后置；事实被否定并从可用事实集中退役。
++- `fact_merged`：后置；重复事实合并到规范事实。
++- `fact_superseded`：后置；旧事实被更新事实覆盖。
++- `fact_pinned`：后置；reason 选择需要长期保留在摘要里的事实。
++- `route_suppressed`：后置；路线被暂时压制，不再分配普通 worker。
++- `route_reopened`：后置；被压制路线因新证据重新开放。
++- `branch_split`：后置；显式拆分互斥假设分支。
++- `branch_resolved`：后置；分支被确认、否定或关闭。
++- `resource_locked`：后置；独占资源被 worker 或 coordinator 占用。
++- `resource_released`：后置；独占资源释放。
++- `flag_invalidated`：后置；多 flag 或误报场景中撤销错误 flag 记录。
++
++### 事件约束
++
++- 一条事件只表达一个主要动作
++- 事件要尽量短，不把一整段推理塞进一个 payload
++- 原始 trace 不删除，只在证据图里挂引用
++- `hypothesis_added` 不能被当作事实使用
++- MVP 阶段优先保证核心闭环，长尾事件后置
++
++## 6. 代码级模块规划
++
++建议新增：
++
++- `backend/evidence/__init__.py`
++- `backend/evidence/models.py`
++- `backend/evidence/store.py`
++- `backend/evidence/recorder.py`
++- `backend/evidence/query.py`
++- `backend/evidence/replay.py`
++- `backend/evidence/views.py`
++- `backend/evidence/state.py`
++- `backend/evidence/serialization.py`
++
++### 6.1 `models.py`
++
++定义结构化模型，建议全部使用 dataclass 或轻量 pydantic 模型。
++
++核心模型：
++
++- `EvidenceEvent`
++- `EvidenceProvenance`
++- `EvidenceLink`
++- `EvidenceQuery`
++- `EvidenceReplayCursor`
++- `BoardSnapshot`
++- `FactState`
++- `IntentState`
++- `RouteState`
++- `BranchState`
++- `PocRecord`
++- `ReviewRecord`
++- `DirectiveRecord`
++- `ResourceLock`
++
++### 6.2 `store.py`
++
++负责 SQLite 读写。
++
++职责：
++
++- 初始化 schema
++- 插入事件
++- 保证幂等
++- 按 challenge / solver / event_type 查询
++- 支持分页和时间范围查询
++- MVP 先覆盖 `events` / `intents` / `intent_sources` / `intent_products`
++- 后续再补 `facts` / `routes` / `branches` / `locks` 这类投影表
++
++### 6.3 `recorder.py`
++
++负责把运行时信号转换成事件。
++
++职责：
++
++- 接收 solver / swarm / submission 的结构化调用
++- 写入 store
++- 给事件分配唯一 id
++- 维护 challenge 内顺序号
++
++### 6.4 `query.py`
++
++负责只读查询。
++
++职责：
++
++- challenge 时间线查询
++- 只看 verified 事件
++- 只看 hypothesis 事件
++- 按 solver_label 筛选
++- 导出 JSON / JSONL
++- MVP 先聚焦 challenge timeline 和 intent 关系
++
++### 6.5 `views.py`
++
++负责黑板可读视图生成。
++
++职责：
++
++- board 全量视图
++- reason summary
++- review summary
++- fact pin context
++- route / branch / lock 视图
++- MVP 先保证 board / reason summary / replay
++
++### 6.6 `state.py`
++
++负责事件折叠后的状态读取。
++
++职责：
++
++- facts / intents / routes / branches / pocs / locks 的状态投影
++- snapshot 构建
++- 退役 / 终态过滤
++- MVP 先做 facts / intents / dead-ends / flag / timeline 的投影
++
++### 6.7 `replay.py`
++
++负责 challenge 回放。
++
++职责：
++
++- 按时间顺序重建事件流
++- 支持按事件类型过滤回放
++- 支持输出给 UI / CLI
++
++### 6.8 配置接入
++
++建议在 `backend/config.py` 的 `Settings` 里增加：
++
++- `evidence_db_path`
++- `blackboard_default_worker_lease_seconds`
++
++默认建议：
++
++- `evidence_db_path = "logs/evidence.sqlite3"`
++- `blackboard_default_worker_lease_seconds = 300`
++
++黑板功能默认启用且是唯一主链路，不再保留关闭后回退到旧 solver 流程的模式。
++
++## 7. SQLite schema
++
++如果要和 `shared_graph` 的语义对齐，建议 schema 也分 MVP 和扩展层。
++
++### 7.1 Stage 1 MVP 主表
++
++- `events`
++- `intents`
++- `intent_sources`
++- `intent_products`
++
++### 7.2 后置扩展表
++
++- `pocs`
++- `routes`
++- `fact_reviews`
++- `branches`
++- `fact_states`
++- `fact_pins`
++- `fact_merges`
++- `operator_directives`
++- `hitl_requests`
++
++### 7.3 事件主表
++
++`events` 是源事实表，建议字段：
++
++- `seq` INTEGER PRIMARY KEY AUTOINCREMENT
++- `ts` REAL NOT NULL
++- `challenge_name` TEXT NOT NULL
++- `actor` TEXT NOT NULL
++- `kind` TEXT NOT NULL
++- `payload` TEXT NOT NULL
++- `artifact_id` TEXT
++- `verified` INTEGER NOT NULL DEFAULT 0
++- `confidence` REAL NOT NULL DEFAULT 1.0
++- `dedupe_key` TEXT UNIQUE
++
++### 7.4 意图表
++
++`intents` 至少要有：
++
++- `intent_id`
++- `challenge_name`
++- `goal`
++- `status`
++- `dispatch_state`
++- `worker`
++- `lease_until`
++- `created_seq`
++- `result_seq`
++- `result_detail`
++- `route_hash`
++- `branch_id`
++- `lane_key`
++
++### 7.5 关系表
++
++- `intent_sources`
++- `intent_products`
++- `fact_merges`
++
++### 7.6 视图与退役状态
++
++- `fact_states` 用来保存事实生命周期
++- `fact_pins` 用来保存模型选择保留的事实
++- `routes` 用来保存被压制的路线
++- `branches` 用来保存分支状态
++- `operator_directives` 用来保存外部指导
++- `hitl_requests` 用来保存人工介入请求
++
++### 7.7 存储约束
++
++- 使用 SQLite
++- 建议启用 WAL
++- 事件插入必须幂等
++- 重启后不能重复写同一事件
++- 默认存储路径由 `Settings.evidence_db_path` 控制
++
++## 8. 数据流设计
++
++### 8.1 运行时主链路
++
++1. `ChallengeSwarm` 为 challenge 初始化 shared graph
++2. coordinator / reason 读取 board summary
++3. coordinator / reason 生成 `intent_proposed`
++4. worker solver 从黑板原子认领 `intent_claimed`
++5. worker solver 围绕该 intent 执行工具调用和推理
++6. `SolverTracer` 继续写 JSONL
++7. worker solver 把事实、猜测、死路或 flag 写回 shared graph
++8. coordinator / reason 根据更新后的黑板继续分配下一轮 intent
++
++### 8.2 事件写入点
++
++优先从这些位置写事件：
++
++- challenge start / finish
++- reason plan generated
++- worker intent claim / finish
++- tool call / tool result
++- fact / hypothesis / dead-end writeback
++- flag submission
++
++### 8.3 推荐映射
++
++- reason 生成任务 -> `intent_proposed`
++- worker 认领任务 -> `intent_claimed`
++- worker 完成任务 -> `intent_completed`
++- `tool_result` 中出现可验证事实 -> `fact_added`
++- 推测性总结 -> `hypothesis_added`
++- 明确放弃的方案 -> `dead_end_added`
++- 提交并确认 flag -> `flag_verified`
++
++## 9. 与现有组件的接入点
++
++### 9.1 `backend/agents/swarm.py`
++
++建议在 swarm 层创建 challenge 级 shared graph，并把它作为唯一协作状态传给 coordinator / reason / solver。
++
++要求：
++
++- shared graph 生命周期跟 challenge 走
++- 同一 challenge 下各 solver 共用一个 store
++- solver 创建前先初始化 shared graph
++- solver 分配以 intent 为单位，而不是每个 solver 自行完整求解整题
++
++### 9.2 `backend/agents/solver.py`
++
++Pydantic solver 侧需要暴露结构化证据入口。
++
++建议：
++
++- 在 `SolverDeps` 或等价依赖对象上增加 `shared_graph`
++- solver 启动后必须读取 board summary 和当前 intent
++- solver 只能执行自己认领的 intent
++- 工具调用后保留 trace，并把可用结果作为 provenance 绑定到事件
++- solver 完成时必须写入 `intent_completed`
++- `_findings` 字符串总结不再作为主状态，只作为兼容输出或最终摘要
++
++### 9.3 `backend/agents/codex_solver.py`
++
++Codex solver 侧同样改成 shared graph worker。
++
++重点：
++
++- 继续复用 app-server 动态工具
++- thread prompt 中注入当前 intent 和 board summary
++- 不再让 Codex solver 默认独立规划完整题
++- 不改变底层 token / turn 统计逻辑
++- 不把 evidence 写入 prompt
++
++### 9.4 `backend/agents/claude_solver.py`
++
++先不补 MCP 工具，但如果 Claude solver 参与 stage1 主链路，也必须遵守 shared graph worker 契约。
++
++### 9.5 `backend/tools/core.py`
++
++`do_check_findings` 需要迁移为读取 shared graph 的 board summary 或新增等价工具。
++`do_read_solver_trace` 继续保留，用于 provenance 和调试。
++
++## 10. API 需求
++
++### 10.1 Recorder API
++
++建议最少提供：
++
++```python
++record_event(
++    challenge_name: str,
++    event_type: str,
++    payload: dict,
++    *,
++    solver_label: str | None = None,
++    provenance: dict | None = None,
++    links: list[str] | None = None,
++) -> str
++```
++
++除了通用 `record_event`，MVP 需要提供黑板语义 API：
++
++```python
++propose_intent(actor: str, goal: str, from_event_ids: list[str] | None = None) -> str
++claim_intent(worker: str, intent_id: str, lease_seconds: int = 300) -> bool
++complete_intent(worker: str, intent_id: str, result: str, produced_events: list[str] | None = None) -> str
++add_fact(actor: str, fact: str, *, verified: bool, provenance: dict) -> str
++add_hypothesis(actor: str, hypothesis: str, *, provenance: dict | None = None) -> str
++add_dead_end(actor: str, reason: str, *, provenance: dict | None = None) -> str
++verify_flag(actor: str, flag: str, *, provenance: dict) -> str
++```
++
++### 10.2 Query API
++
++建议最少提供：
++
++```python
++list_events(challenge_name: str, *, event_type: str | None = None, solver_label: str | None = None)
++get_event(event_id: str)
++get_timeline(challenge_name: str)
++export_challenge(challenge_name: str, format: str = "jsonl")
++```
++
++### 10.3 Replay API
++
++建议最少提供：
++
++```python
++replay_challenge(challenge_name: str, *, event_types: list[str] | None = None)
++```
++
++## 11. 恢复与幂等
++
++这是 Stage 1 的关键点之一。
++
++### 要求
++
++- SQLite 文件可直接重开
++- 同一事件重复写入不会产生重复记录
++- 中途崩溃后，已提交事件不能丢
++- challenge 回放顺序稳定
++
++### 建议做法
++
++- MVP 可以优先使用 SQLite 自增 `seq` 作为事件顺序
++- 对外暴露的 `event_id` 可以由 `challenge_name + seq` 派生
++- 插入事件时使用事务
++- 写入失败要可重试
++- intent 认领必须用原子更新，保证同一 intent 只有一个 worker 赢
++
++## 12. 可观测性
++
++### 需要保留的可观察信息
++
++- 事件总数
++- 按 challenge 的事件数
++- 按 event_type 的分布
++- 按 solver_label 的分布
++- 最近一次写入时间
++- 回放耗时
++- open / claimed / completed intent 数量
++- 无可认领 intent 的等待时间
++
++### 建议输出
++
++- CLI 友好的表格输出
++- 可导出的 JSON
++- 后续给 UI 的 timeline 数据
++
++## 13. 测试要求
++
++### 单元测试
++
++- event 序列化 / 反序列化
++- SQLite 写入与查询
++- 幂等插入
++- challenge 过滤
++- event_type 过滤
++- solver_label 过滤
++
++### 集成测试
++
++- solver 跑一轮后能产出 evidence
++- reason 能提出 intent
++- solver 能认领 intent
++- solver 完成后能写回 `intent_completed`
++- restart 后 evidence 仍可查询
++- trace 路径与 evidence 能对上
++- 旗子确认能落到 `flag_verified`
++
++### 回归测试
++
++- 黑板主链路下 solver 能正常结束
++- 无旧 findings 主状态依赖
++- 不影响 benchmark runner 的输出结构
++
++## 14. 验收标准
++
++Stage 1 完成时，至少满足：
++
++- 能按 challenge 查询全部证据
++- 能区分事实、猜测、死路和验证结果
++- 能关联原始 trace / tool result
++- SQLite 落盘可恢复
++- 重启后不丢事件
++- 黑板是唯一主状态
++- solver 按 intent 执行，而不是默认单兵完整求解
++- coordinator / reason 能基于 board summary 继续规划
++
++## 15. 推荐实现顺序
++
++1. 先定 `models.py`
++2. 再做 `store.py`
++3. 然后做 `recorder.py`
++4. 再接 `swarm.py`
++5. 再接 `solver.py` 和 `codex_solver.py`
++6. 最后补 `query.py` 和 `replay.py`
++
++## 16. 备注
++
++这一阶段不要急着让系统“聪明”，先让它“记得住、查得到、回得来”。
+diff --git a/docs/rag_stage1_review.md b/docs/rag_stage1_review.md
+new file mode 100644
+index 0000000..acd8b31
+--- /dev/null
++++ b/docs/rag_stage1_review.md
+@@ -0,0 +1,272 @@
++# RAG Stage 1 方案筛查与落地校验报告（详查版）
++
++> 执行落地请以 [最小可运行版 Review v2](./rag_stage1_review_v2.md) 为准；本文保留完整问题审查记录。
++
++> 审查对象：`docs/rag_stage1_plan.md`（以下简称“原计划”）
++>
++> 参照：`docs/rag_plan.md`、当前 `backend/` 实现。本文是实施前的审查结论和补充方案，不代表 Stage 1 已经实现。
++
++## 0. 已确认的范围决策（本轮对齐结果）
++
++以下内容已按本轮沟通直接落定，后续不再作为阻塞性问题反复询问：
++
++1. **“state 1”统一改称“Stage 1”。** 这里不是 Muteki 的某个运行状态编号，而是 RAG 总计划里的第一阶段。Stage 1 当前只服务一个业务场景：当前 CTF 题目求解。交付目标是一个能运行的共享状态图/黑板，以及基于它进行任务提出、认领、执行和回写的 Codex 主链路。
++2. **Muteki 采用语义对齐、最小实现。** 以 Muteki shared graph 的核心语义为参考；必要时可以复制少量代码，但不追求完整搬运。哪个实现简单、稳定、侵入小就采用哪个。
++3. **只保留 Codex solver。** 本次主链路不扩展 Pydantic/Claude solver 适配；相关兼容不作为 Stage 1 交付条件。
++4. **从当前版本起黑板是唯一主状态。** 不保留可切回旧 solver 主流程的生产开关；旧 `findings` 只允许在开发/测试过渡期作为兼容比较数据，验收后移除其主状态职责。
++5. **只保持必要的既有行为。** sandbox、工具调用、flag 提交确认、成本/步数统计、取消和必要的 quota fallback 继续保留；与黑板 worker 无关的旧消息格式和额外功能不为迁移增加复杂度。
++6. **事件契约由实现侧统一定稿。** 采用版本化事件模型、稳定 event ID、provenance 和 intent 状态机；参数（例如默认 lease 300 秒）参考 Muteki/现有工程惯例直接确定，不再逐项要求业务侧确认。
++7. **`verified` 只做二值规则。** `verified=true` 表示该内容被真实工具输出、文件内容、服务响应或 CTFd 提交结果直接证明；模型自己“看起来合理”的判断只能写成 hypothesis，不能进入 verified facts。MVP 不引入多级信任体系。
++
++### “短期双写/影子校验”是什么意思
++
++迁移旧链路时，可以让一次动作同时产生旧 findings/message bus 记录和新黑板事件，再用脚本比较数量、顺序、intent 状态和 flag 结果。这叫双写/影子校验，目的是尽早发现适配错误，不是让两个主链路长期并存。
++
++本项目采用更简单的做法：只在本地开发和集成测试跑有限次数的对比；生产运行直接使用黑板唯一主链路。这样既能验证迁移，又不会引入双状态长期不一致的问题。
++
++### 用大白话理解 Stage 1 的最小闭环
++
++- 黑板就是每道题的一张持久化工作表：记录“已经确认的事实”“还没证实的猜测”“不要重复走的死路”和“下一步任务”。
++- coordinator/reason 负责把下一步拆成任务；Codex solver 先领一个任务，做完后把结果写回，再领下一个。
++- `verified` 就是“这句话有没有真实证据”。例如命令确实输出了某个版本号，可以 verified；solver 猜测“可能是 SQL 注入”，只能是 hypothesis。
++- Muteki 的复杂路线、分支、锁、人工审核等能力先不搬。只搬能支撑当前 CTF 求解的事件记录、任务认领、回写、恢复和回放。
++
++### 将由实现侧直接确定的默认参数
++
++| 参数 | 初始值/规则 | 说明 |
++| --- | --- | --- |
++| worker lease | 300 秒 | 任务超过该时间未续租即可回收 |
++| lease heartbeat | 每 60 秒 | worker 执行期间自动续租 |
++| intent retry | 最多 3 次 | 超过后标记 failed，交给 reason 决定是否新建任务 |
++| event payload | 结构化 JSON，展示 excerpt 限长 | 原始大输出保留路径/哈希，不把无限文本塞进黑板 |
++| dedupe | 调用方幂等 key；无 key 时使用稳定指纹 | 重试不会制造重复逻辑事件 |
++| verified | 仅 `true/false` | 真实输出才可为 true，模型推理默认 false |
++
++除非后续出现明确业务约束，上述实现参数不再单独拉齐。
++
++## 1. 总体结论
++
++原计划对共享黑板的目标、事件分类、SQLite 持久化和基本验收方向描述得较完整，但仍是“概念设计 + 文件清单”，还不是可以直接开发和验收的迁移规格。当前代码与目标运行模型存在结构性差异：
++
++| 维度 | 当前实现 | 原计划目标 | 结论 |
++| --- | --- | --- | --- |
++| 调度 | `coordinator_loop` 调用 `do_spawn_swarm`，`ChallengeSwarm` 并行启动每个 solver | coordinator/reason 产生 intent，worker 认领并循环执行 | 主循环需要改造，不能只加记录器 |
++| 协作状态 | `ChallengeSwarm.findings`、进程内 `ChallengeMessageBus` | SQLite 事件源黑板和投影视图 | 没有现成兼容接口 |
++| solver 单位 | `run_until_done_or_gave_up()` 以整题为单位，输出仅允许 `flag_found` | worker 以 intent 为单位回写事实/猜测/死路 | 输出协议和运行循环均需变化 |
++| 证据 | `SolverTracer` 写带时间戳的 JSONL，结果截断 | 事件、provenance、links 可查询和回放 | 需要统一 ID、双写/迁移策略 |
++| coordinator | Codex/Claude LLM 负责持续调度、读 trace、广播 | “coordinator / reason”读 board 并生成 intent | `reason` 角色尚未定义或实现 |
++| 配置 | `Settings` 没有 evidence DB/lease 配置 | 黑板默认启用且唯一主状态 | 配置、故障策略和回滚方式缺失 |
++
++因此，原计划可以作为方向性方案，但在开发前必须补齐本文列出的契约、状态机、适配规则、恢复语义和验收阈值。尤其不能把“新增 `backend/evidence/`”误解为完成主链路迁移；若不改变 swarm/solver 的调度与输出，黑板只会成为另一份日志。
++
++## 2. 逐条问题清单
++
++严重度：`P0` 表示不解决就无法实现/验收；`P1` 表示会造成错误协作或不可运营；`P2` 表示质量、可维护性或文档一致性问题。
++
++### 2.1 范围、背景与可追溯性
++
++| ID | 严重度 | 原计划位置 | 问题与影响 | 必须补充/修改 |
++| --- | --- | --- | --- | --- |
++| S1 | P0 | §1、§3.2 | 只写“state 1”，没有定义 state 1 的入口、出口、允许的 agent、并发模型、完成条件和失败转移。无法判断哪些流程应迁移。 | 明确定义 State-1 状态机、触发条件、终态、异常态和非 State-1 行为。 |
++| S2 | P0 | §1、§3.2 | 依赖 `muteki-main/muteki/swarm/shared_graph.py`，仓库没有该代码、版本、commit、协议或许可说明，无法核对“同类”语义。 | 固定参考仓库/commit，附 API/schema 对照表和允许的最小子集。 |
++| S3 | P0 | §3 | 没有从 CLI、poller、coordinator loop、`do_spawn_swarm`、swarm、solver 到 CTFd 提交的端到端迁移映射。 | 增加旧链路到新链路的逐函数映射、责任边界和删除/保留清单。 |
++| S4 | P1 | §2 与 `docs/rag_plan.md` §5、§121 | Stage 1 名称是 RAG，但正文明确“不做检索”；与总计划的阶段关系、交付物和依赖未建立。 | 写明 Stage 1 是 evidence/blackboard prerequisite，Stage 2 才消费其数据，并定义跨阶段接口。 |
++| S5 | P1 | §2.1、§14 | 没有 baseline、目标 solve rate、延迟、token、事件完整率、重复任务率等量化门槛。 | 先记录旧链路基线，再给迁移后必须达到的阈值和统计方法。 |
++| S6 | P1 | 全文 | 没有明确不变约束：sandbox 隔离、提交冷却、quota fallback、成本统计、benchmark 输出、网络策略是否必须保持。 | 将现有行为列为兼容性不变量，并为每项指定测试。 |
++
++### 2.2 事件与证据模型
++
++| ID | 严重度 | 原计划位置 | 问题与影响 | 必须补充/修改 |
++| --- | --- | --- | --- | --- |
++| E1 | P0 | §7.3、§10 | 表中只有 `seq`，API 却返回 `event_id`；没有稳定的 UUID/格式、全局还是 challenge 级唯一规则。 | 定义 `event_id`（建议 UUID/ULID）与 `seq` 的关系，所有外键统一使用 `event_id`。 |
++| E2 | P0 | §7.3、§11 | `AUTOINCREMENT` 是数据库全局序号，文档又说“维护 challenge 内顺序号”；两者不一致，多 challenge 并发时无法得到预期排序。 | 增加 `run_id`、`challenge_seq`，明确排序键为 `(ts, seq)` 或单调 `challenge_seq`。 |
++| E3 | P0 | §4.4、§7.3 | provenance 仅列字段，没有结构模型、必填条件、长度/敏感信息规则或校验失败处理；`artifact_id` 未定义。 | 定义 `EvidenceProvenance`、artifact 类型/存储、字段必填矩阵、截断和 secret 脱敏策略。 |
++| E4 | P0 | §4.2、§10.1 | `EvidenceLink` 被列为模型，事件 API 只有 `links: list[str]`，没有关系类型、方向、目标约束。证据图无法可靠回答“由什么支撑”。 | 采用 `{target_event_id, relation}`，规定 `supports/derived_from/contradicts/produces/for_intent` 等枚举。 |
++| E5 | P0 | §5、§7.3 | `kind`、`event_type`、`type` 三种命名并存；`payload` 是任意 dict，无法校验事件特有字段。 | 统一命名；为每个 MVP 事件提供版本化 JSON Schema/TypedDict，并拒绝未知或非法 payload。 |
++| E6 | P1 | §7.3 | `verified` 和 `confidence` 的语义不清：谁可以验证、0/1 如何产生、confidence 是否允许任意值；“provenance gate”没有 gate 规则。 | 定义 verified 状态转换、验证主体/来源、confidence 范围和事实可见性过滤。 |
++| E7 | P1 | §5、§10 | `fact_added`、`hypothesis_added`、`dead_end_added` 没有内容 ID、规范化文本、标签、去重策略；同一事实会无限重复。 | 增加 `fact_id`/`claim_key`、canonical text、dedupe/merge 规则；至少实现事实级幂等。 |
++| E8 | P1 | §4.1、§5 | 示例包含 PoC、review、branch，但这些事件又列为后置；读者无法知道 MVP 是否必须记录其引用。 | 将示例按 MVP/后置分开，MVP 视图不得依赖后置表。 |
++| E9 | P1 | §4.3、§6.5 | `review summary`、`fact pin context`、routes、branches、locks 被列为黑板至少视图，但对应事件/表后置，MVP 无法生成。 | 要么降级为后置视图，要么把最小 review/pin 状态纳入 MVP 并写清实现。 |
++| E10 | P1 | §5 | `dead_end` 的“已验证不可行或收益很低”有主观标准，也没有路线标识、重开条件和有效期，可能错误阻断后续 solver。 | 定义 evidence 要求、route key、owner、confidence、reopen 条件和人工覆盖。 |
++| E11 | P1 | §5 | 没有 challenge start/finish、solver start/stop、submission attempted/rejected/error 等事件类型，§8 却要求写入这些动作。 | 增加生命周期和提交结果事件，或明确它们映射到哪一种现有事件。 |
++| E12 | P1 | §4.4、§7.3 | 工具输出只保存 excerpt，未说明原始大输出存放处、哈希、保留期限；截断后可能无法审计。 | 保存 artifact URI/hash/size，excerpt 仅作展示；制定 retention 和敏感数据策略。 |
++
++### 2.3 Intent、调度和多 agent 协作
++
++| ID | 严重度 | 原计划位置 | 问题与影响 | 必须补充/修改 |
++| --- | --- | --- | --- | --- |
++| I1 | P0 | §5、§7.4、§10.1 | intent 状态（open/claimed/done/failed/cancelled）和合法转移未定义；`status` 与 `dispatch_state` 的区别不明。 | 给出状态机、转移者、条件、终态和失败码。 |
++| I2 | P0 | §7.4、§11 | lease 过期、续租、崩溃回收、重复完成、worker 重启均未定义；会导致任务永久占用或重复执行。 | 规定原子 claim SQL、lease heartbeat、过期 reclaim、fencing token 和幂等 complete。 |
++| I3 | P0 | §8.1、§9.1 | 计划说 solver 只能执行自己认领的 intent，但没有 API/tool 让 agent 读取、claim 或 complete intent。 | 增加 board read/propose/claim/complete 工具，并在服务端强制 worker 身份校验。 |
++| I4 | P0 | §3.1、§8.1 | 没有定义一个 intent 的粒度、输入约束、预期产物、依赖 intent、最大执行时间和重试次数。 | Intent 契约至少包含 goal、context、acceptance、inputs、expected products、timeout、retry policy。 |
++| I5 | P0 | §3、§8 | “coordinator / reason”被当成同一角色，但当前代码没有 reason 组件；没有说明 LLM coordinator 是否就是 reason，还是新增 planner。 | 明确角色、进程边界、调用时机、幂等方式、预算和 board summary 输入输出。 |
++| I6 | P0 | §3.1、§9.1 | 当前 `ChallengeSwarm` 是所有模型并行竞速整题；目标是共享 intent worker。只增加 shared graph 不会改变调度行为。 | 重写 swarm 为 scheduler/worker pool，或明确过渡期每个 solver 如何领取不同 intent，禁止整题竞速。 |
++| I7 | P1 | §3.1 | 没有冲突处理：两个事实互斥、多个 solver 提交不同 flag、两个 intent 争用同一文件/服务时如何决策。 | 规定 claim 冲突、事实冲突、flag winner、资源锁（即使锁后置也要有 MVP 防护）。 |
++| I8 | P1 | §3.1、§4.3 | 没有公平性、优先级、lane、branch 的 MVP 使用规则；schema 却预留 `route_hash/branch_id/lane_key`。 | 明确这些字段是 nullable 的设计占位，或纳入调度算法并给优先级/饥饿处理。 |
++| I9 | P1 | §3、§8 | coordinator 何时被黑板更新唤醒、无 intent 时如何等待、没有可认领任务时何时退出，没有定义。 | 定义事件触发/轮询机制、backoff、idle timeout、challenge 完成条件。 |
++| I10 | P1 | §2.2、§5 | “自动总结/分类不替代人工判断”与“从 tool_result 识别可验证事实”之间存在矛盾，分类责任未分配。 | 明确 agent 显式提交为主；自动提取只能产生 hypothesis/draft，不能直接变为 verified fact。 |
++
++### 2.4 与现有代码的适配缺口
++
++| ID | 严重度 | 代码证据 | 问题与影响 | 必须补充/修改 |
++| --- | --- | --- | --- | --- |
++| C1 | P0 | `backend/agents/swarm.py:94,101,196-201,277-283` | findings 和 message bus 是主协作状态，且仅进程内、最多 200 条、按模型游标读取；重启后丢失，不能作为黑板兼容实现。 | 先由 adapter 将 bus 读写转为 board 事件，再在切换后移除 `findings` 主状态和 200 条裁剪。 |
++| C2 | P0 | `backend/agents/solver.py:211-272`、`backend/output_types.py:11-26` | Pydantic solver 每轮只接受 `FlagFound`，成功/放弃才返回；没有 worker result 或证据提交通道。 | 增加 worker output/显式 board tools；保留 flag 输出仅作为最终完成信号。 |
++| C3 | P0 | `backend/agents/codex_solver.py:462-537`、`claude_solver.py:236-256` | Codex/Claude 通过动态工具或 hook 读取 message bus，工具结果并未结构化写入 evidence。 | 三种 solver 共用同一 `BoardContext`/Recorder；工具 wrapper 统一记录 call/result 和 provenance。 |
++| C4 | P0 | `backend/deps.py:22-38` | `SolverDeps` 没有 shared graph；`CoordinatorDeps` 也没有 store/board registry。 | 增加 challenge-scoped `Board`/`EvidenceRecorder`，明确生命周期和依赖注入。 |
++| C5 | P0 | `backend/agents/coordinator_loop.py:116-183` | coordinator loop 只消费 poller、solver inbox、operator inbox 和 swarm 状态，不消费 board 事件，也没有按 board 生成 intent。 | 将 board event stream 接入 loop，定义事件去重、批量摘要和 LLM 触发节流。 |
++| C6 | P0 | `backend/agents/coordinator_core.py:138-176` | coordinator 当前通过读取某个 solver 的 JSONL trace 调试；计划未说明该接口何时改读 board、trace 如何保留。 | 保留 trace 调试 API，新增 board query；禁止将 trace 文本作为协作主状态。 |
++| C7 | P1 | `backend/agents/swarm.py:206-243`、`backend/tools/core.py:76-87` | submission 只有 confirmed/incorrect 的内存结果；dry-run、重复 flag、冷却、网络异常没有事件定义。 | 记录 submission_attempted/result/flag_verified，flag 脱敏或权限控制；保证 confirmed 与 board 原子一致。 |
++| C8 | P1 | `backend/tracing.py:20-58` | trace 文件名含秒级时间戳，事件无稳定 event ID；并发/重启可能难以定位 `trace_event_index`。 | tracer 为每条记录分配 `trace_id`/index，并在 evidence 中保存精确引用；定义文件轮转和并发写规则。 |
++| C9 | P1 | `backend/config.py:8-39` | `evidence_db_path` 和 lease 配置不存在；路径创建、权限、相对路径基准、容器/多进程共享方式未定义。 | 增加配置、环境变量名、启动初始化、目录权限和非法路径错误。 |
++| C10 | P1 | `backend/agents/swarm.py:357-396` | 发现 flag 后会设置全 swarm cancel 并取消其它 task；没有说明 pending intent 如何标记 cancelled/requeued，事件可能丢失。 | 定义取消传播顺序：先写终态事件，再 cancel worker；重启可恢复未完成 intent。 |
++| C11 | P1 | `backend/benchmarks/runner.py`、`solver_base.py` | benchmark 依赖 `SolverResult` 的 status/findings/step/cost/log_path；计划只说“不影响输出”，没有适配方案。 | 规定 result projection 和兼容字段来源，并加入 benchmark 回归。 |
++| C12 | P2 | `backend/tools/core.py:155-163` | `do_check_findings` 仍按“未读消息”语义；board 是可查询状态，不应依赖消费游标，否则不同 agent 看到的事实不一致。 | 将其改为 board summary/query，并保留兼容 wrapper 但标记 deprecated。 |
++
++### 2.5 存储、恢复、安全与运维
++
++| ID | 严重度 | 原计划位置 | 问题与影响 | 必须补充/修改 |
++| --- | --- | --- | --- | --- |
++| D1 | P0 | §7 | MVP 只有 events/intents 及关系表，但事件中的 provenance、links、facts 状态没有落点；“事件源 + 投影”无法实际恢复。 | 增加规范化 provenance/links 或明确 JSON 存储；给出完整 DDL、索引和外键。 |
++| D2 | P0 | §7、§11 | 没有 schema version、迁移工具、旧库兼容和升级失败回滚。 | 增加 `schema_version`/migration table、启动迁移策略和备份要求。 |
++| D3 | P0 | §11 | dedupe_key 可为空；SQLite UNIQUE 允许多个 NULL；重试请求如何生成同一 key 未定义。 | key 必须由调用方 idempotency key 或稳定事件指纹产生，并明确冲突返回值。 |
++| D4 | P0 | §11 | 事件和 intent 投影的事务边界不明。先写事件后更新 intent 或反之会造成不可回放状态。 | 在同一事务中写 source event + projection，或只从事件重建并给出一致性校验。 |
++| D5 | P1 | §7.7 | 仅建议 WAL，没有 busy timeout、锁竞争、checkpoint、磁盘满、损坏检测和备份恢复策略。 | 写入 PRAGMA、重试上限、健康检查、备份/恢复演练和容量告警。 |
++| D6 | P1 | §11 | 没有多进程/多线程访问假设；coordinator、多个 solver、CLI 查询是否共享一个 SQLite 文件未说明。 | 明确 single-writer 或并发模型，所有写 API 异步安全，禁止跨 event loop 复用锁。 |
++| D7 | P1 | §4.4、§7.3 | tool output、flag、prompt 可能含 secret、token、题目敏感数据；没有访问控制、脱敏、加密和保留期限。 | 定义敏感字段、日志级别、最小权限和 retention；flag 仅对授权视图展示。 |
++| D8 | P1 | §2、§11 | 没有数据库不可用时的降级策略。若黑板是唯一主状态，solver 是否停止、只写 trace 还是失败退出不清楚。 | 规定 fail-closed/fail-open；建议关键 claim/flag 失败时停止该 intent 并显式告警。 |
++| D9 | P2 | §12 | 观测指标没有采集点、标签、导出位置、采样/聚合定义；“回放耗时”等指标无法验收。 | 为每个指标定义 source、单位、窗口、日志/metrics 后端及告警阈值。 |
++
++### 2.6 API、测试和交付文档问题
++
++| ID | 严重度 | 原计划位置 | 问题与影响 | 必须补充/修改 |
++| --- | --- | --- | --- | --- |
++| A1 | P0 | §10 | API 没有返回类型、异常、同步/异步约定、事务上下文和权限；示例签名不足以实现。 | 发布 Python protocol/typed models，定义错误码、超时、重试和调用者身份。 |
++| A2 | P1 | §10.1 | `record_event` 用 `event_type`，schema 用 `kind`；`solver_label` 与 `actor` 关系不明。 | 统一为 `actor_id`、`actor_type`、`kind`，solver_label 作为 actor metadata。 |
++| A3 | P1 | §10.2-10.3 | query/replay 没有分页 cursor、时间边界、稳定排序、未知 format 行为和大结果限制。 | 增加 cursor/limit/from_seq/to_seq、最大 payload、JSON/JSONL schema。 |
++| A4 | P1 | §6.2、§6.5-6.7 | 模块职责重叠：state、views、replay、query 的边界不清；实现顺序却把 query/replay 放到最后，而 solver 接入依赖它们。 | 先确定领域层接口和依赖图，按 models→store→state→recorder→board API→adapters→views/query/replay 实施。 |
++| A5 | P0 | §13 | 测试没有并发 claim race、lease reclaim、事务崩溃、重复提交、损坏 DB、事件乱序、敏感数据、三种 solver 一致性测试。 | 增加单元、并发、故障注入、适配器和端到端测试矩阵。 |
++| A6 | P1 | §13、§14 | “solver 能正常结束”没有定义 no-intent、部分失败、flag 已解、coordinator 退出等结束条件。 | 写可执行验收场景和 expected event sequence。 |
++| A7 | P0 | §15 | 没有 rollout、数据迁移、灰度、回滚、feature flag 或运维 runbook；“默认唯一主链路”直接切换风险高。 | 采用可观测的双写/影子验证→小范围切换→全量切换；回滚时仍以同一 board 数据恢复，不恢复 findings 主状态。 |
++| A8 | P2 | §16 | 备注“记得住、查得到、回得来”是目标口号，未转换为可测的完整性、查询延迟和恢复 RTO/RPO。 | 加入指标定义，例如事件不丢失、重放结果一致、恢复时间上限。 |
++
++## 3. 需要双方对齐/确认的待办需求
++
++以下问题在没有答案前不应冻结代码接口。建议由产品/架构负责人逐项给出结论并记录到 ADR。
++
++### A. 迁移边界
++
++1. State 1 的准确入口、出口、终态和异常转移是什么？是否只有当前 CTF solve 场景？
++2. `muteki-main` 采用哪个 commit/API 版本？是否允许复制代码，还是只对齐语义？
++3. Stage 1 是否允许短期双写和影子校验？“唯一主链路”从哪个发布版本开始生效？
++4. Pydantic、Codex、Claude 三类 solver 是否同时迁移？Claude 没有 MCP 时使用什么 board 接口？
++5. 现有 quota fallback、solver bump、提交冷却、benchmark runner 是否必须完全保持行为？
++
++### B. 黑板和事件契约
++
++1. `event_id`、`run_id`、challenge 内顺序号和 trace index 的最终格式是什么？
++2. facts 是事件直接折叠出的临时状态，还是需要独立 `fact_id`/生命周期表？
++3. verified 的授权者和规则是什么？工具输出、solver 自报、coordinator 判断、人工确认分别是什么等级？
++4. provenance 原始输出保留多久、存 SQLite 还是文件/object store，哪些字段必须脱敏？
++5. 事实、意图、工具结果和 submission 之间允许哪些 link relation？是否允许跨 challenge 链接？
++6. `confidence` 是否由模型提供，还是由规则计算？如何防止低可信 hypothesis 被 summary 当成 fact？
++
++### C. Intent 与协作调度
++
++1. reason 是现有 coordinator 的一个阶段、独立 agent，还是新的服务？使用哪个模型和预算？
++2. 一个 worker 一次只能 claim 一个 intent 吗？是否允许 batch claim、转派、暂停和主动放弃？
++3. lease 多久、如何续租、进程崩溃多久后回收？旧 worker 的迟到写入如何被 fencing token 拒绝？
++4. intent 的优先级、依赖、重试上限、超时和完成判定是什么？
++5. 互斥事实、重复路线、并行访问同一 sandbox/service 时如何处理？MVP 是否需要最小 lane/resource lock？
++6. 无 open intent 时是由 reason 继续规划、等待事件，还是结束 challenge？
++
++### D. 兼容、恢复和运营
++
++1. 历史 JSONL/findings 是否导入；若不导入，回放起点从迁移发布时间还是 challenge start？
++2. 黑板 SQLite 是每 challenge 一个文件还是全局一个文件？备份、权限、容量和清理由谁负责？
++3. DB 不可写、迁移失败、事件 schema 非法时，系统 fail-closed 还是保留 trace 后继续？
++4. 运维需要哪些 CLI：board、timeline、replay、stale intent、repair、export、health check？
++5. solve rate/token/延迟/重复 intent/证据完整率的基线和门槛是多少？
++
++## 4. 建议采用的完整落地路径
++
++### Phase 0：冻结契约和基线
++
++1. 固定 muteki 参考版本，整理术语表和 State-1 状态机。
++2. 画出现有链路和目标链路，逐项标出保留、替换、适配、删除的函数/数据。
++3. 用当前 benchmark 记录 solve rate、步数、成本、耗时、失败类型、错误提交率和并发资源占用。
++4. 发布 ADR：事件 envelope、intent 状态机、verified/provenance 规则、故障策略、兼容窗口和安全策略。
++
++### Phase 1：Evidence foundation（不改变 solver 决策）
++
++1. 实现 `models.py`：版本化 `EvidenceEvent`、`Provenance`、`Link`、`Intent`，含字段校验和脱敏。
++2. 实现 SQLite store：完整 DDL、外键、索引、WAL/busy timeout、schema migration、事务和稳定排序。
++3. 采用 `event_id + idempotency_key`；source event 与 intent projection 在同一事务提交。
++4. 实现 state fold、query、replay 和 board snapshot；replay 后的 snapshot 必须可与在线 projection 做一致性校验。
++5. 在 tracer、submission、swarm lifecycle 处接入 recorder，先做双写；旧 JSONL 保留作为审计源。
++
++### Phase 2：建立 Worker 契约
++
++1. 在 `SolverDeps`/Codex/Claude 等价上下文注入 challenge-scoped `BoardContext`，包含 `board.read_summary`、`propose_intent`、`claim_intent`、`complete_intent`、`add_fact`、`add_hypothesis`、`add_dead_end`、`verify_flag`。
++2. tool wrapper 自动写 tool_call/tool_result，并绑定 trace_id、step、artifact；模型显式提交的结论才可进入对应事实 API。
++3. 扩展 solver 输出为 worker result（completed/blocked/failed/flag_found + produced event IDs），保持 `SolverResult` 外部兼容投影。
++4. 系统服务端检查 worker 身份和 lease，拒绝未认领 intent 的回写；complete、flag confirmation 必须幂等。
++
++### Phase 3：替换调度主链路
++
++1. `ChallengeSwarm` 初始化一个 challenge board 和 scheduler；reason/coordinator 只通过 board 产生 intent。
++2. worker 启动后先读 compact board summary，原子 claim 一个 intent，执行后回写结果并释放/完成 lease。
++3. coordinator loop 订阅 board 更新，按事件批量触发 reason，使用 backoff 防止空转；board 中的 flag_verified 触发统一取消和 challenge finish 事件。
++4. message bus 改成兼容通知适配器：读取 board summary、写入 `message_bus_compat` 事件；经过影子验证后删除其主状态依赖。
++5. 保留 `do_read_solver_trace` 作为调试/provenance 入口，`do_check_findings` 改为 board query 的兼容 wrapper。
++
++### Phase 4：恢复、观测和安全运营
++
++1. 实现 stale lease 扫描、reclaim、异常 intent 告警和重启续跑；启动时校验 schema 与 projection 一致性。
++2. 增加事件计数、写入失败、claim 冲突、lease 延迟、空闲 intent、replay 耗时、证据完整率等 metrics。
++3. 增加 board/timeline/replay/export/health/stale-intent CLI；限制大 payload 和敏感视图权限。
++4. 做数据库备份恢复、磁盘满、锁竞争、进程崩溃和网络故障演练。
++
++### Phase 5：验证与发布门禁
++
++发布必须同时通过：
++
++- schema/serialization/query/replay 单元测试；
++- 两个或以上并发 worker 的 claim race、lease expiry、迟到写入和重复 complete 测试；
++- Pydantic/Codex/Claude（实际纳入范围者）的统一 board contract 测试；
++- solver、coordinator、submission、benchmark 的端到端回归；
++- kill/restart 后 event 不丢、intent 可恢复、flag 状态一致；
++- 与 Phase 0 基线对比，solve rate 不下降超过约定阈值，成本/延迟/重复任务率在预算内；
++- provenance 可从 board event 定位到 trace/tool artifact，且 hypothesis 不会出现在 verified fact 查询中。
++
++## 5. 建议补入原计划的最小验收事件序列
++
++一个成功 intent 至少应能回放为：
++
++```text
++challenge_started
++intent_proposed
++intent_claimed
++tool_called / tool_result (可重复)
++fact_added 或 hypothesis_added 或 dead_end_added
++intent_completed
++submission_attempted / submission_result（如有）
++flag_verified
++challenge_finished
++```
++
++失败、取消、过期和重启场景应分别给出 expected sequence，且任意重复请求回放后只能得到一个逻辑结果。该序列应成为集成测试夹具和运维排障的共同依据。
++
++## 6. 对原计划的编辑建议
++
++建议保留原计划的目标、概念和模块方向，但在合并开发前完成以下编辑：
++
++- 在开头增加 State-1 定义、参考 muteki 版本和现状链路图；
++- 把 MVP 事件/视图与后置事件/视图彻底拆开，清理 state/views/query/replay 的职责重叠表述；
++- 统一 `kind/event_type/type`、`actor/solver_label`、`event_id/seq` 命名；
++- 将完整 DDL、状态机、API 返回/异常、幂等和 lease 语义作为规范，而不是“建议”；
++- 明确工具、solver、coordinator、submission 的实际写入点和身份校验；
++- 增加双写灰度、重启恢复、故障降级、安全脱敏、指标阈值和回滚 runbook；
++- 将本文“待确认”问题逐项关闭后，再把“黑板唯一主链路”写成最终承诺。
++
++在这些内容关闭前，原计划不宜直接进入大规模编码；最先可执行的交付应是 Phase 0 的契约/基线和 Phase 1 的可独立测试 evidence store。
+diff --git a/docs/rag_stage1_review_v2.md b/docs/rag_stage1_review_v2.md
+new file mode 100644
+index 0000000..6ec6680
+--- /dev/null
++++ b/docs/rag_stage1_review_v2.md
+@@ -0,0 +1,214 @@
++# RAG Stage 1 Review v2：最小可运行黑板主链路
++
++> 本文是 `docs/rag_stage1_review.md` 的执行版更新稿。目标是先把当前 CTF 求解场景完整跑通，不追求一次实现 Muteki 的全部高级能力。
++
++## 1. 先说结论
++
++Stage 1 只做一件事：把现在“每个 solver 自己从头解完整道题”的流程，改成“一个持久化黑板协调多个 Codex worker”的流程。
++
++必须具备的闭环只有：
++
++```text
++开始题目 -> 黑板记录 -> coordinator 拆任务 -> Codex worker 认领任务
++-> 使用现有 sandbox/tools -> 把结果写回黑板 -> coordinator 继续拆任务
++-> CTFd 确认 flag -> 结束题目
++```
++
++本阶段不实现：向量 RAG、routes/branches、PoC 生命周期、事实审核/合并、资源锁、人工介入、复杂 trust level、UI 和自动知识总结。
++
++## 2. 当前问题（大白话）
++
++1. 现在的 `ChallengeSwarm` 会让每个 solver 各自解整道题，大家不是在分工，而是在重复比赛。
++2. `findings` 和 `ChallengeMessageBus` 只是进程内字符串消息，程序重启后就没了，也不能可靠区分“事实”和“猜测”。
++3. JSONL trace 只能回答“做过什么”，不能回答“下一步任务是什么、谁负责、任务是否完成”。
++4. 当前 solver 的输出协议主要只有 `flag_found`，没有“我领取了哪个任务”“我发现了什么”“这条路走不通”等正式回写入口。
++5. 当前 coordinator 能读 trace 和发消息，但没有一个持久化的共享状态可供它持续规划。
++
++所以，单纯新增一个 evidence 目录或把日志写进 SQLite 不够；必须同时补上最小的任务认领和 worker 循环。
++
++## 3. 已确定的范围
++
++- “state 1”统一称为 **Stage 1**，不是额外的运行状态编号。
++- 只支持当前 CTF 解题业务，不扩展其他业务场景。
++- 只保留 Codex solver 实现；Pydantic/Claude 不属于本阶段交付。
++- Muteki 只做语义参考，必要时复制少量实现；以简单、稳定、最小侵入为准。
++- Muteki 参考源码目录：`/home/mengshancha/muteki-main`，主要参考 `muteki/swarm/shared_graph.py` 的事件追加、SQLite WAL 和原子 Intent claim 语义。
++- 黑板从当前版本开始是唯一主状态。
++- 继续保留 sandbox、动态工具、trace、flag 提交确认、成本/步数统计和必要的 quota fallback。
++- 旧 findings/message bus 不再作为事实来源；最多在开发测试阶段做短期对比。
++
++## 4. MVP 黑板定义
++
++### 4.1 事件
++
++所有状态都由 append-only `events` 事件产生。MVP 只实现这些事件：
++
++| 事件 | 含义 |
++| --- | --- |
++| `challenge_started` / `challenge_finished` | 题目生命周期 |
++| `intent_proposed` | coordinator 提出一个具体任务 |
++| `intent_claimed` | 一个 worker 原子领取任务 |
++| `intent_completed` | worker 完成、失败或阻塞任务 |
++| `tool_call` / `tool_result` | 工具调用及结果索引 |
++| `fact_added` | 有真实输出支撑的事实 |
++| `hypothesis_added` | 尚未证实的猜测 |
++| `dead_end_added` | 已确认不可行的方向 |
++| `submission_result` / `flag_verified` | 提交结果及正确 flag 确认 |
++
++事件统一字段：`event_id`、`schema_version`、`ts`、`challenge_name`、`run_id`、`actor_id`、`actor_type`、`kind`、`payload`、`provenance`、`dedupe_key`。
++
++### 4.2 `verified` 的简单规则
++
++MVP 只有二值标记：
++
++- `verified=true`：命令真实输出、文件内容、服务响应或 CTFd 返回值直接证明；
++- `verified=false`：solver 的推测、未复现实验、自然语言判断。
++
++未经证明的内容只能写入 `hypothesis_added`，不能被 board summary 当作事实提供给后续规划。无需引入 Muteki 之外的多级信任系统。
++
++### 4.3 Intent
++
++Intent 是一条可执行的小任务，而不是“解决整道题”。最小字段：
++
++`intent_id`、`challenge_name`、`goal`、`acceptance`、`status`、`worker_id`、`lease_until`、`attempt`、`created_event_id`、`result_event_id`。
++
++状态只保留：
++
++```text
++open -> claimed -> completed
++                 -> failed
++                 -> blocked
++claimed -> open   (lease 过期回收)
++```
++
++同一时刻只能有一个有效 worker。完成、失败、回收都必须幂等。
++
++## 5. 最小实现架构
++
++### 5.1 `backend/evidence/`
++
++只需要以下模块：
++
++- `models.py`：事件、provenance、intent、board snapshot 类型；
++- `store.py`：SQLite schema、事务、幂等、原子 claim；
++- `board.py`：面向 coordinator/worker 的读写 API；
++- `state.py`：从事件折叠出 facts、hypotheses、dead ends、intents、flag；
++- `query.py`：按 challenge 查询和导出；
++- `replay.py`：按顺序重放事件并重建 snapshot。
++
++不单独实现复杂的 routes/branches/pocs/reviews/locks 投影。
++
++### 5.2 SQLite
++
++MVP 使用一个全局 SQLite 文件，按 `challenge_name` 和 `run_id` 隔离数据：
++
++- `events`：唯一事实来源；
++- `intents`：当前可快速 claim 的投影；
++- `event_links`：事件之间的 `supports`、`derived_from`、`for_intent` 关系。
++
++启用 WAL、外键、busy timeout 和 schema migration。所有写入都在事务中完成；事件和 intent 投影必须同事务提交。原始工具大输出保存在 trace/artifact 路径，事件只保留 excerpt、路径和 hash。
++
++### 5.3 Codex worker
++
++在 `CodexSolver` 上增加 board context 和以下最小操作：
++
++1. `read_board_summary()`；
++2. `list_open_intents()`；
++3. `claim_intent(intent_id)`；
++4. 使用现有 sandbox/tools 执行；
++5. `add_fact` / `add_hypothesis` / `add_dead_end`；
++6. `complete_intent(result)`；
++7. 通过现有 submit 逻辑提交 flag，确认后写 `flag_verified`。
++
++worker 不能执行未领取的 intent。tool wrapper 自动记录 `tool_call/tool_result` 并关联现有 trace index；结论由 worker 显式提交，不能靠字符串 findings 猜测生成。
++
++### 5.4 Coordinator / reason
++
++不新增一套复杂 agent。直接把现有 Codex coordinator 的“读消息、看 trace、决定下一步”改成：
++
++1. 读取 board summary；
++2. 生成一个或多个 `intent_proposed`；
++3. 根据 `intent_completed`、新事实和死路继续规划；
++4. 看到 `flag_verified` 后结束 challenge。
++
++这里的 reason 只是 coordinator 的规划职责，不是另一个必须单独部署的组件。
++
++### 5.5 Swarm 与兼容层
++
++`ChallengeSwarm` 仍负责 sandbox、solver 生命周期、取消、提交锁和成本汇总，但调度改为 worker pool：每个 Codex 实例循环领取 intent，而不是启动后直接独立解完整题。
++
++`message_bus` 暂时保留类型和兼容调用，内部改为读取 board summary；切换完成后删除 `findings` 字典的主状态职责。`do_read_solver_trace` 保留为调试和 provenance 查询。
++
++## 6. 默认参数（实现侧直接决定）
++
++| 参数 | 默认值 |
++| --- | --- |
++| `evidence_db_path` | `logs/evidence.sqlite3` |
++| worker lease | 300 秒 |
++| lease heartbeat | 60 秒 |
++| intent 最大尝试 | 3 次 |
++| 单次 board summary | 只返回当前 facts、hypotheses、dead ends、active intents，限制长度 |
++| 事件幂等 | 调用方 key；缺省使用稳定 payload 指纹 |
++| SQLite | WAL + foreign keys + busy timeout 5 秒 |
++| Codex solver replicas | 默认 3，硬上限 3（可用配置降到 1 或 2） |
++
++这些参数不需要业务侧逐项确认；实现后可通过 `Settings` 覆盖。
++
++## 7. 实施顺序
++
++1. 定义 models 和事件 JSON schema；
++2. 完成 SQLite store、migration、幂等写入和原子 claim；
++3. 完成 state fold、board summary、query/replay；
++4. 在 Codex tool wrapper、trace、submission 处接 recorder；
++5. 改造 `CodexSolver` 为 intent worker；
++6. 改造 `ChallengeSwarm` 和现有 Codex coordinator 调度；
++7. 将 message bus 降级为兼容适配层；
++8. 开发阶段跑少量旧 findings 对比，验收后只保留黑板主链路；
++9. 补齐重启恢复、stale lease 回收和 benchmark 回归。
++
++## 8. 验收标准
++
++最小成功案例必须能产生并回放：
++
++```text
++challenge_started
++intent_proposed
++intent_claimed
++tool_call / tool_result
++fact_added 或 hypothesis_added 或 dead_end_added
++intent_completed
++submission_result
++flag_verified
++challenge_finished
++```
++
++同时满足：
++
++- 两个 Codex worker 并发 claim 同一 intent 时只有一个成功；
++- worker 崩溃后 lease 到期，任务可被重新领取；
++- 重启后 board snapshot 与重放结果一致；
++- verified fact、hypothesis、dead end 能分别查询；
++- 任一 board 事件能定位到 trace/tool artifact；
++- flag 确认后其他 worker 能被取消且状态不产生半写入；
++- benchmark 仍能得到原有 `SolverResult` 字段；
++- 不依赖 `ChallengeSwarm.findings` 才能继续求解。
++
++## 9. 仍需对齐的内容（仅保留真正必要项）
++
++目前没有阻塞实现的参数问题。只需在开始编码前确认两件事：
++
++1. Muteki 参考代码的实际仓库/目录是否可以提供；若没有，直接按本文语义实现，不等待源码。
++2. 是否临时将 replicas 降到 1 或 2；默认按 3 个 Codex worker 实现，硬上限为 3。
++
++除此之外，事件字段、lease、重试、SQLite schema、兼容窗口和测试门槛由实现侧按本文确定，不再增加业务对接负担。
++
++## 10. 本版与旧版的主要变化
++
++- 把“state 1”纠正为 Stage 1；
++- 将三类 solver 缩减为 Codex；
++- 将 Muteki 高级对象从 MVP 移除；
++- 用一个简单二值 `verified` 替代复杂信任等级；
++- 明确 coordinator/reason 是同一规划职责；
++- 明确必须改造 swarm/solver 调度，不能只增加日志；
++- 将双写限定为开发测试手段，不作为生产架构；
++- 将验收重点收敛到“能分工、能回写、能恢复、能确认 flag”。
+diff --git a/scripts/save_worktree_diff.sh b/scripts/save_worktree_diff.sh
+new file mode 100755
+index 0000000..fc88d05
+--- /dev/null
++++ b/scripts/save_worktree_diff.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++repo_root="$(git rev-parse --show-toplevel)"
++cd "$repo_root"
++
++output_dir="$repo_root/.codex-diffs"
++mkdir -p "$output_dir"
++
++timestamp="$(date +%Y%m%d-%H%M%S-%N)"
++output_file="$output_dir/worktree-$timestamp.diff"
++
++{
++    printf '# Worktree diff snapshot generated at %s\n' "$(date --iso-8601=seconds)"
++    printf '# Includes tracked changes and non-ignored untracked files.\n\n'
++    git diff --binary
++
++    while IFS= read -r -d '' file; do
++        git diff --no-index --binary /dev/null "$file" || true
++    done < <(git ls-files --others --exclude-standard -z)
++} > "$output_file"
++
++printf '%s\n' "$output_file"
+diff --git a/tests/test_evidence.py b/tests/test_evidence.py
+new file mode 100644
+index 0000000..0552879
+--- /dev/null
++++ b/tests/test_evidence.py
+@@ -0,0 +1,107 @@
++from __future__ import annotations
++
++import threading
++import time
++
++from backend.evidence import EvidenceBoard
++from backend.evidence.store import SQLiteEvidenceStore
++
++
++def test_board_persists_and_replays(tmp_path) -> None:
++    path = tmp_path / "evidence.sqlite3"
++    board = EvidenceBoard.open(path, "demo", "run-1")
++    board.start()
++    intent = board.propose("coordinator", "inspect files")
++    claimed = board.claim("codex-1", intent.intent_id, lease_seconds=30)
++    assert claimed and claimed.worker_id == "codex-1"
++    assert board.claim("codex-1", intent.intent_id).attempt == claimed.attempt
++    fact = board.add_fact(
++        "codex-1", "service 80 is open", verified=True,
++        provenance={"source_kind": "trace", "trace_event_index": 3},
++    )
++    completed = board.complete("codex-1", intent.intent_id, "completed", produced_event_ids=[fact.event_id])
++    assert completed and board.complete("codex-1", intent.intent_id, "completed") == completed
++    board.close()
++
++    reopened = EvidenceBoard.open(path, "demo", "run-1")
++    snapshot = reopened.snapshot()
++    assert snapshot.last_seq >= 5
++    assert snapshot.facts[0].payload["fact"] == "service 80 is open"
++    assert snapshot.facts[0].schema_version == 1
++    assert snapshot.intents[0].status == "completed"
++    reopened.close()
++
++
++def test_open_resumes_only_an_unfinished_run(tmp_path) -> None:
++    path = tmp_path / "evidence.sqlite3"
++    finished = EvidenceBoard.open(path, "demo", "finished-run")
++    finished.start()
++    finished.finish(reason="workers_exhausted")
++    finished.close()
++
++    fresh = EvidenceBoard.open(path, "demo")
++    assert fresh.run_id != "finished-run"
++    fresh.start()
++    resumed = EvidenceBoard.open(path, "demo")
++    assert resumed.run_id == fresh.run_id
++    resumed.close()
++    fresh.close()
++
++
++def test_claim_is_single_winner(tmp_path) -> None:
++    board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
++    intent = board.propose("coordinator", "one task")
++    wins: list[bool] = []
++
++    def claim(worker: str) -> None:
++        wins.append(board.claim(worker, intent.intent_id) is not None)
++
++    threads = [threading.Thread(target=claim, args=(f"codex-{i}",)) for i in range(3)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++    assert sum(wins) == 1
++    board.close()
++
++
++def test_expired_lease_can_be_reclaimed(tmp_path) -> None:
++    board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
++    intent = board.propose("coordinator", "reclaim me")
++    assert board.claim("codex-1", intent.intent_id, lease_seconds=1)
++    time.sleep(1.05)
++    reclaimed = board.claim("codex-2", intent.intent_id, lease_seconds=30)
++    assert reclaimed and reclaimed.worker_id == "codex-2"
++    board.close()
++
++
++def test_stale_worker_cannot_complete_reclaimed_intent(tmp_path) -> None:
++    board = EvidenceBoard.open(tmp_path / "evidence.sqlite3", "demo", "run-1")
++    intent = board.propose("coordinator", "fenced task")
++    assert board.claim("codex-1", intent.intent_id, lease_seconds=1)
++    time.sleep(1.05)
++    assert board.claim("codex-2", intent.intent_id, lease_seconds=30)
++    assert board.complete("codex-1", intent.intent_id, "stale") is None
++    current = board.store.list_intents("demo", "run-1", active_only=False)[0]
++    assert current.status == "claimed"
++    assert current.worker_id == "codex-2"
++    assert not any(
++        event.kind == "intent_completed"
++        for event in board.store.events("demo", "run-1")
++    )
++    board.close()
++
++
++def test_deduped_events_do_not_duplicate(tmp_path) -> None:
++    store = SQLiteEvidenceStore(tmp_path / "evidence.sqlite3")
++    first = store.append_event(
++        challenge_name="demo", run_id="run-1", actor_id="codex-1", actor_type="worker",
++        kind="fact_added", payload={"fact": "same"}, dedupe_key="same-event",
++    )
++    second = store.append_event(
++        challenge_name="demo", run_id="run-1", actor_id="codex-1", actor_type="worker",
++        kind="fact_added", payload={"fact": "same"}, dedupe_key="same-event",
++    )
++    assert first.event_id == second.event_id
++    assert len(store.events("demo", "run-1")) == 1
++    store.close()

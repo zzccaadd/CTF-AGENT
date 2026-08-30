@@ -106,6 +106,40 @@ async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> s
     return json.dumps(swarm.get_status(), indent=2)
 
 
+async def do_read_blackboard(deps: CoordinatorDeps, challenge_name: str) -> str:
+    swarm = deps.swarms.get(challenge_name)
+    if not swarm or not swarm.evidence_board:
+        return f"No blackboard running for {challenge_name}"
+    return swarm.evidence_board.read_board_summary()
+
+
+async def do_list_blackboard_intents(deps: CoordinatorDeps, challenge_name: str) -> str:
+    swarm = deps.swarms.get(challenge_name)
+    if not swarm or not swarm.evidence_board:
+        return f"No blackboard running for {challenge_name}"
+    intents = swarm.evidence_board.store.list_intents(
+        challenge_name, swarm.run_id, active_only=False
+    )
+    return json.dumps([intent.__dict__ for intent in intents], indent=2)
+
+
+async def do_propose_intent(
+    deps: CoordinatorDeps,
+    challenge_name: str,
+    goal: str,
+    acceptance: str = "",
+) -> str:
+    swarm = deps.swarms.get(challenge_name)
+    if not swarm or not swarm.evidence_board:
+        return f"No blackboard running for {challenge_name}"
+    if not goal.strip():
+        return "Intent goal cannot be empty"
+    intent = swarm.evidence_board.propose(
+        "coordinator", goal[:2000], acceptance[:2000]
+    )
+    return json.dumps(intent.__dict__, indent=2)
+
+
 async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
     if deps.no_submit:
         return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'

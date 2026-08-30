@@ -39,7 +39,7 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--coordinator-model", default=None, help="Model for coordinator (default: gpt-5.4-mini)")
 @click.option("--coordinator", default="codex", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
-@click.option("--solvers-per-swarm", default=1, type=click.IntRange(min=1, max=5), help="Single-model solver replicas per challenge")
+@click.option("--solvers-per-swarm", default=3, type=click.IntRange(min=1, max=3), help="Codex workers per challenge (max 3)")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(

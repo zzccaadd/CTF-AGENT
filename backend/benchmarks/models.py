@@ -15,8 +15,8 @@ class BenchmarkLimits:
     allow_internet: bool = False
     attempts: int = 1
     concurrency: int = 1
-    solvers_per_swarm: int = 1
-    max_solvers_per_swarm: int = 5
+    solvers_per_swarm: int = 3
+    max_solvers_per_swarm: int = 3
 
 
 @dataclass(frozen=True)

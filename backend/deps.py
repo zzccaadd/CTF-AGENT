@@ -35,6 +35,8 @@ class SolverDeps:
     no_submit: bool = False
     allow_internet: bool = True
     notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
+    evidence_board: Any | None = None
+    intent_id: str | None = None
 
 
 @dataclass
@@ -43,8 +45,8 @@ class CoordinatorDeps:
     cost_tracker: CostTracker
     settings: Any
     model_specs: list[str] = field(default_factory=list)
-    solvers_per_swarm: int = 1
-    max_solvers_per_swarm: int = 5
+    solvers_per_swarm: int = 3
+    max_solvers_per_swarm: int = 3
     challenges_root: str = "challenges"
     no_submit: bool = False
     max_concurrent_challenges: int = 10

@@ -21,6 +21,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from backend.cost_tracker import CostTracker
+from backend.evidence import EvidenceBoard
 from backend.loop_detect import LoopDetector
 from backend.models import model_id_from_spec, supports_vision
 from backend.output_types import solver_output_json_schema
@@ -127,6 +128,41 @@ SANDBOX_TOOLS = [
         "description": "Send a strategic message to the coordinator (e.g. flag format discovery, shared vulnerability, request for help).",
         "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]},
     },
+    {
+        "name": "blackboard_summary",
+        "description": "Read the current shared blackboard summary for this challenge.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "blackboard_intents",
+        "description": "List active shared-blackboard intents and their owners.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "blackboard_claim",
+        "description": "Claim one open shared-blackboard intent before doing work.",
+        "inputSchema": {"type": "object", "properties": {"intent_id": {"type": "string"}}, "required": ["intent_id"]},
+    },
+    {
+        "name": "blackboard_complete",
+        "description": "Complete the currently claimed intent with a result.",
+        "inputSchema": {"type": "object", "properties": {"result": {"type": "string"}, "status": {"type": "string"}}, "required": ["result"]},
+    },
+    {
+        "name": "blackboard_fact",
+        "description": "Record a concise fact observed in real tool output.",
+        "inputSchema": {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]},
+    },
+    {
+        "name": "blackboard_hypothesis",
+        "description": "Record an unverified hypothesis for other workers.",
+        "inputSchema": {"type": "object", "properties": {"hypothesis": {"type": "string"}}, "required": ["hypothesis"]},
+    },
+    {
+        "name": "blackboard_dead_end",
+        "description": "Record a route that real testing ruled out.",
+        "inputSchema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
+    },
 ]
 
 INTERNET_TOOL_NAMES = {"web_fetch", "webhook_create", "webhook_get_requests"}
@@ -155,10 +191,15 @@ class CodexSolver:
         message_bus=None,
         notify_coordinator=None,
         solver_label: str | None = None,
+        evidence_board: EvidenceBoard | None = None,
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
         self.solver_label = solver_label or model_spec
+        self.evidence_board = evidence_board
+        self.intent_id: str | None = None
+        self._intent_goal = ""
+        self._intent_acceptance = ""
         self.challenge_dir = challenge_dir
         self.meta = meta
         self.message_bus = message_bus
@@ -190,6 +231,8 @@ class CodexSolver:
         self._flag: str | None = None
         self._confirmed = False
         self._findings = ""
+        self._last_tool_output = ""
+        self._last_tool_was_external = False
         self._cost_usd = 0.0
         self._bump_insights: str | None = None
         self._structured_output: dict | None = None
@@ -197,6 +240,8 @@ class CodexSolver:
         self._compact_requested = False
         self._pending_responses: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._intent_heartbeat_task: asyncio.Task | None = None
+        self._intent_lease_seconds = 300
         self._turn_done: asyncio.Event = asyncio.Event()
         self._total_tokens = 0
         self._token_budget_exhausted = False
@@ -460,13 +505,32 @@ class CodexSolver:
 
         self._step_count += 1
         self.tracer.tool_call(tool_name, args, self._step_count)
+        if self.evidence_board:
+            event_args = {
+                key: (value[:2000] if isinstance(value, str) else value)
+                for key, value in args.items()
+            }
+            self.evidence_board.record(
+                self.solver_label,
+                "worker",
+                "tool_call",
+                {"tool": tool_name, "args": event_args, "step": self._step_count, "intent_id": self.intent_id or ""},
+                provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
+                dedupe_key=f"tool-call:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
+            )
 
         loop_status = self.loop_detector.check(tool_name, args)
+        success = True
         if loop_status == "break":
             self.tracer.event("loop_break", tool=tool_name, step=self._step_count)
             result = "Loop detected — try a completely different approach."
         else:
-            result = await self._exec_tool(tool_name, args)
+            try:
+                result = await self._exec_tool(tool_name, args)
+            except Exception as exc:
+                logger.exception("[%s] Tool %s failed", self.agent_name, tool_name)
+                result = f"Tool error: {exc}"
+                success = False
             if loop_status == "warn" and isinstance(result, str):
                 from backend.loop_detect import LOOP_WARNING_MESSAGE
                 result = f"{result}\n\n{LOOP_WARNING_MESSAGE}"
@@ -476,10 +540,36 @@ class CodexSolver:
             image_bytes, mime_type = result
             data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
             content_items = [{"type": "inputImage", "imageUrl": data_url}]
-            self.tracer.tool_result(tool_name, f"image:{mime_type}:{len(image_bytes)}b", self._step_count)
+            image_summary = f"image:{mime_type}:{len(image_bytes)}b"
+            self._last_tool_output = image_summary
+            self._last_tool_was_external = True
+            self.tracer.tool_result(tool_name, image_summary, self._step_count)
+            if self.evidence_board:
+                self.evidence_board.record(
+                    self.solver_label,
+                    "worker",
+                    "tool_result",
+                    {"tool": tool_name, "step": self._step_count, "result": image_summary, "intent_id": self.intent_id or ""},
+                    provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
+                    dedupe_key=f"tool:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
+                )
         else:
             result_text = str(result)
+            self._last_tool_output = result_text
+            self._last_tool_was_external = tool_name not in {
+                "blackboard_summary", "blackboard_intents", "blackboard_claim", "blackboard_complete",
+                "blackboard_fact", "blackboard_hypothesis", "blackboard_dead_end",
+            }
             self.tracer.tool_result(tool_name, result_text[:500], self._step_count)
+            if self.evidence_board:
+                self.evidence_board.record(
+                    self.solver_label,
+                    "worker",
+                    "tool_result",
+                    {"tool": tool_name, "step": self._step_count, "result": result_text[:2000], "intent_id": self.intent_id or ""},
+                    provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
+                    dedupe_key=f"tool:{self.meta.name}:{self.evidence_board.run_id if self.evidence_board else self.tracer.path}:{self.solver_label}:{self._step_count}",
+                )
 
             if self._step_count % 5 == 0 and self.message_bus:
                 from backend.tools.core import do_check_findings
@@ -491,10 +581,91 @@ class CodexSolver:
 
         await self._respond_to_request(request_id, {
             "contentItems": content_items,
-            "success": True,
+            "success": success,
         })
 
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
+        if name == "blackboard_summary":
+            return self.evidence_board.summary() if self.evidence_board else "No shared blackboard available."
+        elif name == "blackboard_intents":
+            if not self.evidence_board:
+                return "No shared blackboard available."
+            return json.dumps(
+                [intent.__dict__ for intent in self.evidence_board.list_open_intents()],
+                ensure_ascii=False,
+                indent=2,
+            )
+        elif name == "blackboard_claim":
+            if not self.evidence_board:
+                return "No shared blackboard available."
+            requested = str(args.get("intent_id", ""))
+            if self.intent_id and requested != self.intent_id:
+                return f"Already assigned to intent {self.intent_id}. Complete it before claiming another."
+            claimed = self.evidence_board.claim(
+                self.solver_label,
+                requested,
+                int(getattr(self.settings, "blackboard_default_worker_lease_seconds", 300)),
+                int(getattr(self.settings, "blackboard_intent_max_attempts", 3)),
+            )
+            if not claimed:
+                return "Intent is unavailable or has reached its attempt limit."
+            self.intent_id = claimed.intent_id
+            self._intent_goal = claimed.goal
+            self._intent_acceptance = claimed.acceptance
+            if not self._intent_heartbeat_task:
+                self._intent_heartbeat_task = asyncio.create_task(self._intent_heartbeat())
+            return json.dumps(claimed.__dict__, ensure_ascii=False)
+        elif name == "blackboard_complete":
+            if not self.evidence_board or not self.intent_id:
+                return "No intent is currently claimed."
+            status = str(args.get("status", "completed"))
+            result = str(args.get("result", ""))[:2000]
+            completed_id = self.intent_id
+            self._complete_current_intent(result, status=status)
+            return f"Completed intent {completed_id} with status {status}."
+        elif name == "blackboard_fact":
+            if not self.evidence_board:
+                return "No shared blackboard available."
+            if not self.intent_id:
+                return "No intent is claimed. Claim an intent before recording evidence."
+            fact = str(args.get("fact", ""))[:2000]
+            verified = bool(self._last_tool_was_external and fact and fact in self._last_tool_output)
+            event = self.evidence_board.add_fact(
+                self.solver_label,
+                fact,
+                verified=verified,
+                provenance={
+                    "source_kind": "trace" if verified else "worker_explicit",
+                    "trace_path": self.tracer.path,
+                    "source_excerpt": self._last_tool_output[:500],
+                },
+                intent_id=self.intent_id,
+            )
+            label = "verified fact" if verified else "unverified candidate"
+            return f"Recorded {label} event {event.event_id}."
+        elif name == "blackboard_hypothesis":
+            if not self.evidence_board:
+                return "No shared blackboard available."
+            if not self.intent_id:
+                return "No intent is claimed. Claim an intent before recording a hypothesis."
+            event = self.evidence_board.add_hypothesis(
+                self.solver_label, str(args.get("hypothesis", ""))[:2000], intent_id=self.intent_id
+            )
+            return f"Recorded hypothesis event {event.event_id}."
+        elif name == "blackboard_dead_end":
+            if not self.evidence_board:
+                return "No shared blackboard available."
+            if not self.intent_id:
+                return "No intent is claimed. Claim an intent before recording a dead end."
+            event = self.evidence_board.add_dead_end(
+                self.solver_label, str(args.get("reason", ""))[:2000], intent_id=self.intent_id
+            )
+            return f"Recorded dead-end event {event.event_id}."
+        if self.evidence_board and not self.intent_id and name in {
+            "bash", "read_file", "write_file", "list_files", "submit_flag",
+            "web_fetch", "webhook_create", "webhook_get_requests", "view_image",
+        }:
+            return "No intent is claimed. Claim an intent before using solver tools."
         if name == "bash":
             return await do_bash(self.sandbox, args.get("command", ""), args.get("timeout_seconds", 60))
         elif name == "read_file":
@@ -537,12 +708,68 @@ class CodexSolver:
             return "No coordinator connected."
         return f"Unknown tool: {name}"
 
+    def _claim_next_intent(self) -> str:
+        if not self.evidence_board:
+            return ""
+        if self.intent_id:
+            return self.intent_id
+        for intent in self.evidence_board.open_intents():
+            claimed = self.evidence_board.claim(
+                self.solver_label,
+                intent.intent_id,
+                int(getattr(self.settings, "blackboard_default_worker_lease_seconds", 300)),
+                int(getattr(self.settings, "blackboard_intent_max_attempts", 3)),
+            )
+            if claimed:
+                self.intent_id = claimed.intent_id
+                self._intent_goal = claimed.goal
+                self._intent_acceptance = claimed.acceptance
+                self._intent_lease_seconds = int(
+                    getattr(self.settings, "blackboard_default_worker_lease_seconds", 300)
+                )
+                self._intent_heartbeat_task = asyncio.create_task(self._intent_heartbeat())
+                return self.intent_id
+        return ""
+
+    async def _intent_heartbeat(self) -> None:
+        """Keep a claimed intent leased while a long Codex turn is running."""
+        while self.evidence_board and self.intent_id:
+            try:
+                await asyncio.sleep(max(1, min(60, self._intent_lease_seconds // 3)))
+            except asyncio.CancelledError:
+                return
+            if self.intent_id:
+                self.evidence_board.store.heartbeat(
+                    intent_id=self.intent_id,
+                    worker_id=self.solver_label,
+                    lease_seconds=self._intent_lease_seconds,
+                )
+
+    def _complete_current_intent(self, result: str, status: str = "completed") -> None:
+        if self.evidence_board and self.intent_id:
+            self.evidence_board.complete(self.solver_label, self.intent_id, result, status=status)
+            self.intent_id = None
+            self._intent_goal = ""
+            self._intent_acceptance = ""
+            if self._intent_heartbeat_task:
+                self._intent_heartbeat_task.cancel()
+                self._intent_heartbeat_task = None
+
     async def run_until_done_or_gave_up(self) -> SolverResult:
         if not self._proc:
             await self.start()
         assert self._thread_id
 
         t0 = time.monotonic()
+        intent_id = self._claim_next_intent() if self.evidence_board else ""
+        if self.evidence_board and not intent_id:
+            return self._result(GAVE_UP)
+        task_context = ""
+        if self.evidence_board:
+            board_context = self.evidence_board.summary()
+            task_context = f"\n\nYour assigned shared-blackboard task (intent {intent_id}): {self._intent_goal}\n"
+            task_context += f"Acceptance: {self._intent_acceptance}\n"
+            task_context += f"\nCurrent blackboard:\n{board_context}\n"
         if self._bump_insights:
             prompt_text = (
                 "Your previous attempt did not find the flag. "
@@ -551,9 +778,16 @@ class CodexSolver:
             )
             self._bump_insights = None
         elif self._step_count == 0:
-            prompt_text = "Solve this CTF challenge."
+            prompt_text = (
+                "Work only on your assigned intent. Use the blackboard tools to record facts, hypotheses, and dead ends."
+                if self.evidence_board else "Solve this CTF challenge."
+            )
         else:
-            prompt_text = "Continue solving. Try a different approach."
+            prompt_text = (
+                "Continue your assigned intent and record the result on the blackboard."
+                if self.evidence_board else "Continue solving."
+            )
+        prompt_text += task_context
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -574,6 +808,7 @@ class CodexSolver:
 
                 if self._token_budget_exhausted:
                     self._findings = f"Token budget exhausted at {self._total_tokens} tokens."
+                    self._complete_current_intent(self._findings, "blocked")
                     return self._result(CANCELLED)
 
                 if self._turn_error:
@@ -581,6 +816,7 @@ class CodexSolver:
                     # Context overflow is terminal — don't fallback, just error
                     if "context_length" in err or "context window" in err:
                         self._findings = f"Turn failed: {self._turn_error}"
+                        self._complete_current_intent(self._findings, "failed")
                         return self._result(ERROR)
                     if self._is_transient_turn_error(err):
                         if attempt < max_attempts:
@@ -602,11 +838,14 @@ class CodexSolver:
                             await asyncio.sleep(delay)
                             continue
                         self._findings = f"Turn failed: {self._turn_error}"
+                        self._complete_current_intent(self._findings, "failed")
                         return self._result(ERROR)
                     if any(k in err for k in ("quota", "rate", "capacity", "usage")):
                         self._findings = f"Turn failed: {self._turn_error}"
+                        self._complete_current_intent(self._findings, "failed")
                         return self._result(QUOTA_ERROR)
                     self._findings = f"Turn failed: {self._turn_error}"
+                    self._complete_current_intent(self._findings, "failed")
                     return self._result(ERROR)
 
                 if self._structured_output and self._structured_output.get("type") == "flag_found":
@@ -616,10 +855,13 @@ class CodexSolver:
                         self._confirmed = True
 
                 if self._confirmed and self._flag:
+                    self._complete_current_intent("flag verified", "completed")
                     return self._result(FLAG_FOUND)
+                self._complete_current_intent(self._findings or "intent completed", "completed")
                 return self._result(GAVE_UP)
 
             except asyncio.CancelledError:
+                self._complete_current_intent("worker cancelled", "blocked")
                 return self._result(CANCELLED)
             except Exception as e:
                 error_str = str(e)
@@ -645,7 +887,9 @@ class CodexSolver:
                     continue
                 self._findings = f"Error: {e}"
                 if "quota" in error_str.lower() or "rate" in error_str.lower():
+                    self._complete_current_intent(self._findings, "failed")
                     return self._result(QUOTA_ERROR)
+                self._complete_current_intent(self._findings, "failed")
                 return self._result(ERROR)
 
     def bump(self, insights: str) -> None:
@@ -663,6 +907,9 @@ class CodexSolver:
         )
 
     async def stop(self) -> None:
+        if self._intent_heartbeat_task:
+            self._intent_heartbeat_task.cancel()
+            self._intent_heartbeat_task = None
         self.tracer.event("stop", step_count=self._step_count)
         self.tracer.close()
         if self._reader_task:
