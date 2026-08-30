@@ -9,7 +9,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class BenchmarkLimits:
-    model: str = "codex/gpt-5.6-luna"
+    model: str = "codex/gpt-5.5"
     timeout_seconds: int = 1_800
     max_tokens: int = 1_000_000
     allow_internet: bool = False
@@ -17,6 +17,8 @@ class BenchmarkLimits:
     concurrency: int = 1
     solvers_per_swarm: int = 3
     max_solvers_per_swarm: int = 3
+    rag_enabled: bool = True
+    knowledge_db_path: str = "logs/knowledge.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,9 @@ class BenchmarkResult:
     tool_calls: int
     trace_path: str
     error: str = ""
+    knowledge_queries: int = 0
+    knowledge_hits: int = 0
+    knowledge_chars: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

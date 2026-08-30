@@ -223,5 +223,13 @@ challenge_finished
 - 基于事实、假设、死路和完成结果的动态 follow-up 规划；
 - message bus 兼容适配、事件 provenance、verified gate、最大尝试次数和自动 blocked；
 - state fold、query、replay 模块及回归测试。
+- 重启时继续使用未占用的 follow-up intent 编号，避免重复任务 ID；
+- 事件重放完全基于 append-only events，不依赖 intents 投影表；自定义 dedupe key 按 challenge/run 隔离，并兼容读取旧版未加作用域的事件；
+- Pydantic API 兜底 solver 也会认领 intent、续租、记录 tool_call/tool_result 并完成任务；租约失效后旧 worker 会停止继续执行操作工具；
+- board summary 有 item 数量和字符数双重上限，避免长结果挤爆模型上下文。
 
-当前未执行的只有真实 Codex 进程、Docker sandbox 和 CTFd 的端到端联调；这不影响本地单元测试和静态校验结果。
+本地 benchmark/smoke 路径使用 `LocalFlagVerifier`，不会连接 CTFd；`backend/ctfd.py`、`poller.py` 和旧 coordinator 入口仍保留给在线 `ctf-solve` 兼容链路。当前未执行的只有真实 Codex 进程、Docker sandbox 和 CTFd 的在线端到端联调；这不影响本地单元测试和静态校验结果。
+
+## 12. 与 Stage 2 Knowledge Base 的边界
+
+Stage 1 只负责解题运行时的 evidence graph、黑板协作、Intent 领取和 flag 生命周期；Stage 2 knowledge base 负责提供可复用的领域资料。Stage 1 产生的题目附件、flag、临时假设和未审核 writeup 不得自动写入通用 knowledge corpus。两者只通过 trace/evidence provenance 关联，避免把一次题目的运行结果当成通用事实。

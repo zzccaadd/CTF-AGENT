@@ -95,6 +95,7 @@ class ChallengeSwarm:
     findings: dict[str, str] = field(default_factory=dict)
     winner: SolverResult | None = None
     confirmed_flag: str | None = None
+    _flag_winner_label: str = ""
     _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _submit_count: dict[str, int] = field(default_factory=dict)  # per-solver wrong submission count
     _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
@@ -344,6 +345,10 @@ class ChallengeSwarm:
                 )
             if is_confirmed:
                 self.confirmed_flag = normalized
+                self._flag_winner_label = solver_label
+                # Stop sibling workers immediately: flag is verified, no more
+                # submissions or solver turns are useful.
+                self.cancel_event.set()
                 if self.evidence_board:
                     self.evidence_board.verify_flag(
                         solver_label, normalized,
@@ -353,6 +358,35 @@ class ChallengeSwarm:
                 self._submit_count[solver_label] = wrong_count + 1
                 self._last_submit_time[solver_label] = time.monotonic()
             return display, is_confirmed
+
+    def _confirmed_flag_result(self) -> SolverResult | None:
+        """Fallback winner when a flag was confirmed but no solver returned it.
+
+        Covers token-budget exhaustion / turn errors hitting in the same turn as
+        submit_flag, so a verified flag is never dropped from the result."""
+        if not self.confirmed_flag:
+            return None
+        solver = self.solvers.get(self._flag_winner_label)
+        trace_path = ""
+        step_count = 0
+        if solver is not None:
+            tracer = getattr(solver, "tracer", None)
+            trace_path = str(getattr(tracer, "path", ""))
+            value = getattr(solver, "_step_count", 0)
+            if isinstance(value, list):
+                value = value[0] if value else 0
+            try:
+                step_count = int(value)
+            except (TypeError, ValueError):
+                step_count = 0
+        return SolverResult(
+            flag=self.confirmed_flag,
+            status=FLAG_FOUND,
+            findings_summary=f"Flag confirmed by {self._flag_winner_label} via local verifier.",
+            step_count=step_count,
+            cost_usd=self.cost_tracker.total_cost_usd,
+            log_path=trace_path,
+        )
 
     async def _run_solver(self, slot: SolverSlot) -> SolverResult | None:
         solver = self._create_solver(slot.model_spec, slot.label)
@@ -505,6 +539,8 @@ class ChallengeSwarm:
             self.cancel_event.set()
             if self.evidence_board:
                 self.evidence_board.finish("swarm", "workers_exhausted")
+            if self.winner is None:
+                self.winner = self._confirmed_flag_result()
             return self.winner
         except asyncio.CancelledError:
             self.cancel_event.set()

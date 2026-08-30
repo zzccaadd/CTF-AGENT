@@ -70,6 +70,15 @@ class EvidenceBoard:
             max_attempts=max_attempts,
         )
 
+    def heartbeat(self, intent_id: str, worker_id: str, lease_seconds: int = 300) -> bool:
+        return self.store.heartbeat(
+            challenge_name=self.challenge_name,
+            run_id=self.run_id,
+            intent_id=intent_id,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+        )
+
     def open_intents(self) -> list[Intent]:
         return self.store.list_intents(self.challenge_name, self.run_id)
 
@@ -121,9 +130,13 @@ class EvidenceBoard:
 
     def summary(self, max_items: int = 16, max_chars: int = 12000) -> str:
         events = self.store.events(self.challenge_name, self.run_id)
-        facts = [e for e in events if e.kind == "fact_added" and e.verified][-max_items:]
-        hypotheses = [e for e in events if e.kind == "hypothesis_added"][-max_items:]
-        dead_ends = [e for e in events if e.kind == "dead_end_added"][-max_items:]
+        item_limit = max(0, int(max_items))
+        facts = ([e for e in events if e.kind == "fact_added" and e.verified][-item_limit:]
+                 if item_limit else [])
+        hypotheses = ([e for e in events if e.kind == "hypothesis_added"][-item_limit:]
+                      if item_limit else [])
+        dead_ends = ([e for e in events if e.kind == "dead_end_added"][-item_limit:]
+                     if item_limit else [])
         intents = self.open_intents()
         lines = [f"## Blackboard: {self.challenge_name}"]
         if facts:
@@ -143,7 +156,9 @@ class EvidenceBoard:
         if len(summary) <= max_chars:
             return summary
         marker = "\n... [blackboard summary truncated]"
-        return summary[: max(0, max_chars - len(marker))] + marker
+        if max_chars <= len(marker):
+            return marker[:max_chars]
+        return summary[: max_chars - len(marker)] + marker
 
     def snapshot(self) -> BoardSnapshot:
         events = self.store.events(self.challenge_name, self.run_id)

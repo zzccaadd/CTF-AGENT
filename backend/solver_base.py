@@ -24,6 +24,9 @@ class SolverResult:
     step_count: int
     cost_usd: float
     log_path: str
+    knowledge_queries: int = 0
+    knowledge_hits: int = 0
+    knowledge_chars: int = 0
 
 
 class SolverProtocol(Protocol):

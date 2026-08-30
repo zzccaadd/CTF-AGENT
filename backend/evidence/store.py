@@ -57,9 +57,9 @@ class SQLiteEvidenceStore:
             CREATE INDEX IF NOT EXISTS idx_events_kind
                 ON events(challenge_name, run_id, kind, seq);
             CREATE TABLE IF NOT EXISTS intents (
-                intent_id TEXT PRIMARY KEY,
                 challenge_name TEXT NOT NULL,
                 run_id TEXT NOT NULL,
+                intent_id TEXT NOT NULL,
                 goal TEXT NOT NULL,
                 acceptance TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'open',
@@ -68,7 +68,8 @@ class SQLiteEvidenceStore:
                 attempt INTEGER NOT NULL DEFAULT 0,
                 created_event_id TEXT NOT NULL,
                 result_event_id TEXT,
-                result TEXT NOT NULL DEFAULT ''
+                result TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (challenge_name, run_id, intent_id)
             );
             CREATE INDEX IF NOT EXISTS idx_intents_claimable
                 ON intents(challenge_name, run_id, status, lease_until, attempt);
@@ -83,14 +84,25 @@ class SQLiteEvidenceStore:
         # CREATE TABLE IF NOT EXISTS does not add columns to databases created
         # by an earlier Stage 1 revision. Keep this migration deliberately small
         # and idempotent so a running installation can be upgraded in place.
-        event_columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
-        }
-        if "schema_version" not in event_columns:
+        # The whole migration runs under BEGIN IMMEDIATE so concurrent first
+        # connections cannot race on ALTER TABLE / table rebuild.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            event_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "schema_version" not in event_columns:
+                self._conn.execute(
+                    "ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"
+                )
+            self._migrate_intents_table()
             self._conn.execute(
-                "ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', '2')"
             )
-        self._conn.commit()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -155,9 +167,18 @@ class SQLiteEvidenceStore:
         dedupe_key = dedupe_key or self._fingerprint(
             challenge_name, run_id, actor_id, kind, payload
         )
+        legacy_dedupe_key = dedupe_key
         # Dedupe is scoped to one challenge run. This prevents a caller-supplied
         # short key from colliding with an unrelated challenge in the global DB.
         dedupe_key = f"{challenge_name}:{run_id}:{dedupe_key}"
+        # Read old unscoped rows during an in-place upgrade. Restrict the lookup
+        # by challenge/run so a legacy collision cannot leak another run's event.
+        legacy = self._conn.execute(
+            "SELECT * FROM events WHERE dedupe_key=? AND challenge_name=? AND run_id=?",
+            (legacy_dedupe_key, challenge_name, run_id),
+        ).fetchone()
+        if legacy is not None:
+            return self._event(legacy)
         event_id = str(uuid.uuid4())
         self._conn.execute(
             """INSERT OR IGNORE INTO events
@@ -229,6 +250,54 @@ class SQLiteEvidenceStore:
                 self._conn.rollback()
                 raise
         return event
+
+    def _migrate_intents_table(self) -> None:
+        """Rebuild the intents projection with a (challenge_name, run_id, intent_id)
+        primary key when the database still has the legacy intent_id-only key.
+
+        Must be called while the caller owns the write lock (BEGIN IMMEDIATE).
+        The old table is renamed, the new table is created, rows are copied,
+        and the old table is dropped — all inside the same transaction.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='intents'"
+        ).fetchone()
+        if row is None:
+            return
+        if "PRIMARY KEY (challenge_name, run_id, intent_id)" in str(row[0]):
+            return
+        self._conn.execute("DROP INDEX IF EXISTS idx_intents_claimable")
+        self._conn.execute("ALTER TABLE intents RENAME TO intents_legacy")
+        self._conn.execute(
+            """CREATE TABLE intents (
+                challenge_name TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                intent_id TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                acceptance TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                worker_id TEXT,
+                lease_until REAL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                created_event_id TEXT NOT NULL,
+                result_event_id TEXT,
+                result TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (challenge_name, run_id, intent_id)
+            )"""
+        )
+        self._conn.execute(
+            """INSERT OR IGNORE INTO intents
+            (challenge_name, run_id, intent_id, goal, acceptance, status, worker_id,
+             lease_until, attempt, created_event_id, result_event_id, result)
+            SELECT challenge_name, run_id, intent_id, goal, acceptance, status, worker_id,
+                   lease_until, attempt, created_event_id, result_event_id, result
+            FROM intents_legacy"""
+        )
+        self._conn.execute("DROP TABLE intents_legacy")
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_intents_claimable
+            ON intents(challenge_name, run_id, status, lease_until, attempt)"""
+        )
 
     def _event(self, row: sqlite3.Row) -> EvidenceEvent:
         return EvidenceEvent(
@@ -382,8 +451,9 @@ class SQLiteEvidenceStore:
                         dedupe_key=f"max-attempts:{intent_id}:{max_attempts}",
                     )
                     self._conn.execute(
-                        "UPDATE intents SET status='blocked', result=?, result_event_id=?, worker_id=NULL, lease_until=NULL WHERE intent_id=?",
-                        ("maximum attempts reached", event.event_id, intent_id),
+                        "UPDATE intents SET status='blocked', result=?, result_event_id=?, worker_id=NULL, lease_until=NULL "
+                        "WHERE intent_id=? AND challenge_name=? AND run_id=?",
+                        ("maximum attempts reached", event.event_id, intent_id, challenge_name, run_id),
                     )
                     self._conn.commit()
                     return None
@@ -417,11 +487,30 @@ class SQLiteEvidenceStore:
             return None
         return self._intent(row)
 
-    def heartbeat(self, *, intent_id: str, worker_id: str, lease_seconds: int = 300) -> bool:
+    def heartbeat(
+        self,
+        *,
+        challenge_name: str,
+        run_id: str,
+        intent_id: str,
+        worker_id: str,
+        lease_seconds: int = 300,
+    ) -> bool:
+        """Renew the lease only while the intent is still owned by worker_id and
+        the current lease has not expired yet (fencing guard), scoped to one run."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE intents SET lease_until=? WHERE intent_id=? AND status='claimed' AND worker_id=?",
-                (time.time() + max(1, int(lease_seconds)), intent_id, worker_id),
+                """UPDATE intents SET lease_until=?
+                WHERE intent_id=? AND challenge_name=? AND run_id=?
+                  AND status='claimed' AND worker_id=? AND lease_until >= ?""",
+                (
+                    time.time() + max(1, int(lease_seconds)),
+                    intent_id,
+                    challenge_name,
+                    run_id,
+                    worker_id,
+                    time.time(),
+                ),
             )
             self._conn.commit()
             return cur.rowcount == 1

@@ -20,7 +20,7 @@ CTF Agent is an autonomous CTF solving system with a coordinator + solver-swarm 
 
 ## Default Model
 
-The benchmark default is `codex/gpt-5.6-luna`.
+The benchmark default is `codex/gpt-5.5`.
 
 ## RAG Evaluation
 
@@ -45,7 +45,7 @@ uv run python scripts/run_rag_eval.py
 
 Default runner settings:
 
-- model: `codex/gpt-5.6-luna`
+- model: `codex/gpt-5.5`
 - timeout: `1800`
 - max tokens: `500000`
 - concurrency: `1`

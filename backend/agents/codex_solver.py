@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from backend.cost_tracker import CostTracker
 from backend.evidence import EvidenceBoard
+from backend.knowledge import KnowledgeService
 from backend.loop_detect import LoopDetector
 from backend.models import model_id_from_spec, supports_vision
 from backend.output_types import solver_output_json_schema
@@ -146,7 +147,14 @@ SANDBOX_TOOLS = [
     {
         "name": "blackboard_complete",
         "description": "Complete the currently claimed intent with a result.",
-        "inputSchema": {"type": "object", "properties": {"result": {"type": "string"}, "status": {"type": "string"}}, "required": ["result"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "result": {"type": "string"},
+                "status": {"type": "string", "enum": ["completed", "failed", "blocked"]},
+            },
+            "required": ["result"],
+        },
     },
     {
         "name": "blackboard_fact",
@@ -163,15 +171,33 @@ SANDBOX_TOOLS = [
         "description": "Record a route that real testing ruled out.",
         "inputSchema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
     },
+    {
+        "name": "search_knowledge",
+        "description": "Search the local reviewed knowledge base. Returns source and line provenance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "source_type": {"type": "string"},
+                "metadata": {"type": "object"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 INTERNET_TOOL_NAMES = {"web_fetch", "webhook_create", "webhook_get_requests"}
 
 
-def sandbox_tools(allow_internet: bool) -> list[dict]:
+def sandbox_tools(allow_internet: bool, knowledge_enabled: bool = True) -> list[dict]:
     if allow_internet:
-        return list(SANDBOX_TOOLS)
-    return [tool for tool in SANDBOX_TOOLS if tool["name"] not in INTERNET_TOOL_NAMES]
+        tools = list(SANDBOX_TOOLS)
+    else:
+        tools = [tool for tool in SANDBOX_TOOLS if tool["name"] not in INTERNET_TOOL_NAMES]
+    if not knowledge_enabled:
+        tools = [tool for tool in tools if tool["name"] != "search_knowledge"]
+    return tools
 
 
 class CodexSolver:
@@ -211,8 +237,17 @@ class CodexSolver:
         self.no_submit = no_submit
         self.submit_fn = submit_fn
         self.allow_internet = bool(getattr(settings, "allow_internet", True))
+        self.knowledge_enabled = bool(getattr(settings, "knowledge_enabled", True))
         self.max_tokens = int(getattr(settings, "max_tokens_per_challenge", 0) or 0)
-        self._dynamic_tools = sandbox_tools(self.allow_internet)
+        self._dynamic_tools = sandbox_tools(self.allow_internet, self.knowledge_enabled)
+        self.knowledge_service = KnowledgeService.from_path(
+            getattr(settings, "knowledge_db_path", "logs/knowledge.sqlite3"),
+            max_chars=int(getattr(settings, "knowledge_max_chars", 8_000)),
+            timeout_ms=int(getattr(settings, "knowledge_query_timeout_ms", 200)),
+        ) if self.knowledge_enabled else None
+        self._knowledge_queries = 0
+        self._knowledge_hits = 0
+        self._knowledge_chars = 0
 
         self.sandbox = DockerSandbox(
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
@@ -585,6 +620,46 @@ class CodexSolver:
         })
 
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
+        if name == "search_knowledge":
+            if not self.knowledge_service:
+                return "Knowledge search is disabled for this run."
+            self._knowledge_queries += 1
+            results = self.knowledge_service.search(
+                str(args.get("query", "")),
+                source_type=args.get("source_type"),
+                metadata=args.get("metadata") if isinstance(args.get("metadata"), dict) else None,
+                top_k=args.get("top_k", getattr(self.settings, "knowledge_top_k", 5)),
+            )
+            self._knowledge_hits += len(results)
+            self._knowledge_chars += sum(len(result.text) for result in results)
+            diagnostic = self.knowledge_service.last_diagnostic
+            self.tracer.event(
+                "knowledge_searched",
+                query_hash=diagnostic.get("query_hash", ""),
+                hit_count=len(results),
+                returned_chars=sum(len(result.text) for result in results),
+                status=diagnostic.get("status", "unknown"),
+            )
+            if self.evidence_board:
+                self.evidence_board.record(
+                    self.solver_label,
+                    "worker",
+                    "knowledge_searched",
+                    {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or ""},
+                    provenance={
+                        "source_kind": "knowledge",
+                        "query_hash": diagnostic.get("query_hash", ""),
+                        "results": [result.provenance for result in results],
+                    },
+                    dedupe_key=f"knowledge:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
+                )
+            if not results:
+                status = diagnostic.get("status", "empty")
+                return f"Knowledge search returned no usable results ({status}). Continue with sandbox analysis."
+            return json.dumps(
+                {"results": [result.__dict__ for result in results], "diagnostic": diagnostic},
+                ensure_ascii=False,
+            )
         if name == "blackboard_summary":
             return self.evidence_board.summary() if self.evidence_board else "No shared blackboard available."
         elif name == "blackboard_intents":
@@ -618,7 +693,7 @@ class CodexSolver:
         elif name == "blackboard_complete":
             if not self.evidence_board or not self.intent_id:
                 return "No intent is currently claimed."
-            status = str(args.get("status", "completed"))
+            status = self._normalize_intent_status(args.get("status", "completed"))
             result = str(args.get("result", ""))[:2000]
             completed_id = self.intent_id
             self._complete_current_intent(result, status=status)
@@ -675,9 +750,10 @@ class CodexSolver:
         elif name == "list_files":
             return await do_list_files(self.sandbox, args.get("path", "/challenge/distfiles"))
         elif name == "submit_flag":
-            flag = args.get("flag", "")
+            flag = str(args.get("flag", "") or "")
+            candidate = flag.strip()
             if self.no_submit:
-                return f'DRY RUN — would submit "{flag}"'
+                return f'DRY RUN — would submit "{candidate}"'
             if self.submit_fn:
                 display, is_confirmed = await self.submit_fn(flag)
             else:
@@ -685,7 +761,7 @@ class CodexSolver:
                 display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
             if is_confirmed:
                 self._confirmed = True
-                self._flag = flag
+                self._flag = candidate
             return display
         elif name == "web_fetch":
             if not self.allow_internet:
@@ -739,21 +815,53 @@ class CodexSolver:
             except asyncio.CancelledError:
                 return
             if self.intent_id:
-                self.evidence_board.store.heartbeat(
+                renewed = self.evidence_board.heartbeat(
                     intent_id=self.intent_id,
                     worker_id=self.solver_label,
                     lease_seconds=self._intent_lease_seconds,
                 )
+                if not renewed:
+                    self.evidence_board.record(
+                        self.solver_label,
+                        "worker",
+                        "intent_lease_lost",
+                        {"intent_id": self.intent_id},
+                        provenance={"source_kind": "trace", "source_excerpt": "intent lease heartbeat rejected"},
+                    )
+                    self.intent_id = None
+                    self._intent_goal = ""
+                    self._intent_acceptance = ""
+                    return
 
     def _complete_current_intent(self, result: str, status: str = "completed") -> None:
         if self.evidence_board and self.intent_id:
-            self.evidence_board.complete(self.solver_label, self.intent_id, result, status=status)
+            self.evidence_board.complete(
+                self.solver_label,
+                self.intent_id,
+                result,
+                status=self._normalize_intent_status(status),
+            )
             self.intent_id = None
             self._intent_goal = ""
             self._intent_acceptance = ""
             if self._intent_heartbeat_task:
                 self._intent_heartbeat_task.cancel()
                 self._intent_heartbeat_task = None
+
+    @staticmethod
+    def _normalize_intent_status(status: object) -> str:
+        """Keep model/tool aliases from violating the persisted intent contract."""
+        normalized = str(status or "completed").strip().lower()
+        aliases = {
+            "done": "completed",
+            "complete": "completed",
+            "success": "completed",
+            "succeeded": "completed",
+            "error": "failed",
+            "gave_up": "blocked",
+            "give_up": "blocked",
+        }
+        return aliases.get(normalized, normalized if normalized in {"completed", "failed", "blocked"} else "failed")
 
     async def run_until_done_or_gave_up(self) -> SolverResult:
         if not self._proc:
@@ -806,6 +914,12 @@ class CodexSolver:
                 duration = time.monotonic() - t0
                 self.tracer.event("turn_complete", duration=round(duration, 1), steps=self._step_count)
 
+                # A confirmed flag wins over token-budget/error/cancel branches:
+                # the same turn may hit the token cap right after submit_flag.
+                if self._confirmed and self._flag:
+                    self._complete_current_intent("flag verified", "completed")
+                    return self._result(FLAG_FOUND)
+
                 if self._token_budget_exhausted:
                     self._findings = f"Token budget exhausted at {self._total_tokens} tokens."
                     self._complete_current_intent(self._findings, "blocked")
@@ -849,10 +963,14 @@ class CodexSolver:
                     return self._result(ERROR)
 
                 if self._structured_output and self._structured_output.get("type") == "flag_found":
-                    self._flag = self._structured_output.get("flag")
-                    self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {self._flag}"
-                    if self.no_submit:
-                        self._confirmed = True
+                    candidate = str(self._structured_output.get("flag") or "").strip()
+                    if candidate:
+                        self._flag = candidate
+                        self._findings = f"Flag found via {self._structured_output.get('method', '?')}: {candidate}"
+                        if self.no_submit:
+                            self._confirmed = True
+                    else:
+                        self._findings = "Invalid flag_found output: flag is empty; continuing investigation."
 
                 if self._confirmed and self._flag:
                     self._complete_current_intent("flag verified", "completed")
@@ -904,6 +1022,9 @@ class CodexSolver:
             findings_summary=self._findings[:2000],
             step_count=self._step_count,
             cost_usd=self._cost_usd, log_path=self.tracer.path,
+            knowledge_queries=self._knowledge_queries,
+            knowledge_hits=self._knowledge_hits,
+            knowledge_chars=self._knowledge_chars,
         )
 
     async def stop(self) -> None:
@@ -930,3 +1051,6 @@ class CodexSolver:
             self._proc = None
         if self.sandbox:
             await self.sandbox.stop()
+        if self.knowledge_service:
+            self.knowledge_service.close()
+            self.knowledge_service = None

@@ -16,10 +16,44 @@ from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.prompts import ChallengeMeta
 from backend.sandbox import cleanup_orphan_containers, configure_semaphore
-from backend.solver_base import FLAG_FOUND
+from backend.solver_base import FLAG_FOUND, SolverResult
 from backend.submission import LocalFlagVerifier
 
 logger = logging.getLogger(__name__)
+
+
+def _solver_step_count(solver: object) -> int:
+    value = getattr(solver, "_step_count", 0)
+    if isinstance(value, list):
+        value = value[0] if value else 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult:
+    """Preserve useful diagnostics when the benchmark deadline cancels a swarm."""
+    solver_list = list(swarm.solvers.values())
+    findings = "\n\n".join(
+        value for value in swarm.findings.values() if value
+    )[:2000]
+    trace_path = next(
+        (getattr(getattr(solver, "tracer", None), "path", "") for solver in solver_list
+         if getattr(getattr(solver, "tracer", None), "path", "")),
+        "",
+    )
+    return SolverResult(
+        flag=swarm.confirmed_flag,
+        status="timeout",
+        findings_summary=findings or "Benchmark timeout; inspect blackboard and solver traces.",
+        step_count=sum(_solver_step_count(solver) for solver in solver_list),
+        cost_usd=tracker.total_cost_usd,
+        log_path=trace_path,
+        knowledge_queries=sum(int(getattr(solver, "_knowledge_queries", 0)) for solver in solver_list),
+        knowledge_hits=sum(int(getattr(solver, "_knowledge_hits", 0)) for solver in solver_list),
+        knowledge_chars=sum(int(getattr(solver, "_knowledge_chars", 0)) for solver in solver_list),
+    )
 
 
 class BenchmarkRunner:
@@ -75,6 +109,8 @@ class BenchmarkRunner:
                     challenge_timeout_seconds=self.limits.timeout_seconds,
                     max_concurrent_challenges=self.limits.concurrency,
                     max_solvers_per_swarm=self.limits.max_solvers_per_swarm,
+                    knowledge_enabled=self.limits.rag_enabled,
+                    knowledge_db_path=self.limits.knowledge_db_path,
                 )
                 meta = ChallengeMeta.from_yaml(prepared.challenge_dir / "metadata.yml")
                 swarm = ChallengeSwarm(
@@ -95,6 +131,7 @@ class BenchmarkRunner:
                     swarm.kill()
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+                    solver_result = _timeout_result(swarm, tracker)
                     status = "timeout"
                 else:
                     status = solver_result.status if solver_result else "no_result"
@@ -140,6 +177,9 @@ class BenchmarkRunner:
             tool_calls=solver_result.step_count if solver_result else 0,
             trace_path=solver_result.log_path if solver_result else "",
             error=error,
+            knowledge_queries=solver_result.knowledge_queries if solver_result else 0,
+            knowledge_hits=solver_result.knowledge_hits if solver_result else 0,
+            knowledge_chars=solver_result.knowledge_chars if solver_result else 0,
         )
 
     def _write_results(self) -> None:
@@ -154,11 +194,16 @@ class BenchmarkRunner:
                 "concurrency": self.limits.concurrency,
                 "solvers_per_swarm": self.limits.solvers_per_swarm,
                 "max_solvers_per_swarm": self.limits.max_solvers_per_swarm,
+                "rag_enabled": self.limits.rag_enabled,
+                "knowledge_db_path": self.limits.knowledge_db_path,
             },
             "summary": {
                 "total": len(self.results),
                 "solved": sum(result.solved for result in self.results),
                 "cost_usd": round(sum(result.cost_usd for result in self.results), 6),
+                "knowledge_queries": sum(result.knowledge_queries for result in self.results),
+                "knowledge_hits": sum(result.knowledge_hits for result in self.results),
+                "knowledge_chars": sum(result.knowledge_chars for result in self.results),
             },
             "results": [result.to_dict() for result in self.results],
         }

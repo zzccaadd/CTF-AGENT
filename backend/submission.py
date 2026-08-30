@@ -6,7 +6,14 @@ import hmac
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from backend.ctfd import SubmitResult
+
+@dataclass(frozen=True)
+class SubmitResult:
+    """Normalized result returned by any flag submission backend."""
+
+    status: str
+    message: str
+    display: str
 
 
 class FlagSubmitter(Protocol):

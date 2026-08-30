@@ -39,5 +39,9 @@ class Settings(BaseSettings):
     blackboard_default_worker_lease_seconds: int = 300
     blackboard_intent_max_attempts: int = 3
     knowledge_db_path: str = "logs/knowledge.sqlite3"
+    knowledge_enabled: bool = True
+    knowledge_top_k: int = 5
+    knowledge_max_chars: int = 8_000
+    knowledge_query_timeout_ms: int = 200
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

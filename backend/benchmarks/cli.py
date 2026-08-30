@@ -22,12 +22,13 @@ console = Console()
 @click.option("--split", default="development", show_default=True)
 @click.option("--challenge", "challenge_ids", multiple=True, help="Exact provider challenge ID")
 @click.option("--limit", default=5, type=click.IntRange(min=1), show_default=True)
-@click.option("--model", default="codex/gpt-5.6-luna", show_default=True)
+@click.option("--model", default="codex/gpt-5.5", show_default=True)
 @click.option("--timeout", default=1_800, type=click.IntRange(min=1), show_default=True)
 @click.option("--max-tokens", default=1_000_000, type=click.IntRange(min=1), show_default=True)
 @click.option("--concurrency", default=1, type=click.IntRange(min=1), show_default=True, help="Challenges to run at once")
 @click.option("--solvers-per-swarm", default=3, type=click.IntRange(min=1, max=3), show_default=True, help="Codex workers per challenge (max 3)")
 @click.option("--allow-internet", is_flag=True, help="Allow solver internet access")
+@click.option("--rag/--no-rag", "rag_enabled", default=True, show_default=True, help="Enable local knowledge search")
 @click.option("--image", default="ctf-sandbox", show_default=True)
 @click.option("--results", default="benchmark-results.json", type=click.Path(path_type=Path))
 @click.option("-v", "--verbose", is_flag=True)
@@ -43,6 +44,7 @@ def main(
     concurrency: int,
     solvers_per_swarm: int,
     allow_internet: bool,
+    rag_enabled: bool,
     image: str,
     results: Path,
     verbose: bool,
@@ -76,6 +78,7 @@ def main(
         attempts=1,
         concurrency=concurrency,
         solvers_per_swarm=solvers_per_swarm,
+        rag_enabled=rag_enabled,
     )
     console.print("[bold]CTF Agent Benchmark[/bold]")
     console.print(f"  Provider: {provider}")

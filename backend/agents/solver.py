@@ -100,6 +100,14 @@ class TracingToolset(WrapperToolset[SolverDeps]):
             logger.warning(f"Loop break on {name} at step {step}")
             self.tracer.event("loop_break", tool=name, step=step)
             # Inject loop warning by returning it as the tool result
+            if board:
+                board.record(
+                    ctx.deps.model_spec or "solver", "worker", "tool_result",
+                    {"tool": name, "result": LOOP_WARNING_MESSAGE, "step": step,
+                     "intent_id": intent_id or ""},
+                    provenance={"source_kind": "trace", "source_excerpt": LOOP_WARNING_MESSAGE},
+                    dedupe_key=f"tool-result:{ctx.deps.model_spec}:{step}:{name}",
+                )
             return LOOP_WARNING_MESSAGE
 
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
@@ -311,11 +319,15 @@ class Solver:
 
             output = result.output
             if isinstance(output, FlagFound):
-                self._flag = output.flag
-                self._findings = f"Flag found via {output.method}: {output.flag}"
-                # In dry-run mode, structured output is sufficient (can't verify via CTFd)
-                if self.deps.no_submit:
-                    self._confirmed = True
+                candidate = str(output.flag or "").strip()
+                if candidate:
+                    self._flag = candidate
+                    self._findings = f"Flag found via {output.method}: {candidate}"
+                    # In dry-run mode, structured output is sufficient (can't verify via CTFd)
+                    if self.deps.no_submit:
+                        self._confirmed = True
+                else:
+                    self._findings = "Invalid flag_found output: flag is empty; continuing investigation."
             # CTFd confirmation always counts (the primary path when not in dry-run)
             if self.deps.confirmed_flag:
                 self._confirmed = True
@@ -363,6 +375,15 @@ class Solver:
                 if self.intent_id and not self.evidence_board.heartbeat(
                     self.intent_id, self.solver_label, self._intent_lease_seconds
                 ):
+                    self.evidence_board.record(
+                        self.solver_label,
+                        "worker",
+                        "intent_lease_lost",
+                        {"intent_id": self.intent_id},
+                        provenance={"source_kind": "trace", "source_excerpt": "intent lease heartbeat rejected"},
+                    )
+                    self.intent_id = None
+                    self.deps.intent_id = None
                     return
         except asyncio.CancelledError:
             return
