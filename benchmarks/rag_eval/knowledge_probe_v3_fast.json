@@ -1,0 +1,49 @@
+{
+  "name": "knowledge_probe_v3_fast_4",
+  "description": "Stage 2/3 第三轮快速对照集（4 题）：仅保留实测可快速解出的题（<300s，来自 v1/v2/3-solver 数据）。目标：在新默认配置（timeout 300s / max_tokens 1M / solvers_per_swarm 3）下快速迭代，验证提示词强化后的 RAG 调用率，并对比 off/on 的耗时/成本/token 效率。慢题（token 耗尽类）与环境不可用题已剔除。",
+  "generated_at": "2026-08-31",
+  "default_model": "codex/gpt-5.5",
+  "labeling": {
+    "qrels_version": "v1",
+    "annotator": "CTF-Agent review (code-fix session)",
+    "measured_fast": "实测解出耗时 <300s（v1/v2/3-solver 运行数据）"
+  },
+  "items": [
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/forensics/[Very Easy] It Has Begun",
+      "name": "[Very Easy] It Has Begun",
+      "family": "forensics",
+      "knowledge_needed": false,
+      "expected_knowledge": [],
+      "relevant_corpus_docs": []
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/web/[Very Easy] Flag Command",
+      "name": "[Very Easy] Flag Command",
+      "family": "web",
+      "knowledge_needed": false,
+      "expected_knowledge": [],
+      "relevant_corpus_docs": []
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Dynastic",
+      "name": "[Very Easy] Dynastic",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["custom-encoding", "encodings"],
+      "relevant_corpus_docs": ["reference/crypto/encodings-variants.md"]
+    },
+    {
+      "provider": "cybench",
+      "challenge_id": "hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Makeshift",
+      "name": "[Very Easy] Makeshift",
+      "family": "crypto",
+      "knowledge_needed": true,
+      "expected_knowledge": ["xor", "custom-encoding", "encodings"],
+      "relevant_corpus_docs": ["reference/crypto/encodings-variants.md", "reference/crypto/xor-variants.md"]
+    }
+  ]
+}

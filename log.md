@@ -16395,3 +16395,28 @@ index cf0293d..35d85ec 100644
 > 【配置默认值 + 提示词/工具描述强化，已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【53】
+> 时间：2026-08-31
+> 会话ID：【快题集 v3 建立与启动（新默认配置）】
+> 涉及文件：benchmarks/rag_eval/knowledge_probe_v3_fast.json（新增）/ log.md
+> 需求/遇到的问题：
+> 用户要求不等慢运行收尾：从测试集剔除求解慢的题，只测实测快的题；同时要求分析"调用 RAG 是否确实效率更高"。
+
+> 我的原始提问Prompt：
+> > 不等了，你把求解慢的题先去掉，我需要最快的测试。之后只测试那些快的，同时你要分析，确实调用rag效率更高才行
+
+> 分析与根因：
+> 基于 v1/v2/3-solver 三组实测（elapsed_seconds 与 cost）：慢题（token 耗尽 370-720s）——Data Siege/PackedAway/perfect_secrecy/randsubware/robust-cbc/smallsurp 全部剔除；环境不可用（构建失败）——pickle-jail/noisier-crc 保留标注但跳过；BoxCutter 479s、Labyrinth Linguist 363s 超 300s 预算也剔除。快题（实测 <300s 解出）：It Has Begun（104-116s）、Flag Command（144s）、Dynastic（195s）、Makeshift（264s）。其中 Dynastic/Makeshift 在 v1 标注为非知识型，本轮语料已有 encodings-variants.md/xor-variants.md，重新标注为知识型（custom-encoding/xor）。
+
+> 代码改动说明：
+> benchmarks/rag_eval/knowledge_probe_v3_fast.json（新增）：4 题快题集（2 知识型 Dynastic/Makeshift + 2 非知识型 It Has Begun/Flag Command），标注 knowledge_needed/expected_knowledge/relevant_corpus_docs 与 measured_fast 说明。启动命令（新默认配置）：--compare-rag --timeout 300 --max-tokens 1000000 --solvers-per-swarm 3 --concurrency 2 --results-dir results/rag_eval_v3（记录【52】已改默认值，此处显式传参）。
+
+> 测试验证方式 & 结果：
+> 运行中（bash-14）。分析计划（用户要求的"调用 RAG 效率更高"验证）：① 每题 off vs on 的 elapsed/cost/tokens 对比（3-solver 聚合）；② kq>0 的 run 与 kq=0 的 run 效率对比（耗时/成本/token）；③ 若仍全 0 调用，诚实结论为：快题（easy）上模型不感知知识需求，RAG 无收益可测——需自动注入（记录【52】方案 B）或换 medium 题才能证明收益。
+
+> 本次完整代码Diff：
+> ```diff
+> 【新增 knowledge_probe_v3_fast.json 一个清单文件。】
+> ```
+---
