@@ -16343,3 +16343,25 @@ index cf0293d..35d85ec 100644
 > 【无】
 > ```
 ---
+
+# 开发记录【51】
+> 时间：2026-08-31
+> 会话ID：【v2 运行诊断：swarm 无 winner 丢诊断 + 环境不可用题】
+> 涉及文件：backend/benchmarks/runner.py / scripts/run_rag_eval.py / benchmarks/rag_eval/knowledge_probe_v2.json / tests/test_rag_eval_sets.py / log.md
+> 需求/遇到的问题：
+> 检查 v2 off 阶段结果时发现两类异常：(1) 8 题 status=no_result 且 calls=0、trace_path=""，但对应 trace 文件显示 30+ 次真实工具调用与 token_budget_exhausted（如 robust-cbc 33 calls/51 万 token）——swarm.run() 无 winner 返回 None 时 runner 丢弃全部诊断；(2) just-another-pickle-jail / noisier-crc 两个 challenge status=error 且 $0——docker 镜像构建失败（apt-get exit 100，Debian buster 源不可用），两个并行运行中稳定复现。
+
+> 分析与根因：
+> run_one 的 else 分支在 solver_result is None 时直接 status=no_result、tool_calls=0、trace_path=""——swarm 收集到 CANCELLED（token 耗尽）但无 winner 且无 confirmed_flag 时返回 None，真实运行信息全部丢失（与记录【33】修的 flag 丢失是同类边界，但该次只覆盖 flag 已确认场景）。环境不可用题应显式标注并跳过，而不是每次评估都烧时间/报 error。
+
+> 代码改动说明：
+> backend/benchmarks/runner.py：新增 _no_result_result(swarm, tracker)——swarm 无 winner 时保留真实 trace_path/step_count/cost/知识指标（复用 _swarm_knowledge_metrics），status 保持 no_result；run_one else 分支调用它。scripts/run_rag_eval.py：新增 _active_items(manifest) 过滤 environment_unavailable 项并返回跳过清单，输出增加 skipped_environment_unavailable 字段。benchmarks/rag_eval/knowledge_probe_v2.json：just-another-pickle-jail 与 noisier-crc 标注 environment_unavailable=true + reason（apt-get exit 100，Debian buster 源失效）。tests：新增 _active_items 跳过逻辑测试与 v2 标注断言测试。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：80 passed（78→80）；ruff 通过。遗留：robust-cbc 等 8 题实际是"500k token 预算内未解出"（服务端交互题上下文膨胀），v2 的 --max-tokens 500000 对这类题偏紧，后续评估可调高或拆分；已跑结果中 calls=0 行的诊断已在后续运行修复（新代码对 swarm=None 保留诊断），已产生的 off 结果文件不再追溯修补。
+
+> 本次完整代码Diff：
+> ```diff
+> 【本轮改动已随 fix 提交推送；详见 git log。】
+> ```
+---
