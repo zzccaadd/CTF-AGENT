@@ -16445,3 +16445,28 @@ index cf0293d..35d85ec 100644
 > 【service/schema 修复已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【55】
+> 时间：2026-08-31
+> 会话ID：【trace 记录模型思考过程（assistant_message）】
+> 涉及文件：backend/agents/codex_solver.py / tests/test_knowledge_tool.py / log.md
+> 需求/遇到的问题：
+> 用户要求把模型的思考过程记录到 trace（"主要是 coordinator 的思路过程"）。架构澄清：本系统没有独立 coordinator 模型——协调者是代码逻辑（ChallengeSwarm 提出 bootstrap intents、bump 注入协作 insights，均已有记录）；模型侧的"思考过程"即每个 worker 的 assistant 文本（commentary 推理 + final_answer），而此前 item/completed 的文本只写入内存 _findings，未落盘 trace——导致事后无法审计"模型为什么调用/不调用 search_knowledge"（记录【54】的分析只能靠工具序列推断）。
+
+> 我的原始提问Prompt：
+> > 然后需要在trace中，记录一下模型的思考过程，主要是coordinator的思路过程对把
+
+> 分析与根因：
+> _read_loop 的 item/completed 分支：agentMessage 的 text 仅 self._findings = text[:2000]，且 phase（commentary/final_answer）未区分保存。修复：新增 _record_assistant_message(phase, text)——写 tracer.event("assistant_message", phase, text[:4000], step)，commentary 与 final_answer 均记录，长度截断防止 trace 膨胀（每条 4000 字符上限，与现有 tool_result 截断策略一致）。
+
+> 代码改动说明：
+> backend/agents/codex_solver.py：新增 _record_assistant_message 并在 item/completed 的 agentMessage 分支调用（commentary/final_answer/无 phase 均记录，phase 默认 "message"）。tests/test_knowledge_tool.py：新增 test_assistant_reasoning_is_recorded_to_trace（phase 区分、内容落 trace、5000 字符截断为 4000）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：82 passed（81→82）；ruff 通过。v3 快题集运行中（bash-15，修复后新代码，并发 4），本轮改动不影响运行中进程。遗留：medium 题加入与 v4 测试集待 v3 完成后执行。
+
+> 本次完整代码Diff：
+> ```diff
+> 【assistant_message 记录已随本轮提交推送；详见 git log。】
+> ```
+---

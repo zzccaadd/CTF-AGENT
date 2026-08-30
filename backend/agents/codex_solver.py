@@ -434,6 +434,7 @@ class CodexSolver:
                     text = item.get("text", "")
                     phase = item.get("phase")  # "commentary" | "final_answer" | null
                     if text:
+                        self._record_assistant_message(phase, text)
                         self._findings = text[:2000]
                         if phase != "commentary" and text.lstrip()[:1] == "{":
                             try:
@@ -635,6 +636,21 @@ class CodexSolver:
             "contentItems": content_items,
             "success": success,
         })
+
+    def _record_assistant_message(self, phase: str | None, text: str) -> None:
+        """Persist the model's reasoning (commentary) and final answers into
+        the trace so every decision — including why search_knowledge was or
+        was not called — is auditable afterwards.
+
+        The coordinator role has no separate LLM in this architecture: the
+        swarm logic proposes intents and bumps insights, and each worker's
+        commentary IS the reasoning stream."""
+        self.tracer.event(
+            "assistant_message",
+            phase=phase or "message",
+            text=text[:4000],
+            step=self._step_count,
+        )
 
     @staticmethod
     def _query_outcome(diagnostic: dict, results: list) -> str:

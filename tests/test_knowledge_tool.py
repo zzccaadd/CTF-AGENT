@@ -275,3 +275,23 @@ def test_tool_budget_rejection_records_trace_outcome(tmp_path) -> None:
         assert any(e.get("query_outcome") == "budget_exhausted" for e in events)
     finally:
         service.close()
+
+
+def test_assistant_reasoning_is_recorded_to_trace() -> None:
+    """The model's commentary/final_answer text must land in the trace so the
+    reasoning behind tool choices (incl. knowledge calls) is auditable."""
+    events: list[dict] = []
+    solver = _solver_with(None)
+    solver.tracer = SimpleNamespace(event=lambda *_args, **kwargs: events.append(kwargs))
+
+    solver._record_assistant_message("commentary", "I should check if this cipher pattern is known.")
+    solver._record_assistant_message("final_answer", '{"type":"flag_found","flag":"CTF{x}"}')
+    solver._record_assistant_message(None, "plain message")
+
+    assert events[0]["phase"] == "commentary"
+    assert "cipher pattern" in events[0]["text"]
+    assert events[1]["phase"] == "final_answer"
+    assert events[2]["phase"] == "message"
+    # Long reasoning is truncated to keep traces bounded.
+    solver._record_assistant_message("commentary", "x" * 5000)
+    assert len(events[3]["text"]) == 4000
