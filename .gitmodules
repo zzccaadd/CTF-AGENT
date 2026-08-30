@@ -1,0 +1,6 @@
+[submodule "benchmarks/NYU_CTF_Bench"]
+	path = benchmarks/NYU_CTF_Bench
+	url = https://github.com/NYU-LLM-CTF/NYU_CTF_Bench
+[submodule "benchmarks/cybench"]
+	path = benchmarks/cybench
+	url = https://github.com/andyzorigin/cybench

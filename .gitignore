@@ -16,9 +16,7 @@ benchmark-results.json
 workspace/
 challenges*/
 codex-schema-*/
-benchmarks/NYU_CTF_Bench/
-benchmarks/cybench/.git/
-benchmarks/cybench/
+
 
 # Python cache and build artifacts
 __pycache__/
