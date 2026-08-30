@@ -27,6 +27,10 @@ class SolverResult:
     knowledge_queries: int = 0
     knowledge_hits: int = 0
     knowledge_chars: int = 0
+    knowledge_elapsed_ms: float = 0.0
+    knowledge_tool_calls: int = 0
+    knowledge_cache_hits: int = 0
+    knowledge_budget_rejections: int = 0
 
 
 class SolverProtocol(Protocol):

@@ -173,7 +173,7 @@ SANDBOX_TOOLS = [
     },
     {
         "name": "search_knowledge",
-        "description": "Search the local reviewed knowledge base. Returns source and line provenance.",
+        "description": "Search the local reviewed knowledge base (CWE/memory-safety, ELF/PE and file formats, protocols, gdb/radare2/pwntools/z3/Volatility, CTF technique patterns). Use it when the challenge involves an ABI, format, protocol or technique you are unsure about, or when you need exact tool syntax. Returns source URL, version, license and line provenance. Local and fast.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -218,6 +218,7 @@ class CodexSolver:
         notify_coordinator=None,
         solver_label: str | None = None,
         evidence_board: EvidenceBoard | None = None,
+        knowledge_challenge_budget=None,
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -248,6 +249,17 @@ class CodexSolver:
         self._knowledge_queries = 0
         self._knowledge_hits = 0
         self._knowledge_chars = 0
+        self._knowledge_elapsed_ms = 0.0
+        # Stage 3 S3.1: unified knowledge accounting + budgets + dedupe cache.
+        self._knowledge_tool_calls = 0
+        self._knowledge_cache_hits = 0
+        self._knowledge_budget_rejections = 0
+        self._turn_knowledge_queries = 0
+        self._knowledge_cache: dict[tuple, tuple[list, dict]] = {}
+        self._knowledge_turn_budget = int(getattr(settings, "knowledge_turn_budget", 1))
+        self._knowledge_solver_budget = int(getattr(settings, "knowledge_solver_budget", 8))
+        self._knowledge_context_budget = int(getattr(settings, "knowledge_context_chars_budget", 32_000))
+        self._knowledge_challenge_budget = knowledge_challenge_budget
 
         self.sandbox = DockerSandbox(
             image=getattr(settings, "sandbox_image", "ctf-sandbox"),
@@ -292,6 +304,7 @@ class CodexSolver:
             self.meta, distfile_names, container_arch=container_arch,
             has_named_tools=True,
             allow_internet=self.allow_internet,
+            knowledge_enabled=self.knowledge_enabled,
         )
 
         self._proc = await asyncio.create_subprocess_exec(
@@ -619,11 +632,104 @@ class CodexSolver:
             "success": success,
         })
 
+    @staticmethod
+    def _query_outcome(diagnostic: dict, results: list) -> str:
+        """Map service diagnostics to the unified query_outcome terminal state
+        (Stage 3 S3.1): ok / no_hit / invalid_query / invalid_params / timeout /
+        store_error. budget_exhausted and cache_hit are handled by the caller."""
+        status = diagnostic.get("status")
+        if status == "invalid":
+            reason = diagnostic.get("reason", "")
+            return "invalid_query" if reason in ("empty_query", "query_too_long") else "invalid_params"
+        if status == "timeout":
+            return "timeout"
+        if status == "error":
+            return "store_error"
+        return "ok" if results else "no_hit"
+
+    def _knowledge_cache_key(self, args: dict) -> tuple:
+        """Dedupe key: normalized query + filters. Corpus changes invalidate it
+        per challenge run (cache is per-solver and lives only for the run)."""
+        metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+        raw_top_k = args.get("top_k")
+        top_k = int(raw_top_k) if raw_top_k is not None else int(getattr(self.settings, "knowledge_top_k", 5))
+        return (
+            str(args.get("query", "")).strip().lower(),
+            str(args.get("source_type") or "").strip().lower(),
+            tuple(sorted((str(k), str(v)) for k, v in metadata.items())),
+            top_k,
+        )
+
     async def _exec_tool(self, name: str, args: dict) -> str | tuple[bytes, str]:
         if name == "search_knowledge":
             if not self.knowledge_service:
                 return "Knowledge search is disabled for this run."
+            self._knowledge_tool_calls += 1
+            # Stage 3 S3.1 budgets: turn -> solver -> cumulative context -> challenge.
+            if self._turn_knowledge_queries >= self._knowledge_turn_budget:
+                self._knowledge_budget_rejections += 1
+                return (
+                    f"Knowledge budget exhausted for this turn "
+                    f"({self._knowledge_turn_budget} query max). Continue with sandbox analysis."
+                )
+            if self._knowledge_queries >= self._knowledge_solver_budget:
+                self._knowledge_budget_rejections += 1
+                return (
+                    f"Knowledge budget exhausted for this challenge "
+                    f"({self._knowledge_solver_budget} queries max). Continue with sandbox analysis."
+                )
+            if self._knowledge_chars >= self._knowledge_context_budget:
+                self._knowledge_budget_rejections += 1
+                return (
+                    f"Knowledge context budget exhausted "
+                    f"({self._knowledge_context_budget} chars max). Continue with sandbox analysis."
+                )
+            if self._knowledge_challenge_budget is not None and not self._knowledge_challenge_budget.consume():
+                self._knowledge_budget_rejections += 1
+                return (
+                    f"Challenge knowledge budget exhausted "
+                    f"({self._knowledge_challenge_budget.limit} queries max). Continue with sandbox analysis."
+                )
+            # Dedupe: an identical query+filters in the same run is a cache hit,
+            # not a new backend query.
+            cache_key = self._knowledge_cache_key(args)
+            cached = self._knowledge_cache.get(cache_key)
+            if cached is not None:
+                self._knowledge_cache_hits += 1
+                results, diagnostic = cached
+                outcome = "cache_hit"
+                returned_chars = sum(len(result.text) for result in results)
+                self._knowledge_chars += returned_chars
+                self._knowledge_hits += len(results)
+                self.tracer.event(
+                    "knowledge_searched",
+                    query_hash=diagnostic.get("query_hash", ""),
+                    hit_count=len(results),
+                    returned_chars=returned_chars,
+                    elapsed_ms=diagnostic.get("elapsed_ms"),
+                    status=diagnostic.get("status", "unknown"),
+                    query_outcome=outcome,
+                )
+                if self.evidence_board:
+                    self.evidence_board.record(
+                        self.solver_label,
+                        "worker",
+                        "knowledge_searched",
+                        {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or "", "query_outcome": outcome},
+                        provenance={
+                            "source_kind": "knowledge",
+                            "query_hash": diagnostic.get("query_hash", ""),
+                            "cache_hit": True,
+                            "results": [result.provenance for result in results],
+                        },
+                        dedupe_key=f"knowledge:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
+                    )
+                return json.dumps(
+                    {"results": [result.__dict__ for result in results], "diagnostic": {**diagnostic, "query_outcome": outcome}},
+                    ensure_ascii=False,
+                )
             self._knowledge_queries += 1
+            self._turn_knowledge_queries += 1
             results = self.knowledge_service.search(
                 str(args.get("query", "")),
                 source_type=args.get("source_type"),
@@ -632,23 +738,32 @@ class CodexSolver:
             )
             self._knowledge_hits += len(results)
             self._knowledge_chars += sum(len(result.text) for result in results)
-            diagnostic = self.knowledge_service.last_diagnostic
+            diagnostic = dict(self.knowledge_service.last_diagnostic)
+            outcome = self._query_outcome(diagnostic, results)
+            diagnostic["query_outcome"] = outcome
+            self._knowledge_elapsed_ms += float(diagnostic.get("elapsed_ms") or 0.0)
+            # Cache the outcome even for no-hit/invalid results: a repeated
+            # identical query must not re-hit the store.
+            self._knowledge_cache[cache_key] = (results, diagnostic)
             self.tracer.event(
                 "knowledge_searched",
                 query_hash=diagnostic.get("query_hash", ""),
                 hit_count=len(results),
                 returned_chars=sum(len(result.text) for result in results),
+                elapsed_ms=diagnostic.get("elapsed_ms"),
                 status=diagnostic.get("status", "unknown"),
+                query_outcome=outcome,
             )
             if self.evidence_board:
                 self.evidence_board.record(
                     self.solver_label,
                     "worker",
                     "knowledge_searched",
-                    {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or ""},
+                    {"query_hash": diagnostic.get("query_hash", ""), "hit_count": len(results), "step": self._step_count, "intent_id": self.intent_id or "", "query_outcome": outcome},
                     provenance={
                         "source_kind": "knowledge",
                         "query_hash": diagnostic.get("query_hash", ""),
+                        "query_outcome": outcome,
                         "results": [result.provenance for result in results],
                     },
                     dedupe_key=f"knowledge:{self.meta.name}:{self.evidence_board.run_id}:{self.solver_label}:{self._step_count}",
@@ -901,6 +1016,7 @@ class CodexSolver:
         for attempt in range(1, max_attempts + 1):
             try:
                 self._turn_done.clear()
+                self._turn_knowledge_queries = 0
                 self._structured_output = None
                 self._turn_error = None
                 await self._rpc("turn/start", {
@@ -1025,6 +1141,10 @@ class CodexSolver:
             knowledge_queries=self._knowledge_queries,
             knowledge_hits=self._knowledge_hits,
             knowledge_chars=self._knowledge_chars,
+            knowledge_elapsed_ms=round(self._knowledge_elapsed_ms, 3),
+            knowledge_tool_calls=self._knowledge_tool_calls,
+            knowledge_cache_hits=self._knowledge_cache_hits,
+            knowledge_budget_rejections=self._knowledge_budget_rejections,
         )
 
     async def stop(self) -> None:

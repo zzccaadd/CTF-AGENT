@@ -19,6 +19,8 @@ class BenchmarkLimits:
     max_solvers_per_swarm: int = 3
     rag_enabled: bool = True
     knowledge_db_path: str = "logs/knowledge.sqlite3"
+    knowledge_top_k: int = 5
+    knowledge_max_chars: int = 8_000
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,10 @@ class BenchmarkResult:
     knowledge_queries: int = 0
     knowledge_hits: int = 0
     knowledge_chars: int = 0
+    knowledge_elapsed_ms: float = 0.0
+    knowledge_tool_calls: int = 0
+    knowledge_cache_hits: int = 0
+    knowledge_budget_rejections: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

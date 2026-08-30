@@ -53,6 +53,14 @@ def _timeout_result(swarm: ChallengeSwarm, tracker: CostTracker) -> SolverResult
         knowledge_queries=sum(int(getattr(solver, "_knowledge_queries", 0)) for solver in solver_list),
         knowledge_hits=sum(int(getattr(solver, "_knowledge_hits", 0)) for solver in solver_list),
         knowledge_chars=sum(int(getattr(solver, "_knowledge_chars", 0)) for solver in solver_list),
+        knowledge_elapsed_ms=round(
+            sum(float(getattr(solver, "_knowledge_elapsed_ms", 0.0)) for solver in solver_list), 3
+        ),
+        knowledge_tool_calls=sum(int(getattr(solver, "_knowledge_tool_calls", 0)) for solver in solver_list),
+        knowledge_cache_hits=sum(int(getattr(solver, "_knowledge_cache_hits", 0)) for solver in solver_list),
+        knowledge_budget_rejections=sum(
+            int(getattr(solver, "_knowledge_budget_rejections", 0)) for solver in solver_list
+        ),
     )
 
 
@@ -111,6 +119,8 @@ class BenchmarkRunner:
                     max_solvers_per_swarm=self.limits.max_solvers_per_swarm,
                     knowledge_enabled=self.limits.rag_enabled,
                     knowledge_db_path=self.limits.knowledge_db_path,
+                    knowledge_top_k=self.limits.knowledge_top_k,
+                    knowledge_max_chars=self.limits.knowledge_max_chars,
                 )
                 meta = ChallengeMeta.from_yaml(prepared.challenge_dir / "metadata.yml")
                 swarm = ChallengeSwarm(
@@ -180,6 +190,10 @@ class BenchmarkRunner:
             knowledge_queries=solver_result.knowledge_queries if solver_result else 0,
             knowledge_hits=solver_result.knowledge_hits if solver_result else 0,
             knowledge_chars=solver_result.knowledge_chars if solver_result else 0,
+            knowledge_elapsed_ms=solver_result.knowledge_elapsed_ms if solver_result else 0.0,
+            knowledge_tool_calls=solver_result.knowledge_tool_calls if solver_result else 0,
+            knowledge_cache_hits=solver_result.knowledge_cache_hits if solver_result else 0,
+            knowledge_budget_rejections=solver_result.knowledge_budget_rejections if solver_result else 0,
         )
 
     def _write_results(self) -> None:
@@ -204,6 +218,12 @@ class BenchmarkRunner:
                 "knowledge_queries": sum(result.knowledge_queries for result in self.results),
                 "knowledge_hits": sum(result.knowledge_hits for result in self.results),
                 "knowledge_chars": sum(result.knowledge_chars for result in self.results),
+                "knowledge_elapsed_ms": round(
+                    sum(result.knowledge_elapsed_ms for result in self.results), 3
+                ),
+                "knowledge_tool_calls": sum(result.knowledge_tool_calls for result in self.results),
+                "knowledge_cache_hits": sum(result.knowledge_cache_hits for result in self.results),
+                "knowledge_budget_rejections": sum(result.knowledge_budget_rejections for result in self.results),
             },
             "results": [result.to_dict() for result in self.results],
         }

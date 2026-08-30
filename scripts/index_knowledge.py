@@ -10,6 +10,22 @@ from pathlib import Path
 from backend.knowledge.store import SQLiteKnowledgeBase
 
 ALLOWED_SOURCE_TYPES = ("official", "reference", "internal_notes")
+# Benchmark corpus must never be indexed as RAG knowledge: the policy guard
+# lives at the store layer (source_type) AND here at the path layer, so an
+# accidental `--root benchmarks/...` run is rejected before ingestion.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BENCHMARK_ROOTS = tuple(
+    root.resolve() for root in (REPO_ROOT / "benchmarks",) if (REPO_ROOT / "benchmarks").exists()
+)
+
+
+def _validate_root(root: Path) -> None:
+    resolved = root.resolve()
+    if any(resolved == bench or bench in resolved.parents for bench in BENCHMARK_ROOTS):
+        raise SystemExit(
+            f"refusing to index benchmark corpus root: {root}\n"
+            "benchmark challenges, attachments and flags must never enter the RAG corpus"
+        )
 
 
 def main() -> int:
@@ -24,6 +40,7 @@ def main() -> int:
     args = parser.parse_args()
 
     base = args.root.resolve()
+    _validate_root(base)
     files = sorted(path for path in base.glob(args.pattern) if path.is_file())
     if not files:
         parser.error(f"no files matched {args.pattern!r} under {base}")
@@ -38,7 +55,9 @@ def main() -> int:
                     source_type=args.source_type,
                     source_url=str(path),
                     trust_level=args.trust_level,
-                    metadata={"path": str(path), "format": path.suffix.lstrip(".")},
+                    # Relative path keeps manifests comparable across machines;
+                    # source_url keeps the absolute path for stale-doc cleanup.
+                    metadata={"path": str(path.relative_to(base)), "format": path.suffix.lstrip(".")},
                     max_chars=args.max_chars,
                 )
                 chunks = knowledge.chunk_count(document.document_id)

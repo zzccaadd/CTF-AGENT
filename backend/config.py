@@ -43,5 +43,11 @@ class Settings(BaseSettings):
     knowledge_top_k: int = 5
     knowledge_max_chars: int = 8_000
     knowledge_query_timeout_ms: int = 200
+    # Stage 3 S3.1 retrieval budgets: per-turn / per-solver / per-challenge
+    # query limits and the cumulative context-char budget.
+    knowledge_turn_budget: int = 1
+    knowledge_solver_budget: int = 8
+    knowledge_challenge_budget: int = 24
+    knowledge_context_chars_budget: int = 32_000
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

@@ -151,5 +151,129 @@ def test_service_excludes_unapproved_source_types(tmp_path) -> None:
 def test_schema_version_is_recorded(tmp_path) -> None:
     knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
     version = knowledge._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 1
+    assert version == 2
+    knowledge.close()
+
+
+def test_schema_migration_v1_to_v2_reindexes_cjk(tmp_path) -> None:
+    """A v1 database (CJK runs as single tokens) must be rebuilt on open so
+    per-character Chinese queries keep working after the upgrade."""
+    db = tmp_path / "knowledge.sqlite3"
+    knowledge = SQLiteKnowledgeBase(db)
+    knowledge.ingest(title="指南", text="格式化字符串利用", source_type="official")
+    chunk_id = knowledge._conn.execute("SELECT chunk_id FROM knowledge_chunks LIMIT 1").fetchone()[0]
+    with knowledge._conn:
+        # Simulate v1 FTS content: the whole CJK run is ONE token.
+        knowledge._conn.execute("DELETE FROM knowledge_fts")
+        knowledge._conn.execute(
+            "INSERT INTO knowledge_fts(chunk_id, title, section, text) VALUES (?, ?, ?, ?)",
+            (chunk_id, "指南", "", "格式化字符串利用"),
+        )
+        knowledge._conn.execute("PRAGMA user_version = 1")
+    knowledge.close()
+
+    knowledge = SQLiteKnowledgeBase(db)
+    try:
+        assert knowledge._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        hits = knowledge.search(SearchRequest("格式化"))
+        assert [hit.provenance["title"] for hit in hits] == ["指南"]
+    finally:
+        knowledge.close()
+
+
+def test_service_returns_completed_slow_results_instead_of_fake_timeout(tmp_path) -> None:
+    """A query that finishes after the deadline must still return results.
+
+    The in-query progress handler enforces the hard deadline; post-hoc latency
+    is diagnostic-only so cold caches cannot silently disable RAG."""
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="Guide", text="slow but completed z3 guide", source_type="official")
+    service = KnowledgeService(knowledge, timeout_ms=1)
+
+    real_search = knowledge.search
+    import time as _time
+
+    def slow_search(request, *, timeout_ms=None):
+        _time.sleep(0.05)
+        return real_search(request, timeout_ms=timeout_ms)
+
+    knowledge.search = slow_search  # type: ignore[method-assign]
+    try:
+        results = service.search("z3", top_k=5)
+    finally:
+        service.close()
+
+    assert len(results) == 1
+    assert service.last_diagnostic["status"] == "ok"
+    assert "exceeded_timeout_ms" in service.last_diagnostic
+
+
+def test_service_rejects_oversized_query_and_metadata(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    service = KnowledgeService(knowledge)
+
+    assert service.search("z" * (KnowledgeService.MAX_QUERY_CHARS + 1)) == []
+    assert service.last_diagnostic["reason"] == "query_too_long"
+
+    try:
+        service.search("z3", metadata={f"key{i}": "v" for i in range(KnowledgeService.MAX_METADATA_ITEMS + 1)})
+    except ValueError:
+        assert service.last_diagnostic["reason"] == "invalid_metadata"
+    else:
+        raise AssertionError("oversized metadata must be rejected")
+
+    service.close()
+
+
+def test_service_records_diagnostic_for_invalid_top_k(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    service = KnowledgeService(knowledge)
+    try:
+        service.search("z3", top_k=0)
+    except ValueError:
+        assert service.last_diagnostic["reason"] == "invalid_top_k"
+    else:
+        raise AssertionError("top_k=0 must be rejected")
+    service.close()
+
+
+def test_service_ignores_non_string_source_type(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="Guide", text="z3 guide", source_type="official")
+    service = KnowledgeService(knowledge)
+
+    results = service.search("z3", source_type=123)  # model garbage must not crash
+    assert len(results) == 1
+    service.close()
+
+
+def test_fts_cjk_query_uses_per_character_prefix_recall(tmp_path) -> None:
+    """unicode61 groups a contiguous CJK run into one index token, so the query
+    side expands CJK into per-character prefix terms. This pins the documented
+    Chinese query 口径: 格式化字符串 must recall 格式化字符串利用, and must not
+    recall unrelated runs (字节对齐)."""
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="指南", text="格式化字符串利用", source_type="official")
+    knowledge.ingest(title="对齐", text="字节对齐", source_type="reference")
+
+    hits = knowledge.search(SearchRequest("格式化字符串"))
+    assert [hit.provenance["title"] for hit in hits] == ["指南"]
+
+    # A space inside the CJK run must not break recall.
+    spaced = knowledge.search(SearchRequest("格式化 字符串"))
+    assert [hit.provenance["title"] for hit in spaced] == ["指南"]
+
+    assert [hit.provenance["title"] for hit in knowledge.search(SearchRequest("对齐"))] == ["对齐"]
+    knowledge.close()
+
+
+def test_fts_special_characters_are_sanitized_not_crashed(tmp_path) -> None:
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(title="Asm", text="x86-64 assembly calling convention", source_type="official")
+
+    results = knowledge.search(SearchRequest('C++ "quoted" x86-64!?/'))
+    assert len(results) == 1
+    assert results[0].provenance["title"] == "Asm"
+    # Pure punctuation queries yield no tokens and no crash.
+    assert knowledge.search(SearchRequest("!!! ??? ###")) == []
     knowledge.close()

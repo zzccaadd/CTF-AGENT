@@ -48,6 +48,18 @@ def test_offline_prompt_states_network_policy() -> None:
     assert "General internet and external webhooks are disabled" in prompt
 
 
+def test_prompt_knowledge_section_follows_knowledge_enabled() -> None:
+    enabled = build_prompt(
+        ChallengeMeta(name="demo"), [], allow_internet=False, knowledge_enabled=True
+    )
+    assert "## Knowledge Base" in enabled
+    assert "search_knowledge" in enabled
+    assert "ONE knowledge query per turn" in enabled
+
+    disabled = build_prompt(ChallengeMeta(name="demo"), [], allow_internet=False)
+    assert "## Knowledge Base" not in disabled
+
+
 def test_timeout_result_preserves_solver_diagnostics() -> None:
     class Tracer:
         path = "/tmp/demo-trace.jsonl"

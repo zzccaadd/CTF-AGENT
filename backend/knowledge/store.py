@@ -18,7 +18,11 @@ from backend.knowledge.models import KnowledgeDocument, SearchRequest, SearchRes
 
 TRUST_WEIGHT = {"official": 1.20, "high": 1.10, "medium": 1.00, "low": 0.80}
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]+")
-SCHEMA_VERSION = 1
+CJK_RUN_RE = re.compile(r"[\u3400-\u9fff]+")
+# v1 indexed a contiguous CJK run as ONE unicode61 token (useless for Chinese
+# search); v2 inserts a space between CJK characters so each char is its own
+# token, and rebuilds the FTS table on migration.
+SCHEMA_VERSION = 2
 _INIT_LOCK = threading.Lock()
 
 
@@ -96,8 +100,41 @@ class SQLiteKnowledgeBase:
             if version > SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported knowledge schema version: {version}")
             if version < SCHEMA_VERSION:
+                self._migrate(version)
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
+
+    @staticmethod
+    def _fts_search_text(text: str) -> str:
+        """Split adjacent CJK characters so unicode61 indexes each char as its
+        own token (v2 Chinese search 口径). ASCII text is left untouched."""
+        return re.sub(r"([\u3400-\u9fff])", r" \1 ", text)
+
+    def _migrate(self, from_version: int) -> None:
+        """Explicit, serialized schema migrations (v1 -> v2 = CJK re-tokenize)."""
+        if from_version < 1:
+            return  # fresh database: current DDL is already in place
+        if from_version < 2:
+            # v1 FTS rows tokenize CJK runs as single tokens; re-insert every
+            # chunk's text/title/section with per-character CJK separation.
+            self._conn.execute("DELETE FROM knowledge_fts")
+            rows = self._conn.execute(
+                """SELECT c.chunk_id, d.title, c.section, c.text
+                   FROM knowledge_chunks AS c
+                   JOIN knowledge_documents AS d ON d.document_id = c.document_id"""
+            ).fetchall()
+            self._conn.executemany(
+                "INSERT INTO knowledge_fts(chunk_id, title, section, text) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        row[0],
+                        self._fts_search_text(row[1]),
+                        self._fts_search_text(row[2]),
+                        self._fts_search_text(row[3]),
+                    )
+                    for row in rows
+                ],
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -131,6 +168,7 @@ class SQLiteKnowledgeBase:
         trust_level: str = "medium",
         document_id: str | None = None,
         max_chars: int = 1600,
+        line_offset: int = 0,
     ) -> KnowledgeDocument:
         source_type = source_type.strip().lower()
         if not source_type:
@@ -139,6 +177,8 @@ class SQLiteKnowledgeBase:
             raise ValueError("benchmark corpus must not be indexed as RAG knowledge")
         if trust_level not in TRUST_WEIGHT:
             raise ValueError(f"unsupported trust_level: {trust_level}")
+        if line_offset < 0:
+            raise ValueError("line_offset must be non-negative")
         normalized_text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not normalized_text:
             raise ValueError("knowledge document cannot be empty")
@@ -175,11 +215,25 @@ class SQLiteKnowledgeBase:
                     """INSERT INTO knowledge_chunks
                     (chunk_id, document_id, ordinal, text, section, line_start, line_end, metadata)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (chunk_id, doc_id, chunk.ordinal, chunk.text, chunk.section, chunk.line_start, chunk.line_end, self._json(chunk_metadata)),
+                    (
+                        chunk_id,
+                        doc_id,
+                        chunk.ordinal,
+                        chunk.text,
+                        chunk.section,
+                        chunk.line_start + line_offset if chunk.line_start is not None else None,
+                        chunk.line_end + line_offset if chunk.line_end is not None else None,
+                        self._json(chunk_metadata),
+                    ),
                 )
                 self._conn.execute(
                     "INSERT INTO knowledge_fts(chunk_id, title, section, text) VALUES (?, ?, ?, ?)",
-                    (chunk_id, title, chunk.section, chunk.text),
+                    (
+                        chunk_id,
+                        self._fts_search_text(title),
+                        self._fts_search_text(chunk.section),
+                        self._fts_search_text(chunk.text),
+                    ),
                 )
         return KnowledgeDocument(
             document_id=doc_id,
@@ -219,8 +273,22 @@ class SQLiteKnowledgeBase:
 
     @staticmethod
     def _fts_query(query: str) -> str:
-        tokens = TOKEN_RE.findall(query)
-        return " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens)
+        """Build an FTS5 MATCH expression from a free-text query.
+
+        - ASCII tokens are exact-quoted: `"x86" OR "64"`.
+        - A CJK run is expanded into per-character AND terms: `("格" AND "式"
+          AND "化")`, because v2 indexes each CJK char as its own token. Runs
+          are OR-combined with each other and with ASCII terms. This 口径 is
+          pinned by tests/test_knowledge.py.
+        """
+        terms: list[str] = []
+        for match in TOKEN_RE.finditer(query):
+            token = match.group(0)
+            if CJK_RUN_RE.fullmatch(token):
+                terms.append("(" + " AND ".join(f'"{char}"' for char in token) + ")")
+            else:
+                terms.append(f'"{token.replace(chr(34), "")}"')
+        return " OR ".join(terms)
 
     @staticmethod
     def _matches_metadata(metadata: dict[str, Any], expected: dict[str, Any]) -> bool:
@@ -237,7 +305,7 @@ class SQLiteKnowledgeBase:
             self._conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             rows = self._conn.execute(
-                """SELECT f.chunk_id, f.text, f.section, bm25(knowledge_fts, 1.0, 0.7, 1.2) AS rank,
+                """SELECT f.chunk_id, c.text, f.section, bm25(knowledge_fts, 1.0, 0.7, 1.2) AS rank,
                           d.document_id, d.title, d.source_type, d.source_url, d.metadata AS doc_metadata,
                           d.trust_level, c.line_start, c.line_end, c.metadata AS chunk_metadata
                    FROM knowledge_fts AS f

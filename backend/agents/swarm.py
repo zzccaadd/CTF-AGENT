@@ -105,9 +105,17 @@ class ChallengeSwarm:
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
     run_id: str = ""
     evidence_board: EvidenceBoard | None = field(default=None, init=False, repr=False)
+    # Shared per-challenge knowledge query budget (Stage 3 S3.1); one object
+    # for every solver of this challenge.
+    _knowledge_challenge_budget: object | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Create one persistent board per challenge run and seed worker intents."""
+        from backend.knowledge.budget import KnowledgeBudget
+
+        self._knowledge_challenge_budget = KnowledgeBudget(
+            int(getattr(self.settings, "knowledge_challenge_budget", 24))
+        )
         db_path = getattr(self.settings, "evidence_db_path", "logs/evidence.sqlite3")
         self.evidence_board = EvidenceBoard.open(db_path, self.meta.name, self.run_id or None)
         self.run_id = self.evidence_board.run_id
@@ -197,6 +205,7 @@ class ChallengeSwarm:
                 notify_coordinator=_notify,
                 solver_label=solver_label,
                 evidence_board=self.evidence_board,
+                knowledge_challenge_budget=self._knowledge_challenge_budget,
             )
 
         return self._create_pydantic_solver(model_spec, solver_label=solver_label)
