@@ -16318,3 +16318,28 @@ index cf0293d..35d85ec 100644
 > 【本轮改动已随 fix/swarm-aggregation 提交推送（bfd1681 之后的两个提交）；完整 diff 见 git log。】
 > ```
 ---
+
+# 开发记录【50】
+> 时间：2026-08-31
+> 会话ID：【3-solver-on 实验启动（多 solver 知识指标验证）】
+> 涉及文件：log.md
+> 需求/遇到的问题：
+> 修复 swarm 级知识指标聚合后，用户要求直接启动 3 solver/题的 RAG-on 运行（不等 v2 对照收尾），验证多 solver 协作下的知识调用与解题效率。
+
+> 我的原始提问Prompt：
+> > 直接开新的3-solver-on 不等了
+
+> 分析与根因：
+> v2 对照（bash-12，--concurrency 4 单 solver）仍在 off 阶段收尾；3-solver 实验与之并行运行，知识库为只读查询（WAL 支持多读），无冲突。run_rag_eval 本轮已支持 --solvers-per-swarm（默认 1 保持兼容），runner 正常路径已改为 swarm 全 solver 知识指标聚合（记录【49】），故 3-solver 结果可反映整个 swarm 的真实知识使用。
+
+> 代码改动说明：
+> 【无代码改动】执行命令：scripts/run_rag_eval.py --manifest benchmarks/rag_eval/knowledge_probe_v2.json --rag --solvers-per-swarm 3 --concurrency 2 --timeout 900 --results-dir results/rag_eval_v2_s3（11 题 on-only，每题 3 个 Codex worker 竞争，结果独立目录避免与对照产物混淆）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：78 passed；ruff 通过（本轮无代码改动）。运行中，结果待汇总：关注多 solver 下的 solve rate、每 swarm 知识指标（queries/hits/cache/rejections 已按全 solver 聚合）、以及 3 worker 协作对耗时/成本的影响。
+
+> 本次完整代码Diff：
+> ```diff
+> 【无】
+> ```
+---
