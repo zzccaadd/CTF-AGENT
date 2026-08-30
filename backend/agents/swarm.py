@@ -122,19 +122,22 @@ class ChallengeSwarm:
         self.message_bus.attach_board(self.evidence_board)
         self.evidence_board.start("swarm")
         self._restore_followup_index()
-        # Three focused bootstrap tasks give the initial Codex workers distinct work.
-        goals = (
-            "Recon the challenge files, target, and exposed services",
-            "Analyze the challenge implementation or artifacts for the primary weakness",
-            "Try an independent exploitation or decoding path and verify results",
+        # ONE minimal seed intent gives workers something to claim; all further
+        # planning belongs to the LLM coordinator (muteki-style), which
+        # proposes intents when the blackboard's fact/dead-end counts change.
+        self.evidence_board.propose(
+            "coordinator",
+            "Establish a verified-facts baseline: inspect the challenge files and services, then record verified facts or a dead end.",
+            acceptance="Write verified facts or a dead end, then complete the intent",
+            intent_id=f"bootstrap:{self.meta.name}:{self.run_id}:1",
         )
-        for idx, goal in enumerate(goals, 1):
-            self.evidence_board.propose(
-                "coordinator",
-                goal,
-                acceptance="Write verified facts or a dead end, then complete the intent",
-                intent_id=f"bootstrap:{self.meta.name}:{self.run_id}:{idx}",
-            )
+        # Muteki-style planner: triggered on fact/dead-end changes, plans with
+        # the configured model, writes reasoning to its own trace.
+        self.coordinator = None
+        if getattr(self.settings, "coordinator_enabled", True):
+            from backend.agents.coordinator import Coordinator
+
+            self.coordinator = Coordinator(self.settings, self.meta.name, self.run_id)
 
     def _restore_followup_index(self) -> None:
         """Continue dynamic intent numbering when a run is reopened."""
@@ -417,8 +420,7 @@ class ChallengeSwarm:
         model_spec: str,
         solver_label: str,
     ) -> tuple[SolverResult, SolverProtocol]:
-        """Inner loop: start → run → bump → run → ..."""
-        bump_count = 0
+        """Inner loop: start → run → (coordinator plans) → ..."""
         consecutive_errors = 0
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
@@ -499,24 +501,52 @@ class ChallengeSwarm:
                 else:
                     consecutive_errors = 0
 
-                bump_count += 1
-                # Cooldown between bumps — check cancellation during wait
-                try:
-                    await asyncio.wait_for(
-                        self.cancel_event.wait(),
-                        timeout=min(bump_count * 30, 300),
-                    )
-                    break  # cancelled during cooldown
-                except TimeoutError:
-                    pass  # cooldown elapsed, proceed with bump
-                insights = self._gather_sibling_insights(solver_label)
-                solver.bump(insights)
-                logger.info(
-                    f"[{self.meta.name}/{solver_label}] Bumped ({bump_count}), resuming"
-                )
-                continue
+                # Planning is the LLM coordinator's job now (muteki-style);
+                # the code-level bump loop is removed.
+                break
 
         return result, solver
+
+    async def _evidence_signature(self) -> tuple[int, int]:
+        """(verified_fact_count, dead_end_count) — the muteki-style trigger for
+        coordinator planning (plan when the graph's facts/dead-ends change)."""
+        if not self.evidence_board:
+            return (0, 0)
+        events = self.evidence_board.store.events(self.meta.name, self.run_id)
+        facts = sum(1 for e in events if e.kind == "fact_added" and e.verified)
+        dead_ends = sum(1 for e in events if e.kind == "dead_end_added")
+        return (facts, dead_ends)
+
+    async def _coordinator_loop(self) -> None:
+        """Poll the blackboard signature and run the planner on changes."""
+        if self.coordinator is None:
+            return
+        interval = int(getattr(self.settings, "coordinator_interval_seconds", 5))
+        last = await self._evidence_signature()
+        try:
+            while not self.cancel_event.is_set():
+                await asyncio.sleep(interval)
+                signature = await self._evidence_signature()
+                if signature == last:
+                    continue
+                last = signature
+                summary = self.evidence_board.summary() if self.evidence_board else ""
+                plan = await self.coordinator.plan(summary)
+                if not plan.raw:
+                    continue
+                existing = {
+                    intent.goal
+                    for intent in self.evidence_board.store.list_intents(
+                        self.meta.name, self.run_id, active_only=False
+                    )
+                } if self.evidence_board else set()
+                self.coordinator.propose(self.evidence_board, plan, existing)
+                if plan.verdict == "complete":
+                    logger.info("[%s] coordinator verdict=complete", self.meta.name)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # coordinator failures must never kill the swarm
+            logger.warning("[%s] coordinator loop error: %s", self.meta.name, exc)
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""
@@ -524,6 +554,7 @@ class ChallengeSwarm:
             asyncio.create_task(self._run_solver(slot), name=f"solver-{slot.label}")
             for slot in self._solver_slots()
         ]
+        coordinator_task = asyncio.create_task(self._coordinator_loop(), name="coordinator")
 
         try:
             while tasks:
@@ -539,6 +570,10 @@ class ChallengeSwarm:
                         for p in pending:
                             p.cancel()
                         await asyncio.gather(*pending, return_exceptions=True)
+                        coordinator_task.cancel()
+                        await asyncio.gather(coordinator_task, return_exceptions=True)
+                        if self.coordinator is not None:
+                            self.coordinator.close()
                         if self.evidence_board:
                             self.evidence_board.finish("swarm", "flag_verified")
                         return result
@@ -550,12 +585,17 @@ class ChallengeSwarm:
                 self.evidence_board.finish("swarm", "workers_exhausted")
             if self.winner is None:
                 self.winner = self._confirmed_flag_result()
+            coordinator_task.cancel()
+            await asyncio.gather(coordinator_task, return_exceptions=True)
+            if self.coordinator is not None:
+                self.coordinator.close()
             return self.winner
         except asyncio.CancelledError:
             self.cancel_event.set()
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            coordinator_task.cancel()
+            await asyncio.gather(*tasks, coordinator_task, return_exceptions=True)
             if self.evidence_board:
                 self.evidence_board.finish("swarm", "cancelled")
             raise
@@ -564,7 +604,8 @@ class ChallengeSwarm:
             self.cancel_event.set()
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            coordinator_task.cancel()
+            await asyncio.gather(*tasks, coordinator_task, return_exceptions=True)
             if self.evidence_board:
                 self.evidence_board.finish("swarm", "swarm_error")
             return None

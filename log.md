@@ -16495,3 +16495,28 @@ index cf0293d..35d85ec 100644
 > 【新增 knowledge_probe_v4.json 清单文件。】
 > ```
 ---
+
+# 开发记录【57】
+> 时间：2026-08-31
+> 会话ID：【muteki 式 LLM coordinator 落地（对齐 reason.py 语义）】
+> 涉及文件：backend/agents/coordinator.py（新增）/ backend/agents/swarm.py / backend/agents/codex_solver.py / backend/config.py / tests/test_coordinator.py（新增）/ log.md
+> 需求/遇到的问题：
+> 用户确认按 muteki-main 架构对齐协调层，明确五点：1) 触发对齐（黑板 fact/dead-end 数量变化时规划）；2) 执行只用 gpt-5.5；3) 证据审计对齐（intent 只能基于 verified facts）；4) 可观测写 trace；5) bump 去掉、代码状态机去掉。此前架构无 coordinator 模型（3 个硬编码 bootstrap intents + bump 注入），与 muteki 的 LLM 规划循环不一致。
+
+> 我的原始提问Prompt：
+> > 1.触发对齐 2.执行就只用5.5 3.证据审计对齐 4.可观测给写trace 5。 bump去掉，代码状态机也去掉。
+
+> 分析与根因：
+> muteki `solver/reason.py`：reason phase 是全局规划器 + 反幻觉证据审计——读 graph 提出不重叠 intents、拒绝基于未验证证据的 intent、verdict 状态机（explore/course_correct/complete）、graph 的 fact/dead-end 数量变化时触发。对照现有实现：bootstrap 3 个硬编码 intents（无规划）、bump 每 5 步注入黑板摘要（代码协调）、solver 间 insights 注入（_bump_insights）——全部由代码决策，无 LLM 规划。
+
+> 代码改动说明：
+> backend/agents/coordinator.py（新增）：Coordinator 类——单轮 Codex JSON-RPC（复用 rag_tool_probe 流程，无 sandbox 无工具）、模型 gpt-5.5（coordinator_model 可配）、REASON_PROMPT 对齐 reason.py（证据审计规则 + verdict 状态机 + intents schema）、_parse_plan 容错解析、独立 tracer（trace-coordinator-*.jsonl，assistant_message + plan 事件）、propose 审计（空/重复跳过、run 作用域 id）。backend/agents/swarm.py：bootstrap 3 intents 改为 1 个最小 recon seed；新增 _evidence_signature（verified fact + dead_end 计数）与 _coordinator_loop（每 5s 轮询，签名变化时 plan → propose）；run() 启动/取消 coordinator task；删除 bump 循环（bump_count/cooldown/_gather_sibling_insights/solver.bump）。backend/agents/codex_solver.py：删除每 5 步 do_check_findings 注入、_bump_insights 字段与使用；bump() 改为协议兼容 no-op（记录 bump_ignored）。backend/config.py：coordinator_enabled/coordinator_model/coordinator_interval_seconds/coordinator_turn_timeout_s。tests/test_coordinator.py（新增）：plan 解析（verdict/intents/audit、垃圾输入、坏 verdict、空 goal）、propose 去重审计、触发签名（hypothesis 不触发、verified fact/dead_end 触发）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：87 passed（82→87）；ruff 通过。v4 运行（bash-16）不受影响（运行中进程用旧代码）；coordinator 首次真实生效需下一轮运行（v5）验证：触发频率、intent 质量、trace 可观测、对 solve rate 的影响。遗留：coordinator 成本（每题 2-5 次 gpt-5.5 规划调用）待实测；verdict=complete 时 swarm 停机的联动暂只记录日志（flag 确认路径已有 cancel 机制）。
+
+> 本次完整代码Diff：
+> ```diff
+> 【coordinator 模块与 swarm/solver 改造已随本轮提交推送；详见 git log。】
+> ```
+---

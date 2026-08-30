@@ -285,7 +285,6 @@ class CodexSolver:
         self._last_tool_output = ""
         self._last_tool_was_external = False
         self._cost_usd = 0.0
-        self._bump_insights: str | None = None
         self._structured_output: dict | None = None
         self._turn_error: str | None = None
         self._compact_requested = False
@@ -623,12 +622,6 @@ class CodexSolver:
                     provenance={"source_kind": "trace", "trace_path": self.tracer.path, "trace_event_index": self._step_count},
                     dedupe_key=f"tool:{self.meta.name}:{self.evidence_board.run_id if self.evidence_board else self.tracer.path}:{self.solver_label}:{self._step_count}",
                 )
-
-            if self._step_count % 5 == 0 and self.message_bus:
-                from backend.tools.core import do_check_findings
-                findings = await do_check_findings(self.message_bus, self.solver_label)
-                if findings and "No new findings" not in findings:
-                    result_text = f"{result_text}\n\n---\n{findings}"
 
             content_items = [{"type": "inputText", "text": result_text}]
 
@@ -1025,14 +1018,7 @@ class CodexSolver:
             task_context = f"\n\nYour assigned shared-blackboard task (intent {intent_id}): {self._intent_goal}\n"
             task_context += f"Acceptance: {self._intent_acceptance}\n"
             task_context += f"\nCurrent blackboard:\n{board_context}\n"
-        if self._bump_insights:
-            prompt_text = (
-                "Your previous attempt did not find the flag. "
-                f"Insights from other agents:\n\n{self._bump_insights}\n\n"
-                "Try a different approach."
-            )
-            self._bump_insights = None
-        elif self._step_count == 0:
+        if self._step_count == 0:
             prompt_text = (
                 "Work only on your assigned intent. Use the blackboard tools to record facts, hypotheses, and dead ends."
                 if self.evidence_board else "Solve this CTF challenge."
@@ -1159,9 +1145,9 @@ class CodexSolver:
                 return self._result(ERROR)
 
     def bump(self, insights: str) -> None:
-        self._bump_insights = insights
-        self.loop_detector.reset()
-        self.tracer.event("bump", insights=insights[:500])
+        """Deprecated: planning is the LLM coordinator's job (muteki-style).
+        Kept as a protocol-compatible no-op for existing callers."""
+        self.tracer.event("bump_ignored", reason="coordinator_replaces_bump", insights=insights[:200])
 
     def _result(self, status: str) -> SolverResult:
         self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed)

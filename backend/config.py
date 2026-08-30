@@ -49,5 +49,11 @@ class Settings(BaseSettings):
     knowledge_solver_budget: int = 8
     knowledge_challenge_budget: int = 24
     knowledge_context_chars_budget: int = 32_000
+    # Muteki-style LLM coordinator: plans intents when blackboard fact/dead-end
+    # counts change; runs on the configured model with its own trace.
+    coordinator_enabled: bool = True
+    coordinator_model: str = "gpt-5.5"
+    coordinator_interval_seconds: int = 5
+    coordinator_turn_timeout_s: int = 120
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
