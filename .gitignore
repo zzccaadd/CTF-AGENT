@@ -17,7 +17,6 @@ workspace/
 challenges*/
 codex-schema-*/
 
-
 # Python cache and build artifacts
 __pycache__/
 *.pyc
