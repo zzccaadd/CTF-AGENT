@@ -13757,3 +13757,28 @@ diff --git a/tests/test_benchmark_policy.py b/tests/test_benchmark_policy.py
 +    assert "## Knowledge Base" not in disabled
 > ```
 ---
+
+# 开发记录【47】
+> 时间：2026-08-31
+> 会话ID：【Stage 3 前置四件套：预算/gate/评估基建/git 收尾】
+> 涉及文件：backend/knowledge/budget.py（新增）/ backend/agents/codex_solver.py / backend/agents/swarm.py / backend/config.py / backend/solver_base.py / backend/benchmarks/models.py / backend/benchmarks/runner.py / backend/prompts.py / scripts/run_rag_eval.py / scripts/analyze_rag_compare.py / scripts/generate_stage3_gate.py（新增）/ tests/* / log.md
+> 需求/遇到的问题：
+> 用户确认按顺序完成四项不依赖实验结果的 Stage 3 前置工作：S3.1 检索预算与 query_outcome、S3.0 Stage 2 gate、S3.4 评估基建（repeat/seed/随机化）、git 提交推送收尾。
+
+> 我的原始提问Prompt：
+> > 可以，这四个都可以完成，按顺序都来做把
+
+> 分析与根因：
+> S3.1：模型此前无约束调用知识工具（v1 冒烟 cvv 空转 50 万 token），需要把 plan §3.2 的预算设计落地为代码——turn/solver/challenge 三级限额 + 32k 字符累计 + 去重缓存 + query_outcome 终态；跨 solver 的 challenge 预算需要 swarm 级共享对象。S3.0：评估结论必须锚定固定版本，需要生成不可变 gate 档案（git/环境/语料/检查结果/发布矩阵）。S3.4：现有对照固定"先 off 后 on"且单次运行，需要 --repeats/--seed、随机化顺序、incomplete 配对标记与跨 replicate 聚合。git：全部成果未提交，先固化可回滚 commit 再继续实验。
+
+> 代码改动说明：
+> backend/knowledge/budget.py（新增）：KnowledgeBudget 共享计数器（swarm 级，asyncio 单线程无需锁）。backend/agents/swarm.py：__post_init__ 创建 challenge 级预算并传入 CodexSolver。backend/agents/codex_solver.py：search_knowledge 路径重写——tool_calls 计数、turn/solver/context/challenge 四级预算检查（超限返回可读消息并计 budget_rejections）、同 query+filter+top_k 去重缓存（cache_hit 不计 queries）、query_outcome 终态映射（ok/no_hit/invalid_query/invalid_params/timeout/store_error）+ trace/evidence 记录；turn 起点重置 turn 计数；_result 输出新字段。backend/config.py：knowledge_turn_budget=1/solver_budget=8/challenge_budget=24/context_chars_budget=32000。backend/solver_base.py、backend/benchmarks/models.py、backend/benchmarks/runner.py：knowledge_tool_calls/cache_hits/budget_rejections 三字段全链路。backend/prompts.py：build_prompt 增 knowledge_enabled 参数与 Knowledge Base 段（上一轮已实现，随本提交固化）。scripts/run_rag_eval.py：--repeats/--seed；每 replicate 用 rng.sample 随机化 off/on 顺序（Stage 3 §6.2）；repeats>1 时按 repN 子目录隔离产物；_incomplete_pairs 标记缺侧配对；_aggregate_replicates 输出跨 replicate 均值与每题解出计数。scripts/analyze_rag_compare.py：兼容新旧 comparison schema。scripts/generate_stage3_gate.py（新增）：生成 S3.0 不可变 gate 档案（git head/dirty、环境、corpus manifest/bootstrap 报告/DB 哈希、pytest/ruff/compileall 结果、发布矩阵、benchmark 默认值）。tests：预算（turn/solver/缓存/outcome/共享预算）、incomplete 配对、replicate 聚合、提示词 Knowledge 段等新增测试。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：75 passed（67→75）；ruff 通过；compileall 通过；gate 脚本实际运行生成 logs/stage3_gate_20260831-063444.json（pytest/ruff/compileall 全绿、73 md/72 docs/403 chunks 归档）。git：rag_branch 提交 bfd1681（代码/工具/测试，23 文件）+ fbf12d9（语料/评测资产/文档/log，84 文件），已推送 origin/rag_branch（dc7c90f..fbf12d9），本地与远端同步；benchmarks/cybench 子模块内部差异与 .codex-diffs 快照未提交（有意保留）。遗留：v2 对照（knowledge_probe_v2，--concurrency 4）仍在后台运行，完成后用新版 analyze_rag_compare.py 汇总；正式评估需 3 replicate + qrels。
+
+> 本次完整代码Diff：
+> ```diff
+> 【本轮改动已随提交 bfd1681/fbf12d9 固化；.codex-diffs 增量快照由后续 save_worktree_diff.sh 生成。】
+> ```
+---
