@@ -140,6 +140,7 @@ class Coordinator:
             await proc.stdin.drain()
 
         async def read_loop() -> None:
+            nonlocal turn_failed
             while True:
                 line = await proc.stdout.readline()
                 if not line:
@@ -184,7 +185,7 @@ class Coordinator:
                         else:
                             error_msg = str(error)
                         self.tracer.event("plan_failed", reason="turn_failed", error=error_msg[:300])
-                        turn_failed = True  # noqa: F841  (read after turn_done in plan())
+                        turn_failed = True
                     turn_done.set()
 
         reader = asyncio.create_task(read_loop())

@@ -149,3 +149,83 @@ def test_evidence_signature_counts_facts_dead_ends_and_hypotheses() -> None:
 
     asyncio.run(main())
     board.close()
+
+
+def test_plan_returns_empty_raw_on_turn_failed(monkeypatch) -> None:
+    """A turn/completed with status=failed must yield an empty plan (raw="")
+    and no `plan` event — a 403 balance failure must not masquerade as a
+    successful empty plan. Regression for the nonlocal closure bug where
+    `turn_failed` was assigned inside read_loop without nonlocal, so the flag
+    never reached plan()."""
+    import asyncio
+    import json
+
+    class FakeStream:
+        """Line-based stdout; None ends the stream (EOF)."""
+
+        def __init__(self, lines: list[dict]) -> None:
+            self.lines = list(lines)
+            self.pos = 0
+
+        async def readline(self) -> bytes:
+            if self.pos >= len(self.lines):
+                return b""
+            await asyncio.sleep(0.05)  # let rpc() register its pending future first
+            line = self.lines[self.pos]
+            self.pos += 1
+            return json.dumps(line).encode()
+
+    class FakeStdin:
+        async def write(self, _data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            pass
+
+    class FakeProc:
+        def __init__(self, stdout_lines: list[dict]) -> None:
+            self.stdout = FakeStream(stdout_lines)
+            self.stdin = FakeStdin()
+            self._waited = asyncio.Event()
+
+        def terminate(self) -> None:
+            self._waited.set()
+
+        def kill(self) -> None:
+            self._waited.set()
+
+        async def wait(self) -> int:
+            await self._waited.wait()
+            return 0
+
+    # Scripted protocol: initialize/thread/start/turn responses, then a
+    # failed turn/completed notification.
+    messages = [
+        {"id": 1, "result": {}},
+        {"id": 2, "result": {"thread": {"id": "t1"}}},
+        {"id": 3, "result": {}},
+        {"method": "turn/completed", "params": {"turn": {"status": "failed", "error": {"message": "403 Forbidden: insufficient balance"}}}},
+    ]
+
+    import backend.agents.coordinator as coord_mod
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeProc(messages)
+
+    monkeypatch.setattr(coord_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    coord = _coordinator()
+    events: list[str] = []
+
+    class FakeTracer:
+        def event(self, *args, **kwargs):
+            events.append(args[0] if args else kwargs.get("reason", "?"))
+
+        def close(self):
+            pass
+
+    coord.tracer = FakeTracer()  # type: ignore[assignment]
+    plan = asyncio.run(coord.plan("## Blackboard: demo\n\n### Active intents\n- none"))
+    assert plan.raw == ""
+    assert "plan" not in events, f"plan event must not fire on failed turn, got {events}"
+    assert "plan_failed" in events
