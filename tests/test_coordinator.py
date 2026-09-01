@@ -79,6 +79,33 @@ def test_propose_skips_empty_and_duplicate_intents() -> None:
     assert [goal for goal, _ in board.proposed] == ["New direction"]
 
 
+def test_propose_knowledge_goal_gets_retrieval_acceptance() -> None:
+    """A coordinator goal naming search_knowledge must carry an acceptance
+    that makes running the query a precondition for completion."""
+    coordinator = _coordinator()
+
+    class Board:
+        def __init__(self) -> None:
+            self.proposed: list[tuple[str, str, str]] = []
+
+        def propose(self, actor: str, goal: str, *, acceptance: str = "", intent_id: str | None = None) -> None:
+            self.proposed.append((goal, acceptance, intent_id or ""))
+
+    board = Board()
+    plan = CoordinatorPlan(
+        verdict=VERDICT_EXPLORE,
+        intents=[
+            {"goal": "Run search_knowledge('pyc reversing') before unpacking the binary", "rationale": "r", "depends_on": [], "from_facts": []},
+            {"goal": "Just disassemble main", "rationale": "r", "depends_on": [], "from_facts": []},
+        ],
+    )
+    coordinator.propose(board, plan, existing_goals=set())
+    assert "search_knowledge" in board.proposed[0][0].lower()
+    assert "run the search_knowledge query" in board.proposed[0][1].lower()
+    assert board.proposed[1][0] == "Just disassemble main"
+    assert "search_knowledge" not in board.proposed[1][1].lower()
+
+
 def test_reason_prompt_formats_with_json_example_braces() -> None:
     """The prompt's JSON example contains literal braces that must be escaped
     for str.format — otherwise Coordinator.plan() dies with

@@ -44,6 +44,7 @@ EVIDENCE AUDIT (mandatory):
 - If the flag is already confirmed or the goal is proven by verified facts, verdict must be "complete".
 - verdict meanings: "explore" = keep making progress; "course_correct" = the swarm drifted, propose a new direction; "complete" = goal already satisfied.
 - Intents may include using the search_knowledge tool to consult the local knowledge base when the task needs a technique/format the workers may not know.
+- KNOWLEDGE ROUTING (mandatory): if the challenge involves a technique, format, algorithm, or tool listed in the knowledge base (e.g. XOR variants, pyc reversing, ROP, padding oracle, UPX, SSTI, SQLi, MT19937, RSA attacks) — or any technique the workers might not know precisely — at least ONE of your intents MUST explicitly instruct the worker to run a search_knowledge query with a concrete term (e.g. "search_knowledge('pyc reversing')") BEFORE deeper analysis. Observation-only recon intents do not satisfy this.
 - Do NOT read any skill files, local documentation, or the filesystem. You are a planner without tools: reply with the JSON object directly.
 
 Reply with ONLY a JSON object:
@@ -240,10 +241,19 @@ class Coordinator:
             if not goal or goal in existing_goals:
                 continue
             intent_id = f"coord:{self.run_id}:{next(self._intent_index)}"
+            # If the planner named a knowledge query in the goal, the worker's
+            # acceptance makes running it a precondition for completion.
+            if "search_knowledge" in goal.lower():
+                acceptance = (
+                    "Run the search_knowledge query named in this goal FIRST, "
+                    "then record verified facts or a dead end, then complete the intent"
+                )
+            else:
+                acceptance = "Record verified facts or a dead end, then complete the intent"
             board.propose(
                 "coordinator",
                 goal,
-                acceptance="Record verified facts or a dead end, then complete the intent",
+                acceptance=acceptance,
                 intent_id=intent_id,
             )
             existing_goals.add(goal)
