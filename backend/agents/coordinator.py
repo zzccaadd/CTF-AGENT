@@ -131,6 +131,11 @@ class Coordinator:
             proc.stdin.write((json.dumps(msg) + "\n").encode())
             await proc.stdin.drain()
 
+        async def _respond(request_id: int, result: dict) -> None:
+            resp = {"id": request_id, "result": result}
+            proc.stdin.write((json.dumps(resp) + "\n").encode())
+            await proc.stdin.drain()
+
         async def read_loop() -> None:
             while True:
                 line = await proc.stdout.readline()
@@ -152,7 +157,14 @@ class Coordinator:
                     continue
                 method = msg.get("method", "")
                 params = msg.get("params", {})
-                if method == "item/completed":
+                if method == "item/tool/call" and msg_id is not None:
+                    # The planner has no tools: reject any tool request so the
+                    # turn can complete instead of hanging until turn_timeout.
+                    await _respond(msg_id, {
+                        "contentItems": [{"type": "inputText", "text": "No tools available: the coordinator is a planner only. Reply with the JSON plan directly."}],
+                        "success": False,
+                    })
+                elif method == "item/completed":
                     item = params.get("item", params)
                     if item.get("type") == "agentMessage" and item.get("text"):
                         text = item["text"]
@@ -189,6 +201,11 @@ class Coordinator:
             except TimeoutError:
                 self.tracer.event("plan_failed", reason="turn_timeout")
                 return CoordinatorPlan(raw="")
+        except asyncio.CancelledError:
+            # Swarm finished (e.g. flag verified) while planning: record it so
+            # an empty trace is not misread as "coordinator never triggered".
+            self.tracer.event("plan_cancelled", reason="swarm_finished")
+            raise
         finally:
             proc.terminate()
             try:

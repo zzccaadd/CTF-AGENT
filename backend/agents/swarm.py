@@ -562,16 +562,18 @@ class ChallengeSwarm:
         cooldown = int(getattr(self.settings, "coordinator_min_plan_interval_s", 45))
         last = await self._evidence_signature()
         last_plan_at = 0.0
-        try:
-            while not self.cancel_event.is_set():
-                await asyncio.sleep(poll)
+        while not self.cancel_event.is_set():
+            await asyncio.sleep(poll)
+            try:
                 signature = await self._evidence_signature()
                 if signature == last:
                     continue
-                last = signature
                 now = asyncio.get_running_loop().time()
                 if now - last_plan_at < cooldown:
+                    # Still cooling down: remember the new signature so the
+                    # change is not swallowed, but do not plan yet.
                     continue
+                last = signature
                 last_plan_at = now
                 summary = self.evidence_board.summary() if self.evidence_board else ""
                 plan = await self.coordinator.plan(summary)
@@ -586,10 +588,10 @@ class ChallengeSwarm:
                 self.coordinator.propose(self.evidence_board, plan, existing)
                 if plan.verdict == "complete":
                     logger.info("[%s] coordinator verdict=complete", self.meta.name)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:  # coordinator failures must never kill the swarm
-            logger.warning("[%s] coordinator loop error: %s", self.meta.name, exc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # one bad plan must not kill the loop
+                logger.warning("[%s] coordinator loop error: %s", self.meta.name, exc, exc_info=True)
 
     async def run(self) -> SolverResult | None:
         """Run all solvers in parallel. Returns the winner's result or None."""

@@ -16617,3 +16617,28 @@ index cf0293d..35d85ec 100644
 > 【coordinator prompt 转义与 skill 抑制已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【62】
+> 时间：2026-09-01
+> 会话ID：【v5 验证（2）：coordinator 触发链路打通——turn_timeout 根因是 item/tool/call 未响应】
+> 涉及文件：backend/agents/coordinator.py / backend/agents/swarm.py / tests/test_coordinator.py / log.md
+> 需求/遇到的问题：
+> 验证问题 1 修复有效性时发现两个新问题：1) coordinator 在 swarm 内触发后 plan 仍 turn_timeout（whataxor/matrix-lab-2 两次运行 trace 均只有 plan_failed 或 0 字节），而独立调用 coordinator.plan() 能成功——swarm 内外行为不一致；2) matrix-lab-2 真实运行显示 followup 接力正常（22:24:13 propose → 22:25:42 completed），但无 coord: intent 落地。
+
+> 我的原始提问Prompt：
+> > 那么按照进度，下一步要做什么了（延续 v5 验证）
+
+> 分析与根因：
+> 1) **turn_timeout 根因实锤**：对比 codex_solver 与 coordinator 的 read_loop——solver 处理 `item/tool/call` 服务器请求（动态工具调用并响应），coordinator 的 read_loop **没有处理该消息**。codex app-server 注入 host_skills（muteki-blackboard SKILL.md）后，模型在规划 turn 中尝试调用内置工具（read_file 等）→ 服务器发 item/tool/call 等客户端响应 → coordinator 不响应 → turn 永不结束 → 120s 预算耗尽 turn_timeout。证据：成功 trace（210641）中 assistant_message 已含完整 JSON plan（3 个 intent），但 turn/completed 未触发，plan_failed 紧随其后。2) **_coordinator_loop 两个隐患**：`last = signature` 在冷却检查前更新（冷却期吞掉签名变化，冷却结束永不补触发）；`except Exception` 包住整个 while（一次 plan 异常永久杀死 loop）。3) 时间竞争：swarm 300s timeout vs coordinator 45s 冷却 + 120s turn 预算——慢题上 plan 常被 swarm 结束 cancel（plan_cancelled 事件证实 plan() 已启动）。
+
+> 代码改动说明：
+> backend/agents/coordinator.py：1) read_loop 增加 `item/tool/call` 处理——coordinator 无工具，统一响应 `{"contentItems": [...], "success": False}`（"No tools available: the coordinator is a planner only"），让 turn 正常完成而非挂起；2) plan() 捕获 asyncio.CancelledError 时写 `plan_cancelled` 事件（swarm_finished）再 re-raise——空 trace 不再误导为"从未触发"。backend/agents/swarm.py：_coordinator_loop 重构——冷却期只记录签名不吞变化（冷却结束补触发）；try/except 移入 while 内（单次 plan 异常不杀 loop）；CancelledError 重新抛出。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：95 passed（95→95）；ruff 通过。独立验证：带假设的黑板（含 1 条 hypothesis + completed intent）上 coordinator.plan() 正常返回 verdict=explore + 2 个观察性 intents + audit（"No verified behavioral facts are available yet..."）——修复前该场景 turn_timeout。真实运行 matrix-lab-2（off, 3-solver, 300s）：3 个 seed 全被 claim（#1/#2/#3），#2 完成 seed 后 followup:4 22:32:45 propose → 22:32:57 completed（接力闭环）；coordinator trace 出现 plan_cancelled（plan() 已启动，被 swarm 300s timeout cancel）——修复前 trace 0 字节。遗留：coordinator propose 的 coord: intent 被执行需更长 timeout（如 600s）的题验证；RAG 调用率仍待 on 模式验证。
+
+> 本次完整代码Diff：
+> ```diff
+> 【coordinator item/tool/call 响应 + plan_cancelled 事件 + loop 重构已随本轮提交推送；详见 git log。】
+> ```
+---
