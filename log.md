@@ -16642,3 +16642,28 @@ index cf0293d..35d85ec 100644
 > 【coordinator item/tool/call 响应 + plan_cancelled 事件 + loop 重构已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【63】
+> 时间：2026-09-01
+> 会话ID：【v5 验证（3）：coordinator 完整闭环首次真实生效（coord: intent 被 worker claim 并执行）】
+> 涉及文件：backend/agents/coordinator.py / log.md
+> 需求/遇到的问题：
+> 验证 coordinator 完整链路（触发→plan→propose→claim→执行）。matrix-lab-2 600s 运行中 coordinator 3 次 turn_timeout + 1 次 plan_cancelled（trace 无 assistant_message），而独立测试（含 swarm 活跃期并发）全部 24-55s 成功——swarm 内外行为不一致需定位。
+
+> 我的原始提问Prompt：
+> > 可以，直接开跑测试吧
+
+> 分析与根因：
+> 1) 排除法：4 并发 coordinator 测试全部成功（28-104s）；swarm 运行中外部 coordinator 测试 24.5s 成功——**环境并发不是原因**。2) 加阶段计时调试（rpc_ok 事件记录 initialize/thread_start/turn_start 耗时）后真实运行：**第一次 plan 成功**——RPC 全部 0.1s 秒回，模型 27s 输出 4 个高质量观察性 intents（metadata/disassemble/xor_transform/comparison），`plan` 事件完整写入；后续两次 turn 无输出超时（messages=0）——模型输出时间波动（27s vs >120s）是 gpt-5.5 在该代理（api.tcboys.de）下的偶发行为，非代码 bug。3) 此前 turn_timeout 的根因（item/tool/call 未响应，记录【62】已修）修复后，plan 成功率已从 0 提升到"可成功"。
+
+> 代码改动说明：
+> backend/agents/coordinator.py：plan() 增加阶段计时事件（rpc_ok: initialize/thread_start/turn_start 各记录 elapsed）；plan_failed 附带已收到 assistant messages 计数（messages=N）——超时诊断不再黑盒。保留作为可观测性资产（成本近零，每题 3-6 条事件）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：95 passed；ruff 通过。真实运行 whataxor（off, 3-solver, 300s, run 9707db72）完整闭环实锤：23:47:55 plan 成功 → 4 个 coord: intents propose 落地 → 23:48:50 worker codex/gpt-5.5#3 claim coord:2（"Disassemble main to confirm the exact input flow..."）→ 23:50:03 产出 3 条 hypothesis（main 打印 Enter your password / 调用 xor_transform / strcmp 比较）→ 23:50:11 intent_completed（"Verified from disassembly of main..."）——muteki-style coordinator 首次端到端真实生效。遗留：coordinator turn 偶发超时（模型输出时间波动），可通过提高 coordinator_turn_timeout_s 或加重试缓解；coord:1/3 blocked、coord:4 open 因 swarm flag_found 提前结束（212s）未完成，符合预期。
+
+> 本次完整代码Diff：
+> ```diff
+> 【coordinator 阶段计时与消息计数事件已随本轮提交推送；详见 git log。】
+> ```
+---

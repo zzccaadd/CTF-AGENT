@@ -23,6 +23,7 @@ import asyncio
 import itertools
 import json
 import re
+import time
 from dataclasses import dataclass, field
 
 from backend.tracing import SolverTracer
@@ -176,11 +177,14 @@ class Coordinator:
 
         reader = asyncio.create_task(read_loop())
         try:
+            t0 = time.monotonic()
             await rpc("initialize", {
                 "clientInfo": {"name": "ctf-agent-coordinator", "version": "1.0"},
                 "capabilities": {"experimentalApi": True},
             })
+            self.tracer.event("rpc_ok", phase="initialize", elapsed=round(time.monotonic() - t0, 1))
             await notify("initialized", {})
+            t0 = time.monotonic()
             resp = await rpc("thread/start", {
                 "model": self.model,
                 "personality": "pragmatic",
@@ -191,15 +195,18 @@ class Coordinator:
                 "serviceTier": "flex",
                 "dynamicTools": [],
             })
+            self.tracer.event("rpc_ok", phase="thread_start", elapsed=round(time.monotonic() - t0, 1))
             thread_id = resp["result"]["thread"]["id"]
+            t0 = time.monotonic()
             await rpc("turn/start", {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": "Produce the plan now."}],
             })
+            self.tracer.event("rpc_ok", phase="turn_start", elapsed=round(time.monotonic() - t0, 1))
             try:
                 await asyncio.wait_for(turn_done.wait(), self.turn_budget_s)
             except TimeoutError:
-                self.tracer.event("plan_failed", reason="turn_timeout")
+                self.tracer.event("plan_failed", reason="turn_timeout", messages=len(assistant_text))
                 return CoordinatorPlan(raw="")
         except asyncio.CancelledError:
             # Swarm finished (e.g. flag verified) while planning: record it so
