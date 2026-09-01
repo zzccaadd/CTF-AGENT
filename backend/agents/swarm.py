@@ -585,6 +585,8 @@ class ChallengeSwarm:
             return
         poll = int(getattr(self.settings, "coordinator_interval_seconds", 5))
         cooldown = int(getattr(self.settings, "coordinator_min_plan_interval_s", 45))
+        backoff_after = int(getattr(self.settings, "coordinator_failures_before_backoff", 3))
+        consecutive_failures = 0
         last = await self._evidence_signature()
         last_plan_at = 0.0
         while not self.cancel_event.is_set():
@@ -600,10 +602,21 @@ class ChallengeSwarm:
                     continue
                 last = signature
                 last_plan_at = now
+                if consecutive_failures >= backoff_after:
+                    # Repeated empty plans mean the model is not responding
+                    # (observed under proxy load): stop burning planner turns
+                    # so workers keep the codex sessions they need.
+                    logger.warning(
+                        "[%s] coordinator %d consecutive empty plans — backoff (workers keep sessions)",
+                        self.meta.name, consecutive_failures,
+                    )
+                    continue
                 summary = self.evidence_board.summary() if self.evidence_board else ""
                 plan = await self._plan_with_retry(summary)
                 if not plan.raw:
+                    consecutive_failures += 1
                     continue
+                consecutive_failures = 0
                 existing = {
                     intent.goal
                     for intent in self.evidence_board.store.list_intents(

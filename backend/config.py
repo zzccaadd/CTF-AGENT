@@ -62,5 +62,8 @@ class Settings(BaseSettings):
     coordinator_turn_timeout_s: int = 150
     # Retries for a plan turn that produced no plan (model latency variance).
     coordinator_plan_retries: int = 1
+    # After this many consecutive empty plans, stop planner turns entirely so
+    # workers keep the codex sessions they need (observed under proxy load).
+    coordinator_failures_before_backoff: int = 3
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
