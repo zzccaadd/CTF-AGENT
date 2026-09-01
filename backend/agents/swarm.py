@@ -507,29 +507,45 @@ class ChallengeSwarm:
 
         return result, solver
 
-    async def _evidence_signature(self) -> tuple[int, int]:
-        """(verified_fact_count, dead_end_count) — the muteki-style trigger for
-        coordinator planning (plan when the graph's facts/dead-ends change)."""
+    async def _evidence_signature(self) -> tuple[int, int, int]:
+        """(fact_count, dead_end_count, hypothesis_count) — the trigger for
+        coordinator planning.
+
+        Verified facts alone almost never appear in practice (the fact tool
+        requires the fact to match tool output verbatim), so the signature also
+        counts hypotheses: every solver round auto-records its findings as a
+        hypothesis, which is exactly the "graph changed" signal muteki plans
+        on. The coordinator's prompt still enforces the evidence audit."""
         if not self.evidence_board:
-            return (0, 0)
+            return (0, 0, 0)
         events = self.evidence_board.store.events(self.meta.name, self.run_id)
-        facts = sum(1 for e in events if e.kind == "fact_added" and e.verified)
+        facts = sum(1 for e in events if e.kind == "fact_added")
         dead_ends = sum(1 for e in events if e.kind == "dead_end_added")
-        return (facts, dead_ends)
+        hypotheses = sum(1 for e in events if e.kind == "hypothesis_added")
+        return (facts, dead_ends, hypotheses)
 
     async def _coordinator_loop(self) -> None:
-        """Poll the blackboard signature and run the planner on changes."""
+        """Poll the blackboard signature and run the planner on changes.
+
+        A cooldown between plans keeps cost bounded when the hypothesis count
+        changes every solver round."""
         if self.coordinator is None:
             return
-        interval = int(getattr(self.settings, "coordinator_interval_seconds", 5))
+        poll = int(getattr(self.settings, "coordinator_interval_seconds", 5))
+        cooldown = int(getattr(self.settings, "coordinator_min_plan_interval_s", 45))
         last = await self._evidence_signature()
+        last_plan_at = 0.0
         try:
             while not self.cancel_event.is_set():
-                await asyncio.sleep(interval)
+                await asyncio.sleep(poll)
                 signature = await self._evidence_signature()
                 if signature == last:
                     continue
                 last = signature
+                now = asyncio.get_running_loop().time()
+                if now - last_plan_at < cooldown:
+                    continue
+                last_plan_at = now
                 summary = self.evidence_board.summary() if self.evidence_board else ""
                 plan = await self.coordinator.plan(summary)
                 if not plan.raw:

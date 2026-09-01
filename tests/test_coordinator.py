@@ -79,9 +79,11 @@ def test_propose_skips_empty_and_duplicate_intents() -> None:
     assert [goal for goal, _ in board.proposed] == ["New direction"]
 
 
-def test_evidence_signature_counts_verified_facts_and_dead_ends() -> None:
-    """Trigger alignment: signature changes only when verified facts or dead
-    ends change (muteki: plan when the graph's fact/dead-end counts change)."""
+def test_evidence_signature_counts_facts_dead_ends_and_hypotheses() -> None:
+    """Trigger alignment: any blackboard growth (facts, dead ends OR the
+    auto-recorded hypotheses from each solver round) changes the signature —
+    verified-only facts would never fire because the fact tool requires
+    verbatim output matches."""
     from backend.agents.swarm import ChallengeSwarm
     from backend.evidence import EvidenceBoard
 
@@ -93,16 +95,16 @@ def test_evidence_signature_counts_verified_facts_and_dead_ends() -> None:
     import asyncio
 
     async def main() -> None:
-        assert await swarm._evidence_signature() == (0, 0)
+        assert await swarm._evidence_signature() == (0, 0, 0)
         board.add_hypothesis("w1", "unverified guess")
-        assert await swarm._evidence_signature() == (0, 0)  # hypothesis: no trigger
+        assert await swarm._evidence_signature() == (0, 0, 1)  # hypothesis triggers
         board.add_fact(
             "w1", "the service echoes input", verified=True,
             provenance={"source_kind": "tool_result", "source_excerpt": "bash output"},
         )
-        assert await swarm._evidence_signature() == (1, 0)  # verified fact: trigger
+        assert await swarm._evidence_signature() == (1, 0, 1)  # fact triggers
         board.add_dead_end("w1", "not a buffer overflow")
-        assert await swarm._evidence_signature() == (1, 1)  # dead end: trigger
+        assert await swarm._evidence_signature() == (1, 1, 1)  # dead end triggers
 
     asyncio.run(main())
     board.close()

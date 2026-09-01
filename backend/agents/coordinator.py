@@ -34,13 +34,18 @@ VERDICT_COMPLETE = "complete"
 REASON_PROMPT = """You are the COORDINATOR planner of a CTF-solving swarm. Read the shared blackboard and decide the next non-overlapping intents for the workers.
 
 EVIDENCE AUDIT (mandatory):
-- Build intents ONLY on VERIFIED facts. Hypotheses and dead ends are context only — never the foundation of an intent.
+- Build EXPLOITATION/KEY intents ONLY on VERIFIED facts.
+- With no verified facts yet, you may propose RECON/VERIFICATION intents whose
+  job is to confirm or refute a hypothesis with real tool output — mark them
+  "based_on_hypotheses": true and keep them observational, never conclusive.
+- Hypotheses and dead ends are context for everything else.
 - Do NOT propose an intent that duplicates an existing open/claimed/completed intent.
 - If the flag is already confirmed or the goal is proven by verified facts, verdict must be "complete".
 - verdict meanings: "explore" = keep making progress; "course_correct" = the swarm drifted, propose a new direction; "complete" = goal already satisfied.
+- Intents may include using the search_knowledge tool to consult the local knowledge base when the task needs a technique/format the workers may not know.
 
 Reply with ONLY a JSON object:
-{"verdict": "explore|course_correct|complete", "intents": [{"goal": "...", "rationale": "...", "depends_on": [], "from_facts": []}], "audit": ["one line per audit decision"]}
+{"verdict": "explore|course_correct|complete", "intents": [{"goal": "...", "rationale": "...", "based_on_hypotheses": false, "depends_on": [], "from_facts": []}], "audit": ["one line per audit decision"]}
 
 Blackboard summary:
 {summary}"""

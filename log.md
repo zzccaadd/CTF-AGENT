@@ -16542,3 +16542,28 @@ index cf0293d..35d85ec 100644
 > 【runner 统计口径修复已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【59】
+> 时间：2026-08-31
+> 会话ID：【coordinator 首轮实测：零触发根因修复（签名放宽 + 冷却限频）】
+> 涉及文件：backend/agents/swarm.py / backend/agents/coordinator.py / backend/config.py / tests/test_coordinator.py / log.md
+> 需求/遇到的问题：
+> v4（bash-17，含 coordinator 新代码）跑完：off 4/7、on 5/7（delta=+1 为 Flag Command 翻转，kq=0 属随机）；但 **trace-coordinator-*.jsonl 一个都没有——coordinator 零触发**。排查证据库：全部事件只有 hypothesis_added（20 条，swarm 每轮自动写入），无 fact_added、无 dead_end_added。
+
+> 我的原始提问Prompt：
+> > 现在跑完结果了名 /（恢复会话后继续 v4 分析）
+
+> 分析与根因：
+> 触发签名 = (verified_facts, dead_ends) 在实际运行中恒为 (0,0)：blackboard_fact 工具的 verified 判定要求 fact 逐字出现在上一个外部工具输出中（`fact in self._last_tool_output`），模型几乎不满足；dead_end 工具模型很少主动调用。因此"graph 变化"信号从未出现，coordinator 永不触发——审计语义再正确，触发条件不工作也等于没有 coordinator。修复方向：签名放宽为 (fact_added 任意, dead_end_added, hypothesis_added)——solver 每轮自动写 hypothesis 正是 muteki "graph 变化"信号；为防止每轮触发导致成本失控，增加规划冷却（默认 45s）。
+
+> 代码改动说明：
+> backend/agents/swarm.py：_evidence_signature 改为三元组 (facts, dead_ends, hypotheses)（fact 不再要求 verified）；_coordinator_loop 增加冷却（coordinator_min_plan_interval_s 默认 45，两次规划间隔内只更新签名不规划）。backend/agents/coordinator.py：REASON_PROMPT 证据审计细化——无 verified facts 时允许提出 RECON/VERIFICATION 类 intent（基于 hypothesis 但标注 based_on_hypotheses: true，保持观察性），并提示 intent 可包含使用 search_knowledge 检索语料。backend/config.py：新增 coordinator_min_plan_interval_s。tests/test_coordinator.py：签名测试更新为三元组（hypothesis 也触发）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：87 passed；ruff 通过。v4 结果已归档（off 4/7、on 5/7、$3.44/$3.61、kq 全 0——medium 题上模型仍未主动调用 search_knowledge，使用率问题待 coordinator 提出的含检索意图 + 提示词强化后复测）。遗留：v5 需重跑验证 coordinator 真实触发（预期每 solver 轮触发一次、冷却限频）、intent 质量与 trace 可观测。
+
+> 本次完整代码Diff：
+> ```diff
+> 【签名/冷却/prompt 修复已随本轮提交推送；详见 git log。】
+> ```
+---
