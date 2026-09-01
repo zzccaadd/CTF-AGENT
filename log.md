@@ -16692,3 +16692,28 @@ index cf0293d..35d85ec 100644
 > 【coordinator 知识路由 + plan 重试已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【65】
+> 时间：2026-09-02
+> 会话ID：【Stage：coordinator 连续失败退避 + 900s 实测 worker 自主检索（kq=4/hits=20）】
+> 涉及文件：backend/agents/swarm.py / backend/config.py / log.md
+> 需求/遇到的问题：
+> 自动推进中。900s 端到端运行（matrix-lab-2 on）显示：worker 自主调用 4 次 search_knowledge（kq=4, hits=20, chars=6328——查询词质量高：带 Python 3.7 版本号、magic 420d0d0a、pycdc 工具名），但 coordinator 5 次 plan 全 turn_timeout（messages=0，模型零输出）——代理（api.tcboys.de）在 3-4 个并发 codex 会话下推理排队严重，coordinator 反复烧 turn 白占 worker 需要的会话。
+
+> 我的原始提问Prompt：
+> > 我现在要回去休息了，你自动推进后续任务把……不断写新stage代码，测试代码是否正常，然后再端到端测试看看
+
+> 分析与根因：
+> 900s 运行中 coordinator 连续 5 次空 plan（每次 150s turn + 重试共 ~300s），期间 worker 检索正常（kq=4/hits=20 全来自 worker 自主调用）——coordinator 的失败与 worker 的检索能力解耦，但空转 turn 与 worker 抢代理并发配额，形成负反馈。修复：连续空 plan 达到阈值后本签名周期内不再发起 plan（backoff），签名更新照常跟踪，成功后计数清零。
+
+> 代码改动说明：
+> backend/agents/swarm.py：_coordinator_loop 增加 consecutive_failures 计数——plan 空（含重试后仍空）计数 +1；达到 coordinator_failures_before_backoff（默认 3）后跳过 plan 只记录签名（logger.warning 提示 backoff）；成功 plan 清零。backend/config.py：新增 coordinator_failures_before_backoff=3。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：97 passed（97→97）；ruff 通过。900s 端到端数据（run 2587421e）：matrix-lab-2 on kq=4/hits=20/chars=6328（worker 自主检索，无需 coordinator 引导即已发生）、solve 仍 timeout（题难）；coordinator 全 turn_timeout 触发 backoff 场景。遗留：完整 v5 对比（medium 题 off/on 各 2-3 次）评估 RAG 对 solve rate 的统计影响。
+
+> 本次完整代码Diff：
+> ```diff
+> 【coordinator backoff 已随本轮提交推送；详见 git log。】
+> ```
+---
