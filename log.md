@@ -16817,3 +16817,28 @@ index cf0293d..35d85ec 100644
 > 【service 降级兜底 + coordinator turn_failed 诚实化已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【70】
+> 时间：2026-09-02
+> 会话ID：【Stage：turn_failed nonlocal 闭包缺陷修复（死代码变活）+ 脚本化协议回归测试】
+> 涉及文件：backend/agents/coordinator.py / tests/test_coordinator.py / log.md
+> 需求/遇到的问题：
+> 自动推进 round 3。API 余额仍 INSUFFICIENT_BALANCE（第 3 轮确认，真实 solver turn 403）。探测 coordinator 时发现上一轮修复（9df3e38）**实际是死代码**：trace 显示 plan_failed(turn_failed) 事件已记录，但随后仍发 plan 事件——`turn_failed = True` 在 read_loop 闭包内赋值创建了局部变量（缺 nonlocal），plan() 读取的 turn_failed 恒为 False，`if turn_failed: return` 分支从未执行。
+
+> 我的原始提问Prompt：
+> > （goal round 3 自动推进）
+
+> 分析与根因：
+> Python 闭包语义：嵌套函数内对外层变量赋值（无 nonlocal 声明）会创建局部变量。read_loop 中 `turn_failed = True` 是局部赋值，外层 plan() 的 turn_failed 引用仍是初始 False——修复分支是死代码。ruff F841 之前已提示（"assigned to but never used"），被误判为静态分析误报加 noqa 掩盖，实为真缺陷。附带发现测试基建问题：mock 子进程流存在竞态——read_loop 可能在 rpc() 注册 pending future 之前就消费响应，导致 rpc 永久挂起；需在 readline 加延迟让 rpc 先注册。
+
+> 代码改动说明：
+> backend/agents/coordinator.py：read_loop 声明 `nonlocal turn_failed`（移除 noqa）；turn_failed 分支现在真正生效——失败 turn 返回空 raw 且不误发 plan 事件。tests/test_coordinator.py：新增 test_plan_returns_empty_raw_on_turn_failed——脚本化协议（mock 子进程依次推送 initialize/thread/turn 响应 + turn/completed(failed) 通知），断言 raw="" 且 events 含 plan_failed 无 plan；FakeStream.readline 加 0.05s 延迟规避 pending-future 竞态。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：100 passed（99→100）；ruff 通过。已推送 7728158。修复后真实语义：403 余额/溢出 turn → plan_failed(turn_failed, error) 事件 + 空 raw → backoff 正确计数（不再伪装成成功空计划）。遗留：API 余额恢复后跑 v5 repeats=2 正式对比；frog-waf 待镜像源。
+
+> 本次完整代码Diff：
+> ```diff
+> 【turn_failed nonlocal 修复 + 脚本化协议回归测试已随本轮提交推送；详见 git log。】
+> ```
+---
