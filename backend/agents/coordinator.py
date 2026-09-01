@@ -114,6 +114,7 @@ class Coordinator:
         pending: dict[int, asyncio.Future] = {}
         assistant_text: list[str] = []
         turn_done = asyncio.Event()
+        turn_failed = False
 
         async def rpc(method: str, params: dict | None = None) -> dict:
             msg_id = next(ids)
@@ -174,6 +175,16 @@ class Coordinator:
                         assistant_text.append(text)
                         self.tracer.event("assistant_message", phase=phase, text=text[:4000])
                 elif method == "turn/completed":
+                    turn = params.get("turn", {})
+                    status = turn.get("status", "")
+                    if status == "failed":
+                        error = turn.get("error", {})
+                        if isinstance(error, dict):
+                            error_msg = str(error.get("message", "unknown turn failure"))
+                        else:
+                            error_msg = str(error)
+                        self.tracer.event("plan_failed", reason="turn_failed", error=error_msg[:300])
+                        turn_failed = True  # noqa: F841  (read after turn_done in plan())
                     turn_done.set()
 
         reader = asyncio.create_task(read_loop())
@@ -221,6 +232,11 @@ class Coordinator:
             except TimeoutError:
                 proc.kill()
             reader.cancel()
+
+        if turn_failed:
+            # A failed turn (e.g. 403 INSUFFICIENT_BALANCE, context overflow)
+            # must not be misread as a successful empty plan.
+            return CoordinatorPlan(raw="")
 
         plan = self._parse_plan("\n".join(assistant_text))
         self.tracer.event(
