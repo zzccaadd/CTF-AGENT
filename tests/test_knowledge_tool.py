@@ -51,7 +51,12 @@ def test_tool_schema_contract() -> None:
     assert schema["required"] == ["query"]
     props = schema["properties"]
     assert props["top_k"] == {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}
-    assert set(props) == {"query", "source_type", "metadata", "top_k"}
+    # source_type/metadata were removed from the tool surface: the model
+    # cannot know the corpus layout, and a plausible-but-wrong filter (e.g.
+    # "internal_notes" for a technique query) silently zeroes all hits
+    # (observed in v5 matrix-lab-2: 2/3 PyInstaller queries returned
+    # "no usable results" with source_type=internal_notes).
+    assert set(props) == {"query", "top_k"}
 
 
 def test_tool_disabled_service_returns_readable_message() -> None:
@@ -138,6 +143,34 @@ def test_tool_top_k_default_and_bounds_are_applied(tmp_path) -> None:
         solver._turn_knowledge_queries = 0
         with pytest.raises(ValueError):
             asyncio.run(solver._exec_tool("search_knowledge", {"query": "shared z3", "top_k": 0}))
+    finally:
+        service.close()
+
+
+def test_tool_ignores_stale_source_type_filter(tmp_path) -> None:
+    """A model passing a plausible-but-wrong source_type (e.g. internal_notes
+    for a technique query) must NOT zero out reference hits — the solver no
+    longer forwards source_type/metadata to the service (v5 regression:
+    2/3 PyInstaller queries returned 'no usable results')."""
+    knowledge = SQLiteKnowledgeBase(tmp_path / "knowledge.sqlite3")
+    knowledge.ingest(
+        title="pyc guide",
+        text="# pyc reversing\n\npyinstxtractor.py challenge.exe extracts PyInstaller bundles.",
+        source_type="reference",
+        source_url="file:///docs/pyc.md",
+    )
+    service = KnowledgeService(knowledge)
+    solver = _solver_with(service)
+    import asyncio
+
+    try:
+        payload = json.loads(asyncio.run(solver._exec_tool(
+            "search_knowledge",
+            {"query": "pyinstaller", "source_type": "internal_notes", "metadata": {"topic": "web"}},
+        )))
+        assert payload["diagnostic"]["status"] == "ok"
+        assert len(payload["results"]) == 1, "reference hit must survive a wrong source_type"
+        assert payload["results"][0]["source_type"] == "reference"
     finally:
         service.close()
 

@@ -178,12 +178,6 @@ SANDBOX_TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "source_type": {
-                    "type": "string",
-                    "enum": ["official", "reference", "internal_notes"],
-                    "description": "Optional corpus source type. Omit it to search all sources; other values are ignored.",
-                },
-                "metadata": {"type": "object"},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
             },
             "required": ["query"],
@@ -752,8 +746,10 @@ class CodexSolver:
             self._turn_knowledge_queries += 1
             results = self.knowledge_service.search(
                 str(args.get("query", "")),
-                source_type=args.get("source_type"),
-                metadata=args.get("metadata") if isinstance(args.get("metadata"), dict) else None,
+                # No source_type/metadata passthrough: the model cannot know
+                # the corpus layout, and a plausible-but-wrong filter (e.g.
+                # "internal_notes" for a technique query) silently zeroes all
+                # hits. Search all sources; relevance ranking decides.
                 top_k=args.get("top_k", getattr(self.settings, "knowledge_top_k", 5)),
             )
             self._knowledge_hits += len(results)
