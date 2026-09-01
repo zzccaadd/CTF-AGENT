@@ -16792,3 +16792,28 @@ index cf0293d..35d85ec 100644
 > 【QUOTA_ERROR 分类扩展已随本轮提交推送；详见 git log f901d44。】
 > ```
 ---
+
+# 开发记录【69】
+> 时间：2026-09-02
+> 会话ID：【Stage：source_type 0 命中降级兜底 + coordinator turn_failed 诚实化 + 余额阻塞第 2 轮】
+> 涉及文件：backend/knowledge/service.py / backend/agents/coordinator.py / tests/test_knowledge.py / log.md
+> 需求/遇到的问题：
+> 自动推进 round 2。API 余额仍 INSUFFICIENT_BALANCE（真实 solver turn 403，第 2 轮确认）。期间发现两个代码缺陷：1) service 层白名单 source_type 精确过滤 0 命中时无兜底（工具面已收缩，但服务层仍可被其他调用方误用）；2) **coordinator 把 turn 失败伪装成成功**——turn/completed status=failed（403/溢出）只 set turn_done，空 assistant 流解析成"成功空计划"（探测显示 "OK intents: 0" 实为 403 假象）。
+
+> 我的原始提问Prompt：
+> > （goal round 2 自动推进）
+
+> 分析与根因：
+> 1) service.search 的 request.source_type 是 store 层精确匹配；白名单内但选错的枚举值（模型/调用方传 internal_notes 查技术）→ 0 命中且无重试。2) coordinator read_loop 的 turn/completed 未检查 status=failed——solver 侧（codex_solver._read_loop）检查 status 并记录 _turn_error，coordinator 遗漏了同样的逻辑；后果是余额耗尽时 coordinator 探测"成功"但实际 403，掩盖环境故障，backoff 不触发。
+
+> 代码改动说明：
+> backend/knowledge/service.py：search 增加降级兜底——白名单 source_type 过滤 0 命中时，replace(request, source_type=None, metadata={}) 全源重搜，诊断标注 fallback=True + requested_source_type（最终诊断合并 fallback_note）。backend/agents/coordinator.py：read_loop 的 turn/completed 检查 status=="failed"——记录 plan_failed(turn_failed, error) 并置 turn_failed 标志；plan() 尾部 turn_failed 时返回空 raw（不误发 plan 事件、触发 backoff 计数）。tests/test_knowledge.py：test_service_ignores_non_whitelisted_source_type_filter 更新——白名单过滤 0 命中现在返回降级结果（fallback=True + requested_source_type 断言）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：99 passed（99→99）；ruff 通过。验证：coordinator 探测修复后返回 raw=False（诚实反映 403），修复前返回空 raw 伪装成功——实锤修复正确性。已推送 a19fd6f（service 降级）+ 9df3e38（turn_failed 诚实化）。遗留：API 余额恢复后跑 v5 repeats=2 正式对比；frog-waf 待镜像源。
+
+> 本次完整代码Diff：
+> ```diff
+> 【service 降级兜底 + coordinator turn_failed 诚实化已随本轮提交推送；详见 git log。】
+> ```
+---
