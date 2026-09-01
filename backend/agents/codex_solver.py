@@ -1113,7 +1113,7 @@ class CodexSolver:
                         self._findings = f"Turn failed: {self._turn_error}"
                         self._complete_current_intent(self._findings, "failed")
                         return self._result(ERROR)
-                    if any(k in err for k in ("quota", "rate", "capacity", "usage")):
+                    if any(k in err for k in ("quota", "rate", "capacity", "usage", "balance", "insufficient")):
                         self._findings = f"Turn failed: {self._turn_error}"
                         self._complete_current_intent(self._findings, "failed")
                         return self._result(QUOTA_ERROR)
@@ -1163,7 +1163,7 @@ class CodexSolver:
                     await asyncio.sleep(delay)
                     continue
                 self._findings = f"Error: {e}"
-                if "quota" in error_str.lower() or "rate" in error_str.lower():
+                if "quota" in error_str.lower() or "rate" in error_str.lower() or "balance" in error_str.lower() or "insufficient" in error_str.lower():
                     self._complete_current_intent(self._findings, "failed")
                     return self._result(QUOTA_ERROR)
                 self._complete_current_intent(self._findings, "failed")

@@ -279,3 +279,13 @@ def test_run_solver_loop_stops_when_no_new_work_after_gave_up() -> None:
         assert calls["n"] == 2
 
     asyncio.run(main())
+
+
+def test_balance_error_is_not_transient() -> None:
+    """403 INSUFFICIENT_BALANCE must not be retried as a transient error;
+    it is classified as QUOTA_ERROR upstream and should fail fast."""
+    from backend.agents.codex_solver import CodexSolver
+
+    err = "unexpected status 403 Forbidden: insufficient balance, url: https://api.tcboys.de/responses"
+    assert not CodexSolver._is_transient_turn_error(err)
+    assert "balance" in err.lower() and "insufficient" in err.lower()
