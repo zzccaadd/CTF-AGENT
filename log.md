@@ -16717,3 +16717,28 @@ index cf0293d..35d85ec 100644
 > 【coordinator backoff 已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【66】
+> 时间：2026-09-02
+> 会话ID：【Stage：search_knowledge 工具面收缩——source_type 误过滤修复 + RAG solve 翻转复现（on 2/2）】
+> 涉及文件：backend/agents/codex_solver.py / tests/test_knowledge_tool.py / benchmarks/rag_eval/knowledge_probe_v4.json / log.md
+> 需求/遇到的问题：
+> 自动推进中。v5 off/on 对比首次显示 RAG 收益（off 1/2 → on 2/2，matrix-lab-2 timeout→flag_found），但细节分析发现**检索命中率问题**：solve run 中 3 次检索仅 1 次命中（hits=1）——"PyInstaller unpacking" 查询 2 次返回 "no usable results"，而语料明明有 pyc-reversing.md 第 3 节 PyInstaller 内容（本地直测 3 hits）。
+
+> 我的原始提问Prompt：
+> > 我现在要回去休息了，你自动推进后续任务把……不断写新stage代码，测试代码是否正常，然后再端到端测试看看
+
+> 分析与根因：
+> **source_type 误过滤实锤**：端到端 tool_call 显示模型传 `source_type: "internal_notes"`（schema enum 第一项），而语料 72 文档中 internal_notes 仅 4 篇（全是工具说明，无技术内容）；store 侧 `request.source_type` 精确匹配 → reference 文档全被过滤 → 0 命中。这是记录【54】白名单修复的残留形态：白名单外的乱值被忽略（已修），但**合法但选错的枚举值仍精确过滤**——模型不知道语料布局，选错是必然。本地验证：source_type=None 3 hits / internal_notes 0 hits / reference 3 hits，实锤。附带发现：coordinator 在 3-4 并发 codex 会话下反复空 plan（5 次 turn_timeout messages=0），与 worker 抢代理配额（负反馈）——需退避。
+
+> 代码改动说明：
+> backend/agents/codex_solver.py：search_knowledge 工具 schema 移除 source_type/metadata（只留 query+top_k，模型无法知道语料布局，相关性排序决定结果）；handler 调用 service.search 不再透传 source_type/metadata（全源检索）。tests/test_knowledge_tool.py：schema 契约更新（props == {query, top_k}）；新增 test_tool_ignores_stale_source_type_filter——传 source_type=internal_notes + 任意 metadata 时 reference 命中必须存活。benchmarks/rag_eval/knowledge_probe_v4.json：frog-waf 标记 environment_unavailable（openjdk:11-slim/gradle 镜像在 daocloud/1ms/xuanyuan/docker.io 全部 403/not-found，环境阻塞）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：98 passed（97→98）；ruff 通过。端到端复验（matrix-lab-2 on 600s, run 04583c6e）：**4 次检索全部命中（hits=23, chars=5112），matrix-lab-2 再次 flag_found（468s）**——连续两次 on solve 复现（此前 off 两次 timeout），RAG 收益稳定；PyInstaller 查询全部返回 pyinstxtractor 文档，修复实锤。v5 对比累计：off 1/2（whataxor solved, matrix timeout）vs on 2/2（均 solved）。遗留：frog-waf 待镜像源修复后补测；coordinator 并发空 plan 退避已实现（记录【65】）待长运行验证。
+
+> 本次完整代码Diff：
+> ```diff
+> 【工具面收缩 + frog-waf 标记已随本轮提交推送；详见 git log。】
+> ```
+---
