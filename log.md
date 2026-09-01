@@ -16592,3 +16592,28 @@ index cf0293d..35d85ec 100644
 > 【swarm 并行修复已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【61】
+> 时间：2026-09-01
+> 会话ID：【问题 1 修复实测验证：单题真实运行（Dynastic, 3-solver, off）+ coordinator 首次触发暴露 .format KeyError 并修复】
+> 涉及文件：backend/agents/coordinator.py / tests/test_coordinator.py / log.md
+> 需求/遇到的问题：
+> 用户要求验证问题 1（swarm 并行失效）修复是否有效。验证方式：1) 离线集成验证（FakeSolver 走真实 _run_solver_loop 路径）；2) 真实端到端运行（Dynastic 单题、3-solver、off、--no-rag）。真实运行中 coordinator 首次真正触发，立即暴露新 bug：coordinator loop error: '"verdict"'（KeyError）。
+
+> 我的原始提问Prompt：
+> > 当前问题可以再验证看一下，是否有效解决
+
+> 分析与根因：
+> 1) 离线验证（/tmp/verify_swarm2.py）：真实 _run_solver_loop 驱动 3 个 FakeSolver——3 个 seed intent 全部被 claim（各 4 步），9 个 followup 接力产生且 12/12 completed，3 solver 全部有活干（修复前 2 个 0 步退出）——问题 1 机制层验证通过。2) 真实运行（run d0c41363/210137）：Dynastic solved=1/1；3 个 seed（bootstrap:1/2/3）全部 completed；followup:4 blocked、followup:5 completed（接力产生）；solver trace 修复前 #2/#3 为 3 行 0 步，修复后 #1=17 步、#2=14 步、#3=18 步全完整；run_id 全新隔离。3) coordinator 首次触发即崩溃：`REASON_PROMPT.format(summary=...)` 中 prompt 内嵌 JSON 示例的花括号 `{"verdict": ...}` 被 str.format 当作占位符解析 → KeyError: '"verdict"'——这是 f2e32bf 签名放宽后 coordinator 首次真实触发才暴露的（此前 trace 全 0 字节有两层原因：触发条件不满足 + 一旦触发必崩）。4) 附带发现：coordinator turn_timeout 的诱因是 codex app-server 自动注入 host_skills（muteki-blackboard SKILL.md 在宿主机 ~/.agents/skills/，容器内 404），模型花时间尝试读取 skill 而非直接输出 plan JSON（solver trace 开头的 read_file SKILL.md 404 同源）。
+
+> 代码改动说明：
+> backend/agents/coordinator.py：1) REASON_PROMPT 中 JSON 示例花括号转义为 {{ }}（str.format 安全）；2) prompt 增加明确指示"Do NOT read any skill files, local documentation, or the filesystem. You are a planner without tools: reply with the JSON object directly."——抑制 host_skills 注入导致的 turn_timeout。tests/test_coordinator.py：新增 test_reason_prompt_formats_with_json_example_braces（防 .format KeyError 回归）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：95 passed（94→95）；ruff 通过。独立验证：Coordinator.plan() 修复前抛 KeyError: '"verdict"'（traceback 实锤），修复后正常返回 plan（verdict=explore, intents=0——空黑板时证据审计不产出 intent，符合预期）。真实运行两次均 solved=1/1。遗留：v5 需在含假设/事实的黑板上验证 coordinator 真实产出并 propose intents（当前单题运行中 90s turn_timeout 已通过 prompt 抑制，但 plan 触发后 propose 到黑板的完整链路待实测）；knowledge_queries 仍为 0（medium 题 RAG 调用率问题未变）。
+
+> 本次完整代码Diff：
+> ```diff
+> 【coordinator prompt 转义与 skill 抑制已随本轮提交推送；详见 git log。】
+> ```
+---

@@ -79,6 +79,20 @@ def test_propose_skips_empty_and_duplicate_intents() -> None:
     assert [goal for goal, _ in board.proposed] == ["New direction"]
 
 
+def test_reason_prompt_formats_with_json_example_braces() -> None:
+    """The prompt's JSON example contains literal braces that must be escaped
+    for str.format — otherwise Coordinator.plan() dies with
+    KeyError: '"verdict"' the first time the coordinator actually triggers
+    (regression: v4-era coordinator traces were all empty, and the first
+    post-fix run surfaced this crash in the coordinator loop)."""
+    from backend.agents.coordinator import REASON_PROMPT
+
+    rendered = REASON_PROMPT.format(summary="## Blackboard: x\n\n### Active intents\n- none")
+    assert "{\"verdict\": \"explore" in rendered
+    assert "Blackboard summary:" in rendered
+    assert "## Blackboard: x" in rendered
+
+
 def test_evidence_signature_counts_facts_dead_ends_and_hypotheses() -> None:
     """Trigger alignment: any blackboard growth (facts, dead ends OR the
     auto-recorded hypotheses from each solver round) changes the signature —

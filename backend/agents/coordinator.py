@@ -43,9 +43,10 @@ EVIDENCE AUDIT (mandatory):
 - If the flag is already confirmed or the goal is proven by verified facts, verdict must be "complete".
 - verdict meanings: "explore" = keep making progress; "course_correct" = the swarm drifted, propose a new direction; "complete" = goal already satisfied.
 - Intents may include using the search_knowledge tool to consult the local knowledge base when the task needs a technique/format the workers may not know.
+- Do NOT read any skill files, local documentation, or the filesystem. You are a planner without tools: reply with the JSON object directly.
 
 Reply with ONLY a JSON object:
-{"verdict": "explore|course_correct|complete", "intents": [{"goal": "...", "rationale": "...", "based_on_hypotheses": false, "depends_on": [], "from_facts": []}], "audit": ["one line per audit decision"]}
+{{"verdict": "explore|course_correct|complete", "intents": [{{"goal": "...", "rationale": "...", "based_on_hypotheses": false, "depends_on": [], "from_facts": []}}], "audit": ["one line per audit decision"]}}
 
 Blackboard summary:
 {summary}"""
