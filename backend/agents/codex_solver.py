@@ -947,6 +947,26 @@ class CodexSolver:
                 return self.intent_id
         return ""
 
+    async def _wait_for_open_intent(self) -> str:
+        """Poll the blackboard for a claimable intent (bounded).
+
+        Returns a claimed intent id, or "" if the wait budget expires.
+        Keeps late-starting workers alive instead of exiting with 0 steps
+        when the seed intents were already claimed by sibling solvers.
+        """
+        if not self.evidence_board:
+            return ""
+        budget = int(getattr(self.settings, "blackboard_intent_wait_seconds", 180))
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            await asyncio.sleep(5)
+            intent_id = self._claim_next_intent()
+            if intent_id:
+                self.tracer.event("intent_claimed_after_wait", intent_id=intent_id)
+                return intent_id
+        self.tracer.event("intent_wait_timeout", budget_seconds=budget)
+        return ""
+
     async def _intent_heartbeat(self) -> None:
         """Keep a claimed intent leased while a long Codex turn is running."""
         while self.evidence_board and self.intent_id:
@@ -1011,7 +1031,16 @@ class CodexSolver:
         t0 = time.monotonic()
         intent_id = self._claim_next_intent() if self.evidence_board else ""
         if self.evidence_board and not intent_id:
-            return self._result(GAVE_UP)
+            # Nothing open to claim yet (e.g. a sibling worker took the last
+            # seed intent). Poll for a follow-up intent instead of exiting with
+            # 0 steps, so the swarm stays at full parallelism.
+            try:
+                intent_id = await self._wait_for_open_intent()
+            except asyncio.CancelledError:
+                self._complete_current_intent("worker cancelled while waiting for intent", "blocked")
+                return self._result(CANCELLED)
+            if not intent_id:
+                return self._result(GAVE_UP)
         task_context = ""
         if self.evidence_board:
             board_context = self.evidence_board.summary()

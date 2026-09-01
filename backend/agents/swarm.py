@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -117,20 +118,37 @@ class ChallengeSwarm:
             int(getattr(self.settings, "knowledge_challenge_budget", 24))
         )
         db_path = getattr(self.settings, "evidence_db_path", "logs/evidence.sqlite3")
-        self.evidence_board = EvidenceBoard.open(db_path, self.meta.name, self.run_id or None)
+        # Every ChallengeSwarm run gets a fresh run id: reusing the last
+        # unfinished run (EvidenceBoard.open fallback) mixed stale intents and
+        # evidence from previous runs into new ones (observed in v4: a 8/31
+        # demo run's completed seeds blocked 9/1 workers from claiming).
+        self.run_id = self.run_id or uuid.uuid4().hex
+        self.evidence_board = EvidenceBoard.open(db_path, self.meta.name, self.run_id)
         self.run_id = self.evidence_board.run_id
         self.message_bus.attach_board(self.evidence_board)
         self.evidence_board.start("swarm")
         self._restore_followup_index()
-        # ONE minimal seed intent gives workers something to claim; all further
-        # planning belongs to the LLM coordinator (muteki-style), which
-        # proposes intents when the blackboard's fact/dead-end counts change.
-        self.evidence_board.propose(
-            "coordinator",
+        # Seed ONE non-overlapping recon intent per solver slot so every
+        # parallel worker starts with claimable work. A single seed left all
+        # but one solver with nothing to claim → 0-step gave_up (parallel
+        # swarm silently degraded to one active worker). All further planning
+        # belongs to the LLM coordinator (muteki-style), which proposes
+        # intents when the blackboard's fact/dead-end/hypothesis counts change.
+        seed_goals = [
             "Establish a verified-facts baseline: inspect the challenge files and services, then record verified facts or a dead end.",
-            acceptance="Write verified facts or a dead end, then complete the intent",
-            intent_id=f"bootstrap:{self.meta.name}:{self.run_id}:1",
-        )
+            "Probe the challenge surface: check for running services, ports, and entry points, then record verified facts or a dead end.",
+            "Analyze the challenge artifacts: identify file types, structure, and interesting strings, then record verified facts or a dead end.",
+        ]
+        for i, _slot in enumerate(self._solver_slots()):
+            self.evidence_board.propose(
+                "coordinator",
+                seed_goals[i % len(seed_goals)],
+                acceptance="Write verified facts or a dead end, then complete the intent",
+                intent_id=f"bootstrap:{self.meta.name}:{self.run_id}:{i + 1}",
+            )
+        # Follow-up numbering starts after the seeds.
+        n_seeds = len(self._solver_slots())
+        self._next_intent_index = max(self._next_intent_index, n_seeds + 1)
         # Muteki-style planner: triggered on fact/dead-end changes, plans with
         # the configured model, writes reasoning to its own trace.
         self.coordinator = None
@@ -422,6 +440,7 @@ class ChallengeSwarm:
     ) -> tuple[SolverResult, SolverProtocol]:
         """Inner loop: start → run → (coordinator plans) → ..."""
         consecutive_errors = 0
+        prev_steps = 0
         result = SolverResult(
             flag=None, status=CANCELLED, findings_summary="",
             step_count=0, cost_usd=0.0, log_path="",
@@ -501,8 +520,16 @@ class ChallengeSwarm:
                 else:
                     consecutive_errors = 0
 
-                # Planning is the LLM coordinator's job now (muteki-style);
-                # the code-level bump loop is removed.
+                # GAVE_UP = finished one intent without a flag: loop back and
+                # claim the next follow-up / coordinator-proposed intent
+                # instead of exiting, so the worker keeps contributing.
+                if result.status == GAVE_UP:
+                    if result.step_count <= prev_steps:
+                        # No new work this round (e.g. intent-wait timeout):
+                        # nothing to do — stop this worker instead of spinning.
+                        break
+                    prev_steps = result.step_count
+                    continue
                 break
 
         return result, solver

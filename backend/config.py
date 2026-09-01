@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     evidence_db_path: str = "logs/evidence.sqlite3"
     blackboard_default_worker_lease_seconds: int = 300
     blackboard_intent_max_attempts: int = 3
+    # How long a worker polls for a claimable intent before giving up. With
+    # per-slot seed intents a late-starting solver may find nothing open and
+    # would otherwise exit with 0 steps, silently shrinking the swarm.
+    blackboard_intent_wait_seconds: int = 180
     knowledge_db_path: str = "logs/knowledge.sqlite3"
     knowledge_enabled: bool = True
     knowledge_top_k: int = 5

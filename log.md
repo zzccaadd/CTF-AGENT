@@ -16567,3 +16567,28 @@ index cf0293d..35d85ec 100644
 > 【签名/冷却/prompt 修复已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【60】
+> 时间：2026-09-01
+> 会话ID：【问题 1 修复：swarm 并行失效（单 seed → 0 步 gave_up 退化）】
+> 涉及文件：backend/agents/swarm.py / backend/agents/codex_solver.py / backend/config.py / tests/test_swarm.py（新增）/ log.md
+> 需求/遇到的问题：
+> 用户要求：1) 直接动手修复问题 1——3-solver swarm 实际退化为 1 个 solver 工作；2) 会话结束后按既有结构填充 log.md。深入排查确认根因链：**swarm 启动只 propose 1 个 bootstrap seed intent**（记录【57】从 3 个减为 1 个），3 个 solver 并行时仅 1 个能 claim 到，其余 2 个在 `run_until_done_or_gave_up` 开头 `_claim_next_intent()` 返回空后 **0 步直接 GAVE_UP**——v4 on 阶段 7 题中大量 3 行 trace（start/finish/stop, step_count=0）即此产物；且 `_run_solver` 中 GAVE_UP 后无条件 break，完成一个 intent 的 solver 也退出，followup/coordinator 规划的 intent 无人执行。
+
+> 我的原始提问Prompt：
+> > 直接动手修复问题1,并且每次会话结束后按照相同的结构，来填充后续的内容
+
+> 分析与根因：
+> 1) **单 seed 竞争**：swarm.py __post_init__ 只 propose `bootstrap:{name}:{run_id}:1`，3 个 solver 同时 claim，只有 1 个成功；另 2 个 0 步 gave_up（"Broken (0 steps, $0)" 分支）——并行 swarm 名存实亡（v4 结果实际是"单 solver 串行 + 2 空转进程 + 2 个白启动 sandbox/codex"）。2) **GAVE_UP 后退出**：_run_solver_loop 在 GAVE_UP/ERROR 分支无条件 break（记录【57】删 bump 循环时引入），完成一个 intent 的 worker 不再 claim 下一个 followup/coordinator intent——intent 接力断裂。3) **run_id 复用污染**：EvidenceBoard.open 在 run_id 为空时复用 `latest_run_id`（未 finish 的旧 run）；实锤：8/31 07:46 的 demo run（3a5b6b97，3 个 bootstrap+未 finish）被 9/1 19:11 的 v4 off 阶段复用，旧 intent（bootstrap:1/2/3、followup:4 与旧 events）混入新运行——off/on 对比数据被污染。
+
+> 代码改动说明：
+> backend/agents/swarm.py：1) __post_init__ 每次生成新 run_id（`self.run_id or uuid4().hex`），杜绝旧 run 残留 intent/evidence 混入；2) seed 阶段按 `_solver_slots()` 数量 propose 多个互不重叠的 recon intent（3 个模板：文件与服务基线 / 服务端口探测 / 工件静态分析，循环取用），`_next_intent_index` 从 seeds 之后起算；3) `_run_solver_loop`：GAVE_UP 改为 `continue` 回到循环再 claim 下一个 intent（新 step 判定 `result.step_count <= prev_steps` 时 break，防止等待超时后空转死循环）；ERROR 保持 3 次连续退出。backend/agents/codex_solver.py：新增 `_wait_for_open_intent()`——claim 失败后轮询黑板（每 5s，预算 blackboard_intent_wait_seconds 默认 180s），拿到 intent 才开工，超时仍 GAVE_UP；等待期间被取消返回 CANCELLED 并记录 trace 事件（intent_claimed_after_wait / intent_wait_timeout）。backend/config.py：新增 `blackboard_intent_wait_seconds: int = 180`。tests/test_swarm.py（新增 7 测）：seed 数量=slot 数且目标互不重叠、单 solver 单 seed、run_id 每次全新、等待轮询直到可 claim、预算耗尽 gave_up、GAVE_UP 后续跑下一 intent（n==2 断言）、无新 step 停止不空转。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：94 passed（87→94）；ruff 通过。修复后预期：3 个 solver 同时有活（各 1 个 seed），完成 seed 后继续 claim followup/coordinator intent，swarm 真正并行；run_id 隔离使 off/on 数据干净。遗留：v5 需重跑验证——并行利用率（每 run 3 条完整 trace 而非 2 条完整+1 条 3 行）、coordinator intent 是否被执行、medium 题 knowledge_queries 是否随 coordinator 检索意图提升。
+
+> 本次完整代码Diff：
+> ```diff
+> 【swarm 并行修复已随本轮提交推送；详见 git log。】
+> ```
+---
