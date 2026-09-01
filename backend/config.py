@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     coordinator_model: str = "gpt-5.5"
     coordinator_interval_seconds: int = 5
     coordinator_min_plan_interval_s: int = 45
-    coordinator_turn_timeout_s: int = 120
+    coordinator_turn_timeout_s: int = 150
+    # Retries for a plan turn that produced no plan (model latency variance).
+    coordinator_plan_retries: int = 1
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

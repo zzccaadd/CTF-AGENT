@@ -534,6 +534,31 @@ class ChallengeSwarm:
 
         return result, solver
 
+    async def _plan_with_retry(self, summary: str):
+        """Run the planner with retries for empty/no-plan turns.
+
+        Observed in v5: model latency variance makes a single 120-150s turn
+        flaky (success 27-104s, failures >150s with zero messages). Retrying
+        once on an empty plan materially raises the chance the coordinator
+        produces intents without blocking the swarm (cancellation still
+        propagates immediately).
+        """
+        if self.coordinator is None:
+            from backend.agents.coordinator import CoordinatorPlan
+
+            return CoordinatorPlan(raw="")
+        max_retries = int(getattr(self.settings, "coordinator_plan_retries", 1))
+        attempt = 0
+        while True:
+            plan = await self.coordinator.plan(summary)
+            if plan.raw or attempt >= max_retries:
+                return plan
+            attempt += 1
+            logger.info(
+                "[%s] coordinator plan empty on attempt %d/%d — retrying",
+                self.meta.name, attempt, max_retries,
+            )
+
     async def _evidence_signature(self) -> tuple[int, int, int]:
         """(fact_count, dead_end_count, hypothesis_count) — the trigger for
         coordinator planning.
@@ -576,7 +601,7 @@ class ChallengeSwarm:
                 last = signature
                 last_plan_at = now
                 summary = self.evidence_board.summary() if self.evidence_board else ""
-                plan = await self.coordinator.plan(summary)
+                plan = await self._plan_with_retry(summary)
                 if not plan.raw:
                     continue
                 existing = {

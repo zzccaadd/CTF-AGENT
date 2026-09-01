@@ -195,6 +195,44 @@ def test_run_solver_loops_after_gave_up_to_claim_next_intent() -> None:
     asyncio.run(main())
 
 
+def test_plan_with_retry_retries_empty_plan() -> None:
+    """Empty (no raw) plans are retried up to the configured budget; a plan
+    with content returns immediately; repeated empties give up after budget."""
+    from backend.agents.coordinator import CoordinatorPlan
+    from backend.agents.swarm import ChallengeSwarm
+
+    swarm = object.__new__(ChallengeSwarm)
+    swarm.meta = SimpleNamespace(name="retry-test")
+    swarm.settings = SimpleNamespace(coordinator_plan_retries=2)
+
+    class Planner:
+        def __init__(self, results: list[object]) -> None:
+            self.results = results
+            self.calls = 0
+
+        async def plan(self, summary: str) -> object:
+            self.calls += 1
+            return self.results.pop(0)
+
+    # first two empty → retried, third has content → returned
+    swarm.coordinator = Planner([CoordinatorPlan(raw=""), CoordinatorPlan(raw=""), CoordinatorPlan(raw="json")])
+    plan = asyncio.run(swarm._plan_with_retry("summary"))
+    assert plan.raw == "json"
+    assert swarm.coordinator.calls == 3
+
+    # all empty → stops after budget (retries + 1 initial call)
+    swarm.coordinator = Planner([CoordinatorPlan(raw=""), CoordinatorPlan(raw=""), CoordinatorPlan(raw="")])
+    plan = asyncio.run(swarm._plan_with_retry("summary"))
+    assert plan.raw == ""
+    assert swarm.coordinator.calls == 3
+
+    # content on first attempt → single call, no retry
+    swarm.coordinator = Planner([CoordinatorPlan(raw="ok")])
+    plan = asyncio.run(swarm._plan_with_retry("summary"))
+    assert plan.raw == "ok"
+    assert swarm.coordinator.calls == 1
+
+
 def test_run_solver_loop_stops_when_no_new_work_after_gave_up() -> None:
     """GAVE_UP with no new steps (intent-wait timeout) must stop the worker —
     otherwise it spins forever re-waiting for intents that never appear."""
