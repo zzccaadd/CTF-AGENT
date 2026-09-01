@@ -152,6 +152,18 @@ class KnowledgeService:
         started = time.perf_counter()
         try:
             results = self.knowledge.search(request, timeout_ms=self.timeout_ms)
+            # Fallback: a whitelisted-but-wrong source_type (e.g. a model
+            # guessing "internal_notes" for a technique query) must not zero
+            # out all hits. If the filtered search found nothing and the
+            # caller asked for a specific source, retry across all sources.
+            if not results and request.source_type:
+                self.last_diagnostic = {
+                    "status": "fallback",
+                    "reason": "source_type_no_hits",
+                    "requested_source_type": request.source_type,
+                }
+                request = replace(request, source_type=None, metadata={})
+                results = self.knowledge.search(request, timeout_ms=self.timeout_ms)
         except Exception as exc:  # storage errors must not kill the solver
             if any(marker in str(exc).lower() for marker in ("timeout", "interrupted")):
                 self.last_diagnostic = {
@@ -167,6 +179,13 @@ class KnowledgeService:
             }
             return []
         elapsed_ms = (time.perf_counter() - started) * 1000
+        fallback_note: dict[str, Any] = {}
+        if self.last_diagnostic.get("status") == "fallback":
+            fallback_note = {
+                "fallback": True,
+                "fallback_reason": self.last_diagnostic.get("reason"),
+                "requested_source_type": self.last_diagnostic.get("requested_source_type"),
+            }
 
         results = [result for result in results if result.source_type in self.ALLOWED_SOURCE_TYPES]
         bounded: list[SearchResult] = []
@@ -193,6 +212,7 @@ class KnowledgeService:
             "query_hash": self._query_hash(normalized_query),
             "hit_count": len(bounded),
             "returned_chars": chars,
+            **fallback_note,
         }
         if elapsed_ms > self.timeout_ms:
             # Completed results are never discarded for being slow: the

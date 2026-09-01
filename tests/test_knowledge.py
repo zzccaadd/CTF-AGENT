@@ -260,8 +260,14 @@ def test_service_ignores_non_whitelisted_source_type_filter(tmp_path) -> None:
         results = service.search("z3", source_type=bad)
         assert len(results) == 1, f"source_type={bad!r} must be ignored, got {len(results)}"
 
-    # A whitelisted filter still applies.
-    assert service.search("z3", source_type="reference") == []
+    # A whitelisted filter that yields zero hits falls back to all sources
+    # (a plausible-but-wrong source_type, e.g. "internal_notes" for a
+    # technique query, must not zero out results — v5 regression).
+    fallback = service.search("z3", source_type="reference")
+    assert len(fallback) == 1
+    assert service.last_diagnostic.get("status") == "ok"
+    assert service.last_diagnostic.get("fallback") is True
+    assert service.last_diagnostic.get("requested_source_type") == "reference"
     service.close()
 
 
