@@ -16767,3 +16767,28 @@ index cf0293d..35d85ec 100644
 > 【本轮为运行验证与记录，无新增代码 diff。】
 > ```
 ---
+
+# 开发记录【68】
+> 时间：2026-09-02
+> 会话ID：【Stage：insufficient-balance 403 归类 QUOTA_ERROR（fail-fast）+ API 余额硬阻塞确认】
+> 涉及文件：backend/agents/codex_solver.py / tests/test_swarm.py / log.md
+> 需求/遇到的问题：
+> 自动推进中。v5 repeats=2 重跑（bash-40）因 api.tcboys.de 返回 403 INSUFFICIENT_BALANCE 全部 no_result（cost $0）——**API 余额硬阻塞**：coordinator 单 turn 可成功（PROBE OK，60s 短调用），但 solver 3 并发真实 turn 全部 403 失败（3 个 solver 各报 insufficient balance）。期间发现代码改进点：403 balance 错误不匹配现有 QUOTA_ERROR 关键词（quota/rate/capacity/usage），被当普通 ERROR 重试 3 次白耗时间。
+
+> 我的原始提问Prompt：
+> > （goal round 1 自动推进）继续自动推进，API 余额阻塞时等待
+
+> 分析与根因：
+> 1) 403 body 为 {"code":"INSUFFICIENT_BALANCE","message":"Insufficient account balance"}——含 "balance"/"insufficient" 关键词，不在 quota 分类集合内 → `_turn_error` 路径落入普通 ERROR（3 次重试后失败），solver 白耗 ~6 分钟/个。2) 余额状态：probe 成功但 solver 失败——代理对短调用与长并发调用扣费/检查策略不同，实际余额不足。**端到端验证被余额阻塞，需用户充值或更换代理。**
+
+> 代码改动说明：
+> backend/agents/codex_solver.py：QUOTA_ERROR 分类关键词扩展 "balance"/"insufficient"（两处：_turn_error 分支 + 异常分支）——balance 错误 fail-fast 返回 QUOTA_ERROR（swarm 若有 API fallback 配置则切换，否则直接失败），不再无谓重试。tests/test_swarm.py：新增 test_balance_error_is_not_transient（403 insufficient balance 不在 TRANSIENT_TURN_ERROR_MARKERS 中，确认不会被当瞬时错误重试）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：99 passed（98→99）；ruff 通过。已推送 f901d44。端到端：bash-41（whataxor off 探针）3 solver 全 403 失败——余额硬阻塞确认，v5 正式对比（repeats=2）无法完成，待余额恢复后续跑。遗留：余额恢复后跑 v5_compare_r2 完整对比；frog-waf 待镜像源修复。
+
+> 本次完整代码Diff：
+> ```diff
+> 【QUOTA_ERROR 分类扩展已随本轮提交推送；详见 git log f901d44。】
+> ```
+---
