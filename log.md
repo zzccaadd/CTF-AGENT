@@ -16667,3 +16667,28 @@ index cf0293d..35d85ec 100644
 > 【coordinator 阶段计时与消息计数事件已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【64】
+> 时间：2026-09-02
+> 会话ID：【Stage：coordinator 知识路由——RAG 调用率突破 0（kq=3, hits=7）】
+> 涉及文件：backend/agents/coordinator.py / backend/config.py / backend/agents/swarm.py / tests/test_coordinator.py / tests/test_swarm.py / log.md
+> 需求/遇到的问题：
+> 自动推进后续 stage（用户休息中）：1) coordinator turn 偶发超时（27s~104s 成功 vs >150s 零消息失败，v5 实测波动）；2) 核心遗留——medium 题 RAG 调用率恒为 0（此前 v2/v3/v4 全部 kq=0），coordinator 的 intent 从未引导 worker 使用 search_knowledge。
+
+> 我的原始提问Prompt：
+> > 我现在要回去休息了，你自动推进后续任务把……不断写新stage代码，测试代码是否正常，然后再端到端测试看看
+
+> 分析与根因：
+> 1) **turn 波动**：重试缺失——单次 120-150s turn 对模型延迟敏感，超时即空 plan。2) **知识路由缺失**：REASON_PROMPT 的 "Intents may include using the search_knowledge tool" 太弱（"may"），coordinator 产出纯观察性 recon intent（实测 3 次 plan 均无检索）；且 propose 的 acceptance 无检索约束，worker claim 后无义务查库。3) 工具注入本身正常（on 模式 input_tokens +624、工具列表含 search_knowledge，实测定性）；模型不调用是"自信可解"（whataxor off 3 次全解出）——需在模型不确定的题（matrix-lab-2 两次超时）上验证路由效果。
+
+> 代码改动说明：
+> backend/agents/coordinator.py：1) REASON_PROMPT 增加 KNOWLEDGE ROUTING (mandatory) 段——挑战涉及语料覆盖技术（XOR/pyc/ROP/padding oracle/UPX/SSTI/SQLi/MT19937/RSA）时，至少一个 intent 必须显式指示 worker 运行 search_knowledge（给出具体查询词示例），观察性 recon 不满足；2) propose() 对 goal 含 "search_knowledge" 的 intent 注入检索前置 acceptance（"Run the search_knowledge query named in this goal FIRST, then record verified facts..."）——契约级强制。backend/agents/swarm.py：新增 _plan_with_retry（空 plan 重试，coordinator_plan_retries=1 默认）。backend/config.py：coordinator_turn_timeout_s 120→150；新增 coordinator_plan_retries=1。tests/test_coordinator.py：新增 test_propose_knowledge_goal_gets_retrieval_acceptance。tests/test_swarm.py：新增 test_plan_with_retry_retries_empty_plan（重试直到预算/内容/耗尽三态）。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：97 passed（95→97）；ruff 通过。端到端：1) whataxor on（212s 解出，coordinator 来不及完成 plan——快题时间竞争依然存在，plan_cancelled）；2) **matrix-lab-2 on 600s：kq=3, hits=7, chars=1891——RAG 调用率首次突破 0**！coordinator 首次 plan 即产出含 search_knowledge 的 intent（"Run search_knowledge('pyinstaller reversing') and search_knowledge('pyc reversing')..."），worker 实际执行 3 次查询（pyc reversing ×2 在 bootstrap:3/followup:4，PyInstaller reversing ×1 在 followup:5），查询词质量高；coord:1/2/3 因 600s timeout 未及 claim（open）。检索未显著提升 solve（仍 timeout），但知识路由链路（plan→intent→检索执行）完整打通。重试机制实测生效（00:10:12→立即重试、00:15:17→立即重试）。
+
+> 本次完整代码Diff：
+> ```diff
+> 【coordinator 知识路由 + plan 重试已随本轮提交推送；详见 git log。】
+> ```
+---
