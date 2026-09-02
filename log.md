@@ -16911,3 +16911,28 @@ index cf0293d..35d85ec 100644
 > 【新增 docs/HANDOFF.md 一个文档文件。】
 > ```
 ---
+
+# 开发记录【73】
+> 时间：2026-09-02
+> 会话ID：【v5 rep1 完成：off 2/2 + on 2/2（matrix kq=2/hits=10）+ 知识路由 acceptance 实锤】
+> 涉及文件：scripts/verify_rag_pipeline.py / benchmarks/rag_eval/knowledge_probe_v4.json / log.md
+> 需求/遇到的问题：
+> v5 正式对比（bash-43, repeats=2）rep1 完成：off 2/2（whataxor $1.17 + matrix $1.87）、on 2/2（whataxor kq=0 + matrix kq=2/hits=10）——RAG 无 solve 损失且 matrix 检索被真实使用。rep2 运行中。
+
+> 我的原始提问Prompt：
+> > 我希望你并行做实验并优化代码……验证rag性能的话，你完全可以采用更细粒度的验证方式
+
+> 分析与根因：
+> 1) rep1 数据：on 阶段 matrix-lab-2 的 2 次 search_knowledge 调用（'pyc reversing marshal bytecode Python 3.7' / 'PyInstaller unpacking'）来自 coord:intent 引导——coord:2 goal 明确 "run search_knowledge('pyc reversing') and decompile"，且 propose() 的检索前置 acceptance 正确注入（coord:1/2 带检索契约，coord:3 纯观察无契约）——知识路由设计与实现在真实运行中完整生效。2) 三层 RAG 验证体系落地（verify_rag_pipeline.py：L1 工具调用精确性 / L2 离线检索质量 / L3 快题端到端），frog-waf qrels 补 waf-bypass.md（rr=1.0）。
+
+> 代码改动说明：
+> scripts/verify_rag_pipeline.py（新增）：三层 RAG 验证一键脚本。benchmarks/rag_eval/knowledge_probe_v4.json：frog-waf relevant_corpus_docs 追加 waf-bypass.md。
+
+> 测试验证方式 & 结果：
+> pytest 100 passed；ruff 通过。rep1 on：whataxor flag_found (kq=0——快题模型自信不检索，符合预期) + matrix-lab-2 flag_found (kq=2/hits=10)。已推送 e80754e。rep2 运行中（bash-43）。
+
+> 本次完整代码Diff：
+> ```diff
+> 【pipeline 脚本 + qrels 更新已随本轮提交推送；详见 git log e80754e。】
+> ```
+---
