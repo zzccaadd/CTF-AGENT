@@ -16961,3 +16961,28 @@ index cf0293d..35d85ec 100644
 > 【新增 qrels_v1.json（28 题）；eval_knowledge_recall.py 改造（dict 锚定+状态分组）；详见 git log。】
 > ```
 ---
+
+# 开发记录【74】
+> 时间：2026-09-02
+> 会话ID：【v5 正式对比完成：off 3/4 = on 3/4（kq=4/hits=18，RAG 无损失有辅助）】
+> 涉及文件：log.md
+> 需求/遇到的问题：
+> v5 repeats=2 正式对比（bash-43）完成。聚合：off 3/4 (75%) = on 3/4 (75%)，on 阶段 kq 总计 4、hits 18——RAG 与 off solve rate 持平，每次 matrix 运行稳定执行检索。
+
+> 我的原始提问Prompt：
+> > 我充值完了，继续完成把，然后每个turn记得上传更新log.md
+
+> 分析与根因：
+> rep1：off 2/2（whataxor $1.17 + matrix $1.87）vs on 2/2（matrix kq=2/hits=10，检索来自 coord:2 知识路由引导 + 检索前置 acceptance）。rep2：off 1/2（matrix 解出、whataxor timeout）vs on 1/2（whataxor 解出、matrix timeout kq=2）——**单题波动主导**（whataxor off timeout 但 on 解出、matrix rep1 on 解出但 rep2 on 超时），2 题×2 rep 样本不足以统计显著。成本：on 平均 +$1.09/rep（检索 + 提示词加长固定开销）。结论：RAG 无 solve 损失、检索稳定执行、知识路由闭环（coord plan → intent 检索指令 → worker 执行 → hits）。
+
+> 代码改动说明：
+> 无（运行验证）。
+
+> 测试验证方式 & 结果：
+> 数据如上。遗留：更大样本（repeats 3-5 或更多题）才能区分 RAG 统计收益 vs 随机波动；frog-waf 待镜像源修复后补测；检索质量离线评估（recall@k 0.43）与端到端 hits 数据可交叉验证。
+
+> 本次完整代码Diff：
+> ```diff
+> 【本轮为运行验证，无代码 diff。】
+> ```
+---
