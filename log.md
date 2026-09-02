@@ -16842,3 +16842,28 @@ index cf0293d..35d85ec 100644
 > 【turn_failed nonlocal 修复 + 脚本化协议回归测试已随本轮提交推送；详见 git log。】
 > ```
 ---
+
+# 开发记录【71】
+> 时间：2026-09-02
+> 会话ID：【余额恢复 + v5 正式对比（repeats=2）启动】
+> 涉及文件：log.md
+> 需求/遇到的问题：
+> 用户充值完成，恢复自动推进。API 探测：coordinator plan 返回 raw=True + 3 intents（修复 turn_failed 诚实化后首次真实成功——此前 403 时 raw=False）。启动 v5 正式对比（2 medium 题 whataxor/matrix-lab-2，off/on × 2 replicates，timeout 600s）。
+
+> 我的原始提问Prompt：
+> > 我充值完了，继续完成把，然后每个turn记得上传更新log.md
+
+> 分析与根因：
+> 余额恢复验证通过（coordinator 单 turn 真实产出 3 intents，含知识路由生效迹象）。v5 正式对比为当前最高优先级：此前单组数据 off 1/2 vs on 2/2（RAG 正向），需 2+ replicates 确认统计稳定性。
+
+> 代码改动说明：
+> 无（本轮为运行验证）。运行中：bash-43 v5_compare_final（repeats=2）。
+
+> 测试验证方式 & 结果：
+> 运行中。预期产出：per-replicate off/on solve、kq/hits、成本对比，以及 coordinator 触发与检索命中统计。
+
+> 本次完整代码Diff：
+> ```diff
+> 【本轮为运行验证，无代码 diff。】
+> ```
+---
