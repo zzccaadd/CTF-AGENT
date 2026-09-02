@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: LCG, linear congruential generator, PRNG, random prediction, 随机数
 tool_name: python
 ---
 

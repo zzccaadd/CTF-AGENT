@@ -5,6 +5,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: pwn
+keywords_en: buffer overflow, shellcode, stack smashing, 栈溢出
 tool_name: pwntools
 ---
 

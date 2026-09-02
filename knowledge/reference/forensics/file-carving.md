@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: forensics
+keywords_en: file carving, forensics, binwalk, 文件雕刻
 tool_name: binwalk
 ---
 

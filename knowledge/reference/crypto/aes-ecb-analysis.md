@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: AES, ECB, block cipher, electronic codebook, 分组密码
 tool_name: python
 ---
 

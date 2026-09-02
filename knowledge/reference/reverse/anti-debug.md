@@ -5,6 +5,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: reverse
+keywords_en: anti-debug, anti-analysis, ptrace, gdb, 反调试
 tool_name: gdb
 ---
 

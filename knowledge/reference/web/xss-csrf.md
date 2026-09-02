@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: web
+keywords_en: XSS, cross site scripting, stored XSS, reflected XSS, CSRF, cookie theft, 跨站
 cwe_id: CWE-79
 ---
 

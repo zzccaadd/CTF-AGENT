@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: CBC bit flipping, bit flip, block cipher, 翻转攻击
 tool_name: python
 ---
 

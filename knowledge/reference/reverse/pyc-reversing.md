@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: reverse
+keywords_en: pyc, python bytecode, decompile, uncompyle6, pycdc, marshal, 反编译
 tool_name: pycdc
 ---
 

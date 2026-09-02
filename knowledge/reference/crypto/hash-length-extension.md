@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: hash length extension, SHA1, SHA256, MD5, 哈希长度扩展
 tool_name: python
 ---
 

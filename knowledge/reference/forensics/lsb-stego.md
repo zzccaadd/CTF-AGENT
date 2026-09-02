@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: forensics
+keywords_en: stego, steganography, LSB, zsteg, steghide, 隐写
 tool_name: zsteg
 ---
 

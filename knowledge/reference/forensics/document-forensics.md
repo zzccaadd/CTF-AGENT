@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: forensics
+keywords_en: document forensics, office, pdf, macro, 文档取证
 tool_name: olevba
 ---
 

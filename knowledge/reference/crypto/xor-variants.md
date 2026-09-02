@@ -5,6 +5,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: xor, XOR cipher, keystream reuse, 异或
 tool_name: python
 ---
 

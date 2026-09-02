@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: pwn
+keywords_en: ret2libc, return to libc, PLT, GOT, 返回库
 tool_name: pwntools
 ---
 

@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-09-02
 topic: reverse
+keywords_en: pyinstaller, pyinstxtractor, MEI, CArchive, PYZ, 打包
 tool_name: pyinstxtractor
 ---
 

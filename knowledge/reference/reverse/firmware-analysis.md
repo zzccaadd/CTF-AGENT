@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: reverse
+keywords_en: firmware, filesystem extraction, binwalk, 固件
 tool_name: binwalk
 ---
 

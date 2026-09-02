@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: padding oracle, CBC, PKCS7, decryption oracle, 填充预言
 tool_name: python
 ---
 

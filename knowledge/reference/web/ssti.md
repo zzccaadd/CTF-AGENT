@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: web
+keywords_en: SSTI, server side template injection, template injection, Jinja2, Twig, 模板注入
 cwe_id: CWE-1336
 ---
 

@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: web
+keywords_en: pickle deserialization, pickle RCE, __reduce__, python object injection, 反序列化
 cwe_id: CWE-502
 ---
 

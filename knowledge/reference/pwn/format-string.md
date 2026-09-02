@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: pwn
+keywords_en: format string, printf, %n, 格式化字符串
 cwe_id: CWE-134
 ---
 

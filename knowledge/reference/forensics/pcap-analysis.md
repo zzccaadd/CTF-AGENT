@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: forensics
+keywords_en: pcap, packet capture, wireshark, tshark, network forensics, 流量分析
 tool_name: tshark
 ---
 

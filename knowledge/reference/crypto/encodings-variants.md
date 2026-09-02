@@ -6,6 +6,7 @@ publisher: CTF-Agent reviewed corpus
 license: CC-BY-4.0
 retrieved_at: 2026-08-31
 topic: crypto
+keywords_en: encoding, base64, hex, ROT13, custom encoding, 编码
 tool_name: python
 ---
 
