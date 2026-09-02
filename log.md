@@ -16936,3 +16936,28 @@ index cf0293d..35d85ec 100644
 > 【pipeline 脚本 + qrels 更新已随本轮提交推送；详见 git log e80754e。】
 > ```
 ---
+
+# 开发记录【74】
+> 时间：2026-09-02
+> 会话ID：【M1：qrels 正式化——28 题 chunk 级锚定 + 评估器状态分组改造 + 基线存档】
+> 涉及文件：benchmarks/rag_eval/qrels_v1.json（新增）/ scripts/eval_knowledge_recall.py（改造）/ log.md
+> 需求/遇到的问题：
+> 用户确认 M1 方案：qrels 正式化（chunk 级锚定 + 扩到 ≥20 题）作为后续语料增量/检索优化的统一标尺。实施中发现两个数据事实：1) 语料 official 类 36 篇文档以 frontmatter 的 source_url（外部 URL）作为 db 文档身份入库——锚定若用文件路径会永久失配（BoxCutter/LootStash/randsubware 的 z3 锚定初次全 rr=0 的根因）；2) 主题库（main_100/rag_sensitive_100 各 100 题）的 cybench 题在本地 metadata.json 含 easy_prompt/subtasks answer（漏洞类型 gold 标注），NYU 题有 description——批量提取后按题族比例选题。
+
+> 我的原始提问Prompt：
+> > 是的（确认做 M1：qrels_v1.json + 评估器改造 + 基线）
+
+> 分析与根因：
+> qrels_v1 选题逻辑：curated 5（v4 已复核锚定）+ reused 7（v2 expected_knowledge 复用、按当前语料重锚）+ inferred 13（技巧从 metadata/README 推断，待人工复核）+ gap 3（noisier-crc/Unbreakable/22-back-to-the-past——语料缺口明示）。题族分布 7crypto/5reverse/5pwn/4web/3forensics/4misc=28，对齐 main_100 负载比例。锚定粒度：document + 可选 section hint（chunk 级）；official 类锚定必须用 source_url 值（URL），reference 类用路径子串。评估器改造：dict 锚定解析、section 匹配、按 anchor_status 分组统计（curated/reused/inferred/gap）、challenge 名查询剥难度前缀、默认 manifest 切到 qrels_v1。
+
+> 代码改动说明：
+> benchmarks/rag_eval/qrels_v1.json（新增）：28 题 schema v1.0——name/family/provider/challenge_id/score/expected_knowledge/relevant_corpus_docs（doc+section）/anchor_status/note；status_legend 说明四类状态。scripts/eval_knowledge_recall.py：_normalize_anchor（str 兼容 dict）、_anchor_matches（doc 子串 + section 双向包含）、per-status 聚合表、gap 清单输出、难度前缀剥离、默认 manifest 改 qrels_v1.json。旧 v4 manifest（纯字符串锚定）向后兼容验证通过。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：100 passed；ruff 通过；compileall OK。基线（results/qrels_v1_baseline.txt，28 题/128 查询/top_k=5）：recall@k=0.42（71/168）、MRR=0.902、空查询 17%（22/128）。按状态：curated recall 0.40/MRR 0.926、reused 0.43/0.934、inferred 0.44/0.851、gap 0/0。失败分类：① challenge 名查询系统性失配（语料无题名文档，writeup 语料可解）；② 词汇缺口：substitution-cipher/python-jail/ret2dlresolve/cache-poisoning/strace/rust/spn-cipher/email-forensics/sandbox-bypass/known-plaintext；③ 排序问题：got/elf/web/pwn 等 3 字母泛查询被 official URL 文档（trust 加权）淹没。MRR 0.90 高是因为命中即 rank1；recall 0.42 是短板——这是有区分度的基线（104 文档噪声密度已够）。
+
+> 本次完整代码Diff：
+> ```diff
+> 【新增 qrels_v1.json（28 题）；eval_knowledge_recall.py 改造（dict 锚定+状态分组）；详见 git log。】
+> ```
+---

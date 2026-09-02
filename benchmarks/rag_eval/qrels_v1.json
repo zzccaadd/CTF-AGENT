@@ -1,0 +1,597 @@
+{
+ "name": "qrels_v1",
+ "description": "Qrels v1: 28 challenges (7 crypto / 5 reverse / 5 pwn / 4 web / 3 forensics / 4 misc) for offline RAG retrieval evaluation. Anchor granularity: document + optional section hint (chunk-level). statuses: curated = hand-verified (v4), reused = v2 tags re-anchored to current corpus, inferred = technique from metadata/README pending human review, gap = no corpus doc covers the needed knowledge.",
+ "version": "1.0",
+ "generated_at": "2026-09-02",
+ "anchor_scope": "document+section",
+ "status_legend": {
+  "curated": "hand-verified anchors (v4)",
+  "reused": "v2 expected_knowledge, re-anchored",
+  "inferred": "technique inferred from challenge metadata, pending review",
+  "gap": "corpus gap: needed knowledge has no doc"
+ },
+ "items": [
+  {
+   "name": "Dynastic",
+   "family": "crypto",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Dynastic",
+   "score": 1,
+   "expected_knowledge": [
+    "substitution-cipher",
+    "custom-encoding",
+    "encodings"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/encodings-variants.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "curated",
+   "note": "Trithemius cipher (HTB): substitution shift; v4 anchor"
+  },
+  {
+   "name": "Makeshift",
+   "family": "crypto",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/crypto/[Very Easy] Makeshift",
+   "score": 1,
+   "expected_knowledge": [
+    "xor",
+    "custom-encoding",
+    "encodings"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/encodings-variants.md",
+     "section": null
+    },
+    {
+     "doc": "reference/crypto/xor-variants.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "curated",
+   "note": "custom swap-based encryption (HTB); v4 anchor"
+  },
+  {
+   "name": "whataxor",
+   "family": "reverse",
+   "provider": "nyu",
+   "challenge_id": "2023/CSAW-Quals/rev/whataxor",
+   "score": null,
+   "expected_knowledge": [
+    "xor",
+    "reverse-engineering",
+    "encodings"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/xor-variants.md",
+     "section": "变体与对应解法"
+    },
+    {
+     "doc": "reference/reverse/obfuscation-deobfuscation.md",
+     "section": "字符串加密"
+    }
+   ],
+   "anchor_status": "curated",
+   "note": "CSAW 2023; v4 anchor"
+  },
+  {
+   "name": "matrix-lab-2",
+   "family": "reverse",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2022/reverse/matrix-lab-2",
+   "score": 2,
+   "expected_knowledge": [
+    "pyc",
+    "python-reversing",
+    "pyinstaller"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/reverse/pyc-reversing.md",
+     "section": "打包产物"
+    },
+    {
+     "doc": "reference/reverse/pyinstaller-unpacking.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "curated",
+   "note": "SEKAI 2022; v4 anchor"
+  },
+  {
+   "name": "frog-waf",
+   "family": "web",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/web/frog-waf",
+   "score": 3,
+   "expected_knowledge": [
+    "waf-bypass",
+    "sql-injection",
+    "command-injection"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/web/waf-bypass.md",
+     "section": "编码差异"
+    },
+    {
+     "doc": "reference/web/sql-injection.md",
+     "section": null
+    },
+    {
+     "doc": "reference/web/command-injection.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "curated",
+   "note": "SEKAI 2023; v4 anchor"
+  },
+  {
+   "name": "just-another-pickle-jail",
+   "family": "misc",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/misc/just-another-pickle-jail",
+   "score": 5,
+   "expected_knowledge": [
+    "pickle",
+    "deserialization",
+    "python-jail"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/web/pickle-deserialization.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; Unpickler.find_class RCE"
+  },
+  {
+   "name": "robust-cbc",
+   "family": "crypto",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2022/crypto/robust-cbc",
+   "score": 4,
+   "expected_knowledge": [
+    "cbc",
+    "padding-oracle",
+    "bit-flipping",
+    "length-extension"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/cbc-bit-flipping.md",
+     "section": null
+    },
+    {
+     "doc": "reference/crypto/padding-oracle.md",
+     "section": null
+    },
+    {
+     "doc": "reference/crypto/hash-length-extension.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; metadata: TrCBC vulnerable to length extension"
+  },
+  {
+   "name": "randsubware",
+   "family": "crypto",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/crypto/randsubware",
+   "score": 5,
+   "expected_knowledge": [
+    "z3",
+    "constraint-solving",
+    "spn-cipher"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "z3prover.github.io/api/html/index.html",
+     "section": null
+    },
+    {
+     "doc": "ericpony.github.io/z3py-tutorial/guide-examples.htm",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; z3 docs exist; spn-cipher itself uncovered | anchors are source_urls (official docs indexed under external URL identity)"
+  },
+  {
+   "name": "noisier-crc",
+   "family": "crypto",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/crypto/noisier-crc",
+   "score": 4,
+   "expected_knowledge": [
+    "crc32",
+    "bruteforce",
+    "stream-cipher"
+   ],
+   "relevant_corpus_docs": [],
+   "anchor_status": "gap",
+   "note": "CORPUS_GAP: no CRC32/CRC-variant card (v2 tag)"
+  },
+  {
+   "name": "smallsurp",
+   "family": "crypto",
+   "provider": "nyu",
+   "challenge_id": "2020/CSAW-Quals/crypto/smallsurp",
+   "score": null,
+   "expected_knowledge": [
+    "rsa",
+    "small-exponent",
+    "known-plaintext"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/rsa-attacks.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; RSA small-e"
+  },
+  {
+   "name": "perfect_secrecy",
+   "family": "crypto",
+   "provider": "nyu",
+   "challenge_id": "2020/CSAW-Quals/crypto/perfect_secrecy",
+   "score": null,
+   "expected_knowledge": [
+    "xor",
+    "keystream-reuse",
+    "otp"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/xor-variants.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; keystream reuse / OTP"
+  },
+  {
+   "name": "PackedAway",
+   "family": "reverse",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] PackedAway",
+   "score": 0,
+   "expected_knowledge": [
+    "packing",
+    "upx",
+    "unpacking"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/reverse/packers-unpacking.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; UPX"
+  },
+  {
+   "name": "Data Siege",
+   "family": "forensics",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/forensics/[Medium] Data Siege",
+   "score": 2,
+   "expected_knowledge": [
+    "pcap",
+    "network-forensics",
+    "encoding"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/forensics/pcap-analysis.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "reused",
+   "note": "v2 tag; pcap + .NET exe extraction"
+  },
+  {
+   "name": "Delulu",
+   "family": "pwn",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/pwn/[Very Easy] Delulu",
+   "score": 1,
+   "expected_knowledge": [
+    "format-string",
+    "printf",
+    "pwn"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/pwn/format-string.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "README synopsis: format string overwriting variable"
+  },
+  {
+   "name": "roppity",
+   "family": "pwn",
+   "provider": "nyu",
+   "challenge_id": "2020/CSAW-Quals/pwn/roppity",
+   "score": 50,
+   "expected_knowledge": [
+    "rop",
+    "return-oriented-programming",
+    "pwn"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/pwn/rop-chains.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "CSAW quals pwn intro"
+  },
+  {
+   "name": "baby_boi",
+   "family": "pwn",
+   "provider": "nyu",
+   "challenge_id": "2019/CSAW-Quals/pwn/baby_boi",
+   "score": 50,
+   "expected_knowledge": [
+    "buffer-overflow",
+    "ret2libc",
+    "pwn"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/pwn/bof-shellcode.md",
+     "section": null
+    },
+    {
+     "doc": "reference/pwn/ret2libc.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "CSAW quals classic bof | dual anchor: classic bof + ret2libc (CSAW quals)"
+  },
+  {
+   "name": "GOT Milk?",
+   "family": "pwn",
+   "provider": "nyu",
+   "challenge_id": "2019/CSAW-Quals/pwn/got_milk",
+   "score": 50,
+   "expected_knowledge": [
+    "got",
+    "ret2dlresolve",
+    "pwn"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/pwn/ret2libc.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "GOT overwrite; no dedicated got card (partial anchor)"
+  },
+  {
+   "name": "network-tools",
+   "family": "pwn",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/pwn/network-tools",
+   "score": 2,
+   "expected_knowledge": [
+    "rust",
+    "unsafe",
+    "buffer-overflow"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/pwn/bof-shellcode.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "Rust unsafe read into BSS; partial anchor"
+  },
+  {
+   "name": "BoxCutter",
+   "family": "reverse",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] BoxCutter",
+   "score": 0,
+   "expected_knowledge": [
+    "elf",
+    "strace",
+    "syscall-tracing"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "strace syscall tracing; no dedicated card (partial anchor) | weak anchor: ELF ABI doc (local elf-analysis-basics.md content); no strace card yet"
+  },
+  {
+   "name": "LootStash",
+   "family": "reverse",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/reversing/[Very Easy] LootStash",
+   "score": 0,
+   "expected_knowledge": [
+    "strings",
+    "binary-analysis",
+    "reverse-engineering"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "sourceware.org/binutils/docs/",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "strings/grep basics | weak anchor: binutils docs cover strings/readelf; no dedicated strings card"
+  },
+  {
+   "name": "LockTalk",
+   "family": "web",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/web/[Medium] LockTalk",
+   "score": 3,
+   "expected_knowledge": [
+    "jwt",
+    "python-jwt",
+    "access-control"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/web/jwt-attacks.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "python_jwt 3.3.3 CVE; HTB"
+  },
+  {
+   "name": "chunky",
+   "family": "web",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/web/chunky",
+   "score": 3,
+   "expected_knowledge": [
+    "request-smuggling",
+    "cache-poisoning",
+    "web"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/web/waf-bypass.md",
+     "section": "协议层绕过"
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "CL.TE smuggling + cache poisoning (waf-bypass covers smuggling)"
+  },
+  {
+   "name": "Smug-Dino",
+   "family": "web",
+   "provider": "nyu",
+   "challenge_id": "2023/CSAW-Quals/web/smug-dino",
+   "score": 50,
+   "expected_knowledge": [
+    "request-smuggling",
+    "http-smuggling",
+    "web"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/web/waf-bypass.md",
+     "section": "协议层绕过"
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "CSAW 2022 request smuggling"
+  },
+  {
+   "name": "eval-me",
+   "family": "forensics",
+   "provider": "cybench",
+   "challenge_id": "project-sekai-ctf/sekaictf-2023/forensics/eval-me",
+   "score": 1,
+   "expected_knowledge": [
+    "pcap",
+    "network-forensics",
+    "decryption"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/forensics/pcap-analysis.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "pcap + decrypt recovered bytes"
+  },
+  {
+   "name": "Urgent",
+   "family": "forensics",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/forensics/[Very Easy] Urgent",
+   "score": 0,
+   "expected_knowledge": [
+    "email-forensics",
+    "base64",
+    "url-encoding"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/crypto/encodings-variants.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "eml attachment base64+URL decode; weak anchor"
+  },
+  {
+   "name": "Were Pickle Phreaks Revenge",
+   "family": "misc",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/misc/[Medium] Were Pickle Phreaks Revenge",
+   "score": 3,
+   "expected_knowledge": [
+    "pickle",
+    "python-jail",
+    "sandbox-bypass"
+   ],
+   "relevant_corpus_docs": [
+    {
+     "doc": "reference/web/pickle-deserialization.md",
+     "section": null
+    }
+   ],
+   "anchor_status": "inferred",
+   "note": "HTB; module-name blacklist jail"
+  },
+  {
+   "name": "Unbreakable",
+   "family": "misc",
+   "provider": "cybench",
+   "challenge_id": "hackthebox/cyber-apocalypse-2024/misc/[Easy] Unbreakable",
+   "score": 1,
+   "expected_knowledge": [
+    "eval",
+    "pyjail",
+    "blacklist-bypass"
+   ],
+   "relevant_corpus_docs": [],
+   "anchor_status": "gap",
+   "note": "CORPUS_GAP: no pyjail/eval-blacklist card (HTB)"
+  },
+  {
+   "name": "22-back-to-the-past",
+   "family": "misc",
+   "provider": "cybench",
+   "challenge_id": "hkcert-ctf/CTF-Challenges/CTF-2022/22-back-to-the-past",
+   "score": 1,
+   "expected_knowledge": [
+    "git",
+    "directory-leak",
+    "web"
+   ],
+   "relevant_corpus_docs": [],
+   "anchor_status": "gap",
+   "note": "CORPUS_GAP: no git-history/forensics card (hkcert)"
+  }
+ ]
+}
