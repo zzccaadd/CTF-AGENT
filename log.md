@@ -16867,3 +16867,28 @@ index cf0293d..35d85ec 100644
 > 【本轮为运行验证，无代码 diff。】
 > ```
 ---
+
+# 开发记录【72】
+> 时间：2026-09-02
+> 会话ID：【细粒度 RAG 验证体系建立：离线检索质量评估器 + 工具调用精确性 probe】
+> 涉及文件：scripts/eval_knowledge_recall.py（新增）/ knowledge/reference/web/waf-bypass.md（新增）/ knowledge/reference/**/*.md（28 档补 keywords_en）/ log.md
+> 需求/遇到的问题：
+> 用户要求：实验后台跑，前台并行开发；对比运行用更快验证方式；RAG 性能用更细粒度验证（如 ragas 思路——验证每次是否精确调用知识库），确认知识库调用没问题再做整体计算测试。实施三层细粒度 RAG 验证体系。
+
+> 我的原始提问Prompt：
+> > 我希望你并行做实验并优化代码……验证rag性能的话，你完全可以采用更细粒度的验证方式，例如ragas等，验证每次是否精确调用知识库，等确保知识库调用没问题再进行整体计算测试
+
+> 分析与根因：
+> 1) 检索质量缺口（离线评估实锤，零 API 成本）：语料 28 个中文 reference 文档无英文别名——FTS5 分词下英文查询（sql-injection/command-injection/stego/encodings）无法召回中文内容文档（frog-waf 的 sql-injection 查询 rr=0.00）；缩写缺口（stego vs steganography）。2) WAF 绕过专档缺失（frog-waf 是 web/WAF 题但语料无 waf-bypass 文档）。3) 工具调用精确性验证（rag_tool_probe.py 复用）——验证模型收到指令后真的调 search_knowledge 且只调一次。
+
+> 代码改动说明：
+> scripts/eval_knowledge_recall.py（新增）：ragas 式离线检索质量评估——按 manifest 的 expected_knowledge 生成探测查询，对 relevant_corpus_docs（qrels 锚定）测 recall@k / MRR / 空命中率；零 API 成本，开发循环可反复跑。knowledge/reference/**：28 档中文文档 front matter 补 keywords_en 英文别名（crypto/pwn/forensics/reverse/web 全覆盖）；新增 web/waf-bypass.md（WAF 绕过通用模式：编码差异/大小写混淆/HPP/请求走私/语义绕过）。rag_tool_probe.py 复用为"工具调用精确性"探针。
+
+> 测试验证方式 & 结果：
+> .venv/bin/pytest -q：100 passed；ruff 通过。离线评估：recall@k 0.31→0.43、空查询 24%→12%、MRR 0.94；frog-waf 的 command-injection rr=1.00、sql-injection rr=0.50（修复前 0）；waf-bypass 查询 3/3 命中新文档。工具 probe：模型精确调用 search_knowledge("ELF e_entry", top_k=1) 一次并正确报告结果（turn completed），端到端工具链路 OK（成本 <$0.01）。已推送 80297db。v5 正式对比（bash-43, repeats=2）后台运行中。
+
+> 本次完整代码Diff：
+> ```diff
+> 【评估器 + 语料关键词 + WAF 文档已随本轮提交推送；详见 git log 80297db。】
+> ```
+---
