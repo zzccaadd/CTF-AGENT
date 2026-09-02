@@ -100,7 +100,8 @@
    ],
    "relevant_corpus_docs": [
     "reference/web/sql-injection.md",
-    "reference/web/command-injection.md"
+    "reference/web/command-injection.md",
+    "reference/web/waf-bypass.md"
    ],
    "environment_unavailable": true,
    "environment_note": "docker registry 403/not-found for openjdk:11-slim + gradle:7.5-jdk11-alpine on all mirrors (daocloud/1ms/xuanyuan/docker.io) as of 2026-09-02; excluded from runs"
